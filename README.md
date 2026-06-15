@@ -1,6 +1,6 @@
 # timestamp-gateway
 
-A FastAPI service that accepts a SHA-256 digest over HTTP and returns a Lightning invoice for a small payment. Intended as a gateway between a client application and an LND node, with all LND communication routed through Tor.
+This service lets a client submit a SHA-256 digest for Bitcoin-anchored timestamping through OpenTimestamps, gated by a small Lightning payment. The client sends only the digest, receives a Lightning invoice, pays it, retries with the payment preimage, and receives the resulting .ots timestamp proof. The original file never needs to leave the client's machine, and all communication with the remote LND node is routed through Tor.
 
 ## Requirements
 
