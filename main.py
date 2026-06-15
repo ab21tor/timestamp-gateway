@@ -15,16 +15,19 @@ from opentimestamps.core.timestamp import DetachedTimestampFile, Timestamp
 from opentimestamps.core.serialize import StreamSerializationContext
 from opentimestamps.calendar import RemoteCalendar, DEFAULT_AGGREGATORS
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 load_dotenv()
 
 LND_HOST = os.getenv("LND_HOST")
 LND_PORT = os.getenv("LND_PORT")
 LND_MACAROON_HEX = os.getenv("LND_MACAROON_HEX")
 TOR_PROXY = os.getenv("TOR_PROXY")
-GATEWAY_PRICE_SATS = int(os.getenv("GATEWAY_PRICE_SATS", "0"))
+try:
+    GATEWAY_PRICE_SATS = int(os.getenv("GATEWAY_PRICE_SATS", "0"))
+except ValueError:
+    raise RuntimeError("GATEWAY_PRICE_SATS must be an integer")
 LND_TLS_VERIFY = os.getenv("LND_TLS_VERIFY", "false").lower() == "true"
+if not LND_TLS_VERIFY:
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 _missing = [
     name for name, val in {
@@ -43,7 +46,7 @@ if GATEWAY_PRICE_SATS <= 0:
 AUTH_RE = re.compile(r"^preimage=([0-9a-fA-F]{64})$")
 
 app = FastAPI()
-app.mount("/ui", StaticFiles(directory=Path(__file__).parent, html=True), name="ui")
+app.mount("/ui", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="ui")
 
 
 class TimestampRequest(BaseModel):
