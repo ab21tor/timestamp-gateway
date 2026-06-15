@@ -5,6 +5,7 @@ import os
 import re
 import requests
 import urllib3
+from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.staticfiles import StaticFiles
@@ -42,7 +43,7 @@ if GATEWAY_PRICE_SATS <= 0:
 AUTH_RE = re.compile(r"^preimage=([0-9a-fA-F]{64})$")
 
 app = FastAPI()
-app.mount("/ui", StaticFiles(directory="/Users/georgeedwards/timestamp-gateway", html=True), name="ui")
+app.mount("/ui", StaticFiles(directory=Path(__file__).parent, html=True), name="ui")
 
 
 class TimestampRequest(BaseModel):
