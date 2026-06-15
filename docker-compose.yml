@@ -1,0 +1,30 @@
+services:
+  gateway:
+    build: .
+    env_file: .env
+    restart: unless-stopped
+    depends_on:
+      - tor
+    networks:
+      - ts_net
+    # Uncomment to expose the gateway on clearnet in addition to the onion address:
+    # ports:
+    #   - "8000:8000"
+
+  tor:
+    build: ./tor
+    volumes:
+      - tor_keys:/var/lib/tor
+    restart: unless-stopped
+    networks:
+      - ts_net
+    # Uncomment to expose the Tor SOCKS proxy on the host (useful for local debugging):
+    # ports:
+    #   - "127.0.0.1:9050:9050"
+
+networks:
+  ts_net:
+    driver: bridge
+
+volumes:
+  tor_keys:

@@ -23,7 +23,6 @@ def _parse_config():
             "LND_HOST": os.getenv("LND_HOST"),
             "LND_PORT": os.getenv("LND_PORT"),
             "LND_MACAROON_HEX": os.getenv("LND_MACAROON_HEX"),
-            "TOR_PROXY": os.getenv("TOR_PROXY"),
             "GATEWAY_PRICE_SATS": os.getenv("GATEWAY_PRICE_SATS"),
         }.items() if not val
     ]
@@ -39,7 +38,7 @@ def _parse_config():
         os.getenv("LND_HOST"),
         os.getenv("LND_PORT"),
         os.getenv("LND_MACAROON_HEX"),
-        os.getenv("TOR_PROXY"),
+        os.getenv("TOR_PROXY") or None,  # optional; None = direct connection
         price,
         os.getenv("LND_TLS_VERIFY", "false").lower() == "true",
     )
@@ -73,8 +72,8 @@ def parse_preimage(auth: str) -> str | None:
 
 
 def create_invoice(memo: str, amount_sats: int) -> str:
-    """Call LND REST API via Tor to create a Lightning invoice. Returns the payment_request string (BOLT11). Raises HTTPException 502 on any failure."""
-    proxies = {"https": f"socks5h://{TOR_PROXY}"}
+    """Call LND REST API to create a Lightning invoice. Returns the BOLT11 payment_request. Raises HTTPException 502 on any failure."""
+    proxies = {"https": f"socks5h://{TOR_PROXY}"} if TOR_PROXY else None
     headers = {"Grpc-Metadata-macaroon": LND_MACAROON_HEX}
     url = f"https://{LND_HOST}:{LND_PORT}/v1/invoices"
     try:
@@ -120,7 +119,7 @@ def verify_payment(preimage_hex: str, digest: str) -> bool:
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid preimage: not a hex string")
     payment_hash = hashlib.sha256(preimage_bytes).hexdigest()
-    proxies = {"https": f"socks5h://{TOR_PROXY}"}
+    proxies = {"https": f"socks5h://{TOR_PROXY}"} if TOR_PROXY else None
     headers = {"Grpc-Metadata-macaroon": LND_MACAROON_HEX}
     url = f"https://{LND_HOST}:{LND_PORT}/v1/invoice/{payment_hash}"
     try:
