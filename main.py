@@ -15,33 +15,40 @@ from opentimestamps.core.timestamp import DetachedTimestampFile, Timestamp
 from opentimestamps.core.serialize import StreamSerializationContext
 from opentimestamps.calendar import RemoteCalendar, DEFAULT_AGGREGATORS
 
-load_dotenv()
 
-LND_HOST = os.getenv("LND_HOST")
-LND_PORT = os.getenv("LND_PORT")
-LND_MACAROON_HEX = os.getenv("LND_MACAROON_HEX")
-TOR_PROXY = os.getenv("TOR_PROXY")
-try:
-    GATEWAY_PRICE_SATS = int(os.getenv("GATEWAY_PRICE_SATS", "0"))
-except ValueError:
-    raise RuntimeError("GATEWAY_PRICE_SATS must be an integer")
-LND_TLS_VERIFY = os.getenv("LND_TLS_VERIFY", "false").lower() == "true"
+def _parse_config():
+    """Parse and validate all required env vars. Raises RuntimeError on misconfiguration."""
+    missing = [
+        name for name, val in {
+            "LND_HOST": os.getenv("LND_HOST"),
+            "LND_PORT": os.getenv("LND_PORT"),
+            "LND_MACAROON_HEX": os.getenv("LND_MACAROON_HEX"),
+            "TOR_PROXY": os.getenv("TOR_PROXY"),
+            "GATEWAY_PRICE_SATS": os.getenv("GATEWAY_PRICE_SATS"),
+        }.items() if not val
+    ]
+    if missing:
+        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+    try:
+        price = int(os.getenv("GATEWAY_PRICE_SATS"))
+    except ValueError:
+        raise RuntimeError("GATEWAY_PRICE_SATS must be an integer")
+    if price <= 0:
+        raise RuntimeError(f"GATEWAY_PRICE_SATS must be a positive integer, got {price}")
+    return (
+        os.getenv("LND_HOST"),
+        os.getenv("LND_PORT"),
+        os.getenv("LND_MACAROON_HEX"),
+        os.getenv("TOR_PROXY"),
+        price,
+        os.getenv("LND_TLS_VERIFY", "false").lower() == "true",
+    )
+
+
+load_dotenv()
+LND_HOST, LND_PORT, LND_MACAROON_HEX, TOR_PROXY, GATEWAY_PRICE_SATS, LND_TLS_VERIFY = _parse_config()
 if not LND_TLS_VERIFY:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-_missing = [
-    name for name, val in {
-        "LND_HOST": LND_HOST,
-        "LND_PORT": LND_PORT,
-        "LND_MACAROON_HEX": LND_MACAROON_HEX,
-        "TOR_PROXY": TOR_PROXY,
-        "GATEWAY_PRICE_SATS": os.getenv("GATEWAY_PRICE_SATS"),
-    }.items() if not val
-]
-if _missing:
-    raise RuntimeError(f"Missing required environment variables: {', '.join(_missing)}")
-if GATEWAY_PRICE_SATS <= 0:
-    raise RuntimeError(f"GATEWAY_PRICE_SATS must be a positive integer, got {GATEWAY_PRICE_SATS}")
 
 AUTH_RE = re.compile(r"^preimage=([0-9a-fA-F]{64})$")
 
