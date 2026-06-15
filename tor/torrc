@@ -1,0 +1,12 @@
+# SOCKS proxy — used by the gateway container to reach onion LND endpoints.
+SocksPort 0.0.0.0:9050
+
+# Hidden service — exposes the gateway at a .onion address.
+# After first start, read the address with:
+#   docker compose exec tor cat /var/lib/tor/timestamp_gateway/hostname
+HiddenServiceDir /var/lib/tor/timestamp_gateway/
+HiddenServicePort 80 gateway:8000
+
+DataDirectory /var/lib/tor
+
+Log notice stdout
