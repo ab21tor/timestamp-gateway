@@ -1,6 +1,10 @@
 # timestamp-gateway
 
-timestamp-gateway treats Tor as an optional deployment layer rather than a hard requirement. The gateway can run as a portable node package with Docker Compose, where the FastAPI service is paired with a Tor container that can expose the gateway as an onion service and provide a SOCKS proxy for outbound onion connections. If TOR_PROXY is set, LND requests are routed through Tor; if TOR_PROXY is unset, the gateway connects to LND directly. This means operators can choose their own mode: Tor-only gateway with Tor-only LND, onion gateway with clearnet or hybrid LND, or clearnet/onion public infrastructure. LND is deliberately not bundled; operators bring their own backend from Start9, Umbrel, RaspiBlitz, local LND, remote LND, or other infrastructure. The onion service key is persisted in a Docker volume so the onion address survives restarts, while clearnet exposure is commented out by default. Tor is supported, but not mandatory. VPS is supported, but not mandatory. Tor-only is possible, but not imposed.
+timestamp-gateway is a small, self-hostable Lightning-gated OpenTimestamps gateway. It accepts a SHA-256 digest, charges a configured Lightning price, submits the digest to OpenTimestamps, and returns a raw .ots proof. It stores no files, requires no accounts, and does not need to be trusted after the proof is returned.
+
+This is not a hosted service. It is software for running a timestamp-gateway node. Operators bring their own LND backend — Start9, Umbrel, RaspiBlitz, local LND, remote LND, or other infrastructure — and choose their own exposure model. The gateway can run over Tor, clearnet, or both. If TOR_PROXY is set, LND requests route through Tor; if it is unset, the gateway connects to LND directly. Docker Compose includes an optional Tor container for onion access and outbound SOCKS proxying, with the onion key persisted across restarts.
+
+Tor is supported, but not mandatory. VPS is supported, but not mandatory. Tor-only is possible, but not imposed.
 
 ---
 
