@@ -24,16 +24,36 @@ def _parse_config():
             "LND_PORT": os.getenv("LND_PORT"),
             "LND_MACAROON_HEX": os.getenv("LND_MACAROON_HEX"),
             "GATEWAY_PRICE_SATS": os.getenv("GATEWAY_PRICE_SATS"),
+            "OTS_BACKEND_MODE": os.getenv("OTS_BACKEND_MODE"),
         }.items() if not val
     ]
     if missing:
         raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+
     try:
         price = int(os.getenv("GATEWAY_PRICE_SATS"))
     except ValueError:
         raise RuntimeError("GATEWAY_PRICE_SATS must be an integer")
     if price <= 0:
         raise RuntimeError(f"GATEWAY_PRICE_SATS must be a positive integer, got {price}")
+
+    mode = os.getenv("OTS_BACKEND_MODE").lower()
+    if mode not in ("calendar", "public"):
+        raise RuntimeError(
+            f"OTS_BACKEND_MODE must be 'calendar' or 'public', got {mode!r}"
+        )
+
+    calendar_url = os.getenv("OTS_CALENDAR_URL") or None
+    if mode == "calendar" and not calendar_url:
+        raise RuntimeError(
+            "OTS_CALENDAR_URL is required when OTS_BACKEND_MODE=calendar"
+        )
+    if mode == "public" and calendar_url:
+        raise RuntimeError(
+            "OTS_CALENDAR_URL must not be set when OTS_BACKEND_MODE=public; "
+            "set OTS_BACKEND_MODE=calendar to use a specific calendar backend"
+        )
+
     return (
         os.getenv("LND_HOST"),
         os.getenv("LND_PORT"),
@@ -41,11 +61,23 @@ def _parse_config():
         os.getenv("TOR_PROXY") or None,  # optional; None = direct connection
         price,
         os.getenv("LND_TLS_VERIFY", "false").lower() == "true",
+        mode,
+        calendar_url,
     )
 
 
 load_dotenv()
-LND_HOST, LND_PORT, LND_MACAROON_HEX, TOR_PROXY, GATEWAY_PRICE_SATS, LND_TLS_VERIFY = _parse_config()
+(
+    LND_HOST,
+    LND_PORT,
+    LND_MACAROON_HEX,
+    TOR_PROXY,
+    GATEWAY_PRICE_SATS,
+    LND_TLS_VERIFY,
+    OTS_BACKEND_MODE,
+    OTS_CALENDAR_URL,
+) = _parse_config()
+
 if not LND_TLS_VERIFY:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -93,19 +125,38 @@ def create_invoice(memo: str, amount_sats: int) -> str:
 
 
 def stamp_digest(hex_digest: str) -> bytes:
-    """Submit a SHA256 digest to the OTS public calendars and return the serialized .ots file as bytes."""
+    """Submit a SHA256 digest to the configured OTS backend and return the serialized .ots bytes.
+
+    OTS_BACKEND_MODE=calendar  — submit to the operator-controlled OTS calendar at
+                                  OTS_CALENDAR_URL. No fallback. Failure → RuntimeError.
+    OTS_BACKEND_MODE=public    — submit to DEFAULT_AGGREGATORS (compatibility/testing only).
+                                  Succeeds if at least one aggregator responds.
+    """
     digest_bytes = bytes.fromhex(hex_digest)
     file_timestamp = DetachedTimestampFile(OpSHA256(), Timestamp(digest_bytes))
-    succeeded = 0
-    for url in DEFAULT_AGGREGATORS:
+
+    if OTS_BACKEND_MODE == "calendar":
         try:
-            calendar_timestamp = RemoteCalendar(url).submit(digest_bytes, timeout=10)
+            calendar_timestamp = RemoteCalendar(OTS_CALENDAR_URL).submit(
+                digest_bytes, timeout=10
+            )
             file_timestamp.timestamp.merge(calendar_timestamp)
-            succeeded += 1
         except Exception:
-            logging.warning("OTS calendar %s failed", url, exc_info=True)
-    if succeeded == 0:
-        raise RuntimeError("All OTS calendars failed; no timestamp was created")
+            logging.exception("OTS calendar backend %s failed", OTS_CALENDAR_URL)
+            raise RuntimeError("OTS calendar backend failed")
+    else:
+        # public — compatibility/testing mode only; do not use as the real backend
+        succeeded = 0
+        for url in DEFAULT_AGGREGATORS:
+            try:
+                calendar_timestamp = RemoteCalendar(url).submit(digest_bytes, timeout=10)
+                file_timestamp.timestamp.merge(calendar_timestamp)
+                succeeded += 1
+            except Exception:
+                logging.warning("OTS public calendar %s failed", url, exc_info=True)
+        if succeeded == 0:
+            raise RuntimeError("All OTS public calendars failed; no timestamp was created")
+
     buf = io.BytesIO()
     file_timestamp.serialize(StreamSerializationContext(buf))
     return buf.getvalue()

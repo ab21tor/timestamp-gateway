@@ -1,32 +1,66 @@
 # timestamp-gateway
 
-timestamp-gateway is a small, self-hostable Lightning-gated OpenTimestamps gateway. It accepts a SHA-256 digest, charges a configured Lightning price, submits the digest to OpenTimestamps, and returns a raw .ots proof. It stores no files, requires no accounts, and does not need to be trusted after the proof is returned.
+timestamp-gateway is portable paid OpenTimestamps calendar-node software. It accepts a SHA-256 digest, charges a configured Lightning price, submits the paid digest to the operator's own OpenTimestamps calendar backend, and returns a raw .ots proof. It stores no files, requires no accounts, and does not need to be trusted after the proof is returned.
 
-This is not a hosted service. It is software for running a timestamp-gateway node. Operators bring their own LND backend — Start9, Umbrel, RaspiBlitz, local LND, remote LND, or other infrastructure — and choose their own exposure model. The gateway can run over Tor, clearnet, or both. If TOR_PROXY is set, LND requests route through Tor; if it is unset, the gateway connects to LND directly. Docker Compose includes an optional Tor container for onion access and outbound SOCKS proxying, with the onion key persisted across restarts.
+This is not a hosted service. It is software for running a Lightning-gated OpenTimestamps calendar node.
+
+```
+client / Flagpole
+  → Lightning-gated gateway       (this repo)
+  → operator-controlled OTS calendar  (otsd — the proof engine)
+  → Bitcoin anchoring
+  → .ots
+```
 
 Tor is supported, but not mandatory. VPS is supported, but not mandatory. Tor-only is possible, but not imposed.
 
 ---
 
-## How it works
+## What the gateway does and does not do
 
-1. Client sends `POST /timestamp` with `{"digest": "<sha256-hex>"}` — no auth header.
-2. Gateway calls LND, creates a Lightning invoice, returns HTTP 402 with the BOLT11 string.
-3. Client pays the invoice and records the payment preimage.
-4. Client resends `POST /timestamp` with `Authorization: preimage=<64-hex-preimage>`.
-5. Gateway verifies the payment against LND, submits the digest to the OpenTimestamps public calendars, and returns a raw `.ots` proof file.
-6. Client verifies the proof independently once it is anchored in a Bitcoin block (~1 hour).
+**Does:**
+- Validates SHA-256 digests.
+- Issues a Lightning invoice via an operator-provided LND backend.
+- Verifies payment by preimage: checks that the invoice is settled, the memo matches the digest, and the paid amount meets the configured price.
+- Submits the paid digest to the operator-controlled OTS calendar backend.
+- Returns raw `.ots` bytes.
 
-The original file never touches the gateway. Only the digest is transmitted.
+**Does not:**
+- Store files or documents.
+- Log digests, preimages, or client identities.
+- Prove authorship, ownership, provenance, or claim validity.
+- Prove truth.
+- Anchor to Bitcoin itself — that is the OTS calendar backend's job.
+- Provide a public calendar — the gateway is the paid front door to the operator's private calendar.
+
+**Proves when.** A digest committed before a Bitcoin block existed at that time.
+
+---
+
+## What we corrected
+
+An earlier version of this gateway forwarded paid digests to the public OpenTimestamps aggregators (`a.pool.opentimestamps.org`, etc.). That made the gateway a paid relay to other operators' infrastructure, not an independent calendar node.
+
+The correct architecture is:
+
+| Component | Role |
+|---|---|
+| Gateway | Paid front door. Validates, charges, verifies, forwards. |
+| otsd | Operator-controlled proof engine. Aggregates digests, anchors to Bitcoin. |
+| LND | Operator-provided Lightning backend. Issues and settles invoices. |
+| Bitcoin Core | Operator-provided (or shared) Bitcoin backend for otsd. |
+
+Public calendar mode (`OTS_BACKEND_MODE=public`) is retained as a compatibility/testing option only. It is not the real target.
 
 ---
 
 ## What you need
 
 - Docker and Docker Compose
-- An existing LND node with the REST API enabled
-- An invoice macaroon for that node
-- Inbound Lightning liquidity (see [Inbound liquidity](#inbound-liquidity))
+- An existing LND node with the REST API enabled and an invoice macaroon
+- An OpenTimestamps calendar backend (otsd) — bundled in the Compose stack or external
+- A Bitcoin Core node reachable by otsd, with a wallet loaded and funded for anchoring transactions
+- Inbound Lightning liquidity on the LND node (see [Inbound liquidity](#inbound-liquidity))
 
 ---
 
@@ -36,8 +70,9 @@ The original file never touches the gateway. Only the digest is transmitted.
 git clone https://github.com/ab21tor/timestamp-gateway
 cd timestamp-gateway
 cp .env.example .env
-# Edit .env — fill in LND_HOST, LND_PORT, LND_MACAROON_HEX
-docker compose up -d
+# Edit .env — fill in LND_HOST, LND_PORT, LND_MACAROON_HEX,
+# and BITCOIN_RPC_* for otsd
+docker compose --profile calendar up -d
 ```
 
 Get your onion address:
@@ -46,12 +81,14 @@ Get your onion address:
 docker compose exec tor cat /var/lib/tor/timestamp_gateway/hostname
 ```
 
-Test the endpoint (replace with your onion address or use localhost if you exposed port 8000):
+Test the endpoint:
 
 ```bash
-curl -s -X POST http://localhost:8000/timestamp \
+DIGEST=a3f5c2d1e9b087640000000000000000000000000000000000000000deadbeef
+
+curl -i -X POST http://localhost:8000/timestamp \
   -H "Content-Type: application/json" \
-  -d '{"digest": "a3f5c2d1e9b087640000000000000000000000000000000000000000deadbeef"}'
+  -d "{\"digest\":\"$DIGEST\"}"
 ```
 
 A working gateway returns HTTP 402 with a Lightning invoice. Pay it, then:
@@ -60,11 +97,9 @@ A working gateway returns HTTP 402 with a Lightning invoice. Pay it, then:
 curl -X POST http://localhost:8000/timestamp \
   -H "Content-Type: application/json" \
   -H "Authorization: preimage=<64-char-hex-preimage>" \
-  -d '{"digest": "a3f5c2d1e9b087640000000000000000000000000000000000000000deadbeef"}' \
+  -d "{\"digest\":\"$DIGEST\"}" \
   -o proof.ots
 ```
-
-A successful payment returns the `.ots` file.
 
 ---
 
@@ -76,8 +111,40 @@ A successful payment returns the `.ots` file.
 | `LND_PORT` | Yes | — | LND REST port (typically `8080`) |
 | `LND_MACAROON_HEX` | Yes | — | Hex-encoded invoice macaroon |
 | `GATEWAY_PRICE_SATS` | Yes | — | Satoshis charged per timestamp |
-| `TOR_PROXY` | No | — | SOCKS5h proxy for LND connections (e.g. `tor:9050`). Required if `LND_HOST` is a `.onion` address. Leave unset for direct clearnet LND. |
-| `LND_TLS_VERIFY` | No | `false` | Set `true` only for CA-signed LND TLS certs. Almost no home node qualifies. |
+| `OTS_BACKEND_MODE` | Yes | — | `calendar` (real mode) or `public` (compatibility/testing only) |
+| `OTS_CALENDAR_URL` | When `calendar` | — | URL of the operator-controlled otsd instance (e.g. `http://otsd:14788`) |
+| `TOR_PROXY` | No | — | SOCKS5h proxy for LND connections. Required if `LND_HOST` is `.onion`. |
+| `LND_TLS_VERIFY` | No | `false` | Set `true` only for CA-signed LND TLS certs. |
+
+`OTS_BACKEND_MODE` validation:
+- `calendar` requires `OTS_CALENDAR_URL` to be set. Gateway fails to start if missing.
+- `public` requires `OTS_CALENDAR_URL` to be absent. Gateway fails to start if both are set.
+- Any other value fails at startup.
+- There is no silent fallback between modes.
+
+---
+
+## OTS backend modes
+
+### calendar — operator-controlled calendar (real mode)
+
+```
+OTS_BACKEND_MODE=calendar
+OTS_CALENDAR_URL=http://otsd:14788
+```
+
+The gateway forwards paid digests to the operator's own otsd instance. otsd aggregates submissions and anchors the aggregate root in Bitcoin once per block cycle. This is the intended production mode.
+
+If the calendar backend fails, the gateway returns generic 502. It does not retry against public calendars.
+
+### public — compatibility/testing mode only
+
+```
+OTS_BACKEND_MODE=public
+# OTS_CALENDAR_URL must NOT be set
+```
+
+The gateway forwards paid digests to the public OpenTimestamps aggregators. This mode is provided for testing without a running otsd. It is not the real target and must not be used in production as a substitute for running your own calendar node.
 
 ---
 
@@ -85,50 +152,38 @@ A successful payment returns the `.ots` file.
 
 ### Tor-only (maximum privacy)
 
-Gateway exposed as a Tor hidden service. LND reachable at a `.onion` address. No clearnet ports exposed.
+Gateway exposed as a Tor hidden service. LND reachable at a `.onion` address.
 
 ```
 LND_HOST=yourlnd.onion
-LND_PORT=8080
-LND_MACAROON_HEX=<hex>
 TOR_PROXY=tor:9050
-GATEWAY_PRICE_SATS=21
-LND_TLS_VERIFY=false
+OTS_BACKEND_MODE=calendar
+OTS_CALENDAR_URL=http://otsd:14788
 ```
 
 ```bash
-docker compose up -d
+docker compose --profile calendar up -d
 docker compose exec tor cat /var/lib/tor/timestamp_gateway/hostname
 ```
 
-Clients reach the gateway at `http://<your-onion>.onion/` over Tor (port 80 maps to the gateway's port 8000).
-
-**Trade-off:** Tor adds latency. Inbound Lightning liquidity over Tor-only nodes is harder to obtain — see [Inbound liquidity](#inbound-liquidity).
-
----
+**Trade-off:** Tor adds latency. Tor-only Lightning nodes have harder inbound routing.
 
 ### Hybrid (practical self-hosted)
 
-Gateway exposed on Tor. LND is clearnet or hybrid.
+Gateway onion. LND clearnet or hybrid. otsd on the same host.
 
 ```
-LND_HOST=192.168.1.x    # or clearnet hostname
-LND_PORT=8080
-LND_MACAROON_HEX=<hex>
-TOR_PROXY=              # leave blank — direct connection to clearnet LND
-GATEWAY_PRICE_SATS=21
-LND_TLS_VERIFY=false
+LND_HOST=192.168.1.x
+TOR_PROXY=              # blank — direct LND connection
+OTS_BACKEND_MODE=calendar
+OTS_CALENDAR_URL=http://otsd:14788
 ```
 
-**Trade-off:** If your LND node advertises a clearnet address, your node pubkey is permanently linked to that IP on the public Lightning graph. Do not expose a home IP casually.
-
----
+**Trade-off:** Clearnet LND links node pubkey to IP on the Lightning graph permanently.
 
 ### Clearnet
 
-Gateway port exposed directly. Tor container still runs for the onion address, but clients can also reach the gateway over clearnet.
-
-In `docker-compose.yml`, uncomment the ports block under `gateway`:
+Uncomment in `docker-compose.yml`:
 
 ```yaml
 ports:
@@ -139,96 +194,100 @@ ports:
 
 ## Connecting to LND
 
-The gateway needs an invoice macaroon: it authorises creating and reading invoices, nothing else.
-
-**Find the macaroon on your node:**
+The gateway needs an invoice macaroon — it authorises creating and reading invoices, nothing else.
 
 ```bash
-# LND default location
-~/.lnd/data/chain/bitcoin/mainnet/invoice.macaroon
-```
-
-**Convert to hex:**
-
-```bash
+# Convert the macaroon to hex
 xxd -p -c 256 ~/.lnd/data/chain/bitcoin/mainnet/invoice.macaroon
 ```
 
-Paste the output as `LND_MACAROON_HEX` in `.env`.
+Paste the output as `LND_MACAROON_HEX`.
 
-**LND on the same Docker host:**
+| LND location | `LND_HOST` value | `TOR_PROXY` |
+|---|---|---|
+| Same Docker host (Linux) | Host LAN IP | blank |
+| Same Docker host (Mac/Windows) | `host.docker.internal` | blank |
+| Remote LAN machine | LAN IP | blank |
+| Onion address | `.onion` address | `tor:9050` |
+| Umbrel | `umbrel.local` | blank |
+
+---
+
+## OTS calendar backend (otsd)
+
+otsd is the OpenTimestamps calendar server. It is the proof engine. The gateway is the paid front door.
+
+**What otsd needs:**
+- A Bitcoin Core node with RPC enabled (pruned is acceptable for the submission role).
+- A wallet loaded in Bitcoin Core with enough BTC to pay for periodic OP_RETURN anchoring transactions.
+- A persistent data directory for calendar state.
+
+**Transaction cost:** otsd submits approximately one Bitcoin transaction per block cycle, containing an OP_RETURN with the Merkle root of all digests aggregated since the last anchoring. Normal on-chain fees apply. A small wallet (50k–100k sats) is sufficient for extended low-volume operation.
+
+**Initial vs anchored proof:** When a digest is first submitted, otsd returns a receipt with a pending attestation pointing to the calendar URL. This is not yet Bitcoin-anchored. After Bitcoin confirms the anchoring block (~1 hour), the proof can be upgraded to a full Bitcoin-anchored `.ots` file using:
+
+```bash
+ots upgrade proof.ots
+ots verify proof.ots
+```
+
+The initial `.ots` file returned by the gateway is a valid pending receipt, not a finalized proof. This is normal and expected behaviour.
+
+**Bitcoin RPC env vars** (pass via `.env` or Compose environment):
 
 ```
-LND_HOST=host.docker.internal   # Mac/Windows Docker Desktop
-# or the host's LAN IP on Linux
+BITCOIN_RPC_HOST=
+BITCOIN_RPC_PORT=8332
+BITCOIN_RPC_USER=
+BITCOIN_RPC_PASSWORD=
 ```
 
-**LND on a remote machine (LAN):**
+**otsd is not publicly exposed.** It runs on the internal `ts_net` Docker network. The gateway reaches it at `http://otsd:14788`. Clients have no direct access to otsd; they interact only with the gateway.
 
-```
-LND_HOST=192.168.1.x
-TOR_PROXY=              # blank — direct connection
-```
-
-**LND behind a `.onion` address:**
-
-```
-LND_HOST=yourlnd.onion
-TOR_PROXY=tor:9050
-```
+Verify current otsd installation and configuration at:
+`https://github.com/opentimestamps/opentimestamps-server`
 
 ---
 
 ## Inbound liquidity
 
-To receive Lightning payments, the LND backend must have inbound liquidity: capacity must exist on the remote side of a channel so other nodes can route payments to you.
+To receive Lightning payments, the LND backend must have inbound liquidity. Other nodes must be able to route payments to your node.
 
-**This is a Lightning network and operator issue, not a FastAPI or OpenTimestamps issue.** The gateway itself has no control over routing.
+**This is a Lightning network and operator issue, not a gateway or OTS issue.**
 
-Options for getting inbound capacity:
+Options:
+- **Boltz submarine swap** — push sats from local channel balance to the remote side, creating inbound capacity without opening a new channel.
+- **Receive a channel** — ask a well-connected node (Loop, Bitrefill Thor, ACINQ, Amboss Magma) to open a channel to you.
+- **Lightning Terminal / Pool** — purchase inbound liquidity from the market.
 
-- **Submarine swap:** Use [Boltz](https://boltz.exchange/) to swap sats from your local channel balance to the remote side, creating inbound capacity without opening a new channel.
-- **Receive a channel:** Ask a well-connected node (Loop, Bitrefill Thor, ACINQ, Amboss Magma) to open a channel to you.
-- **Lightning Terminal / Lightning Pool:** Purchase inbound liquidity from the market.
-
-**Tor-only nodes have additional routing challenges.** Many Lightning nodes will not route payments to Tor-only endpoints because they cannot reliably reach them. Options:
-
-- Accept lower payment reliability in exchange for better privacy.
-- Run a hybrid Lightning node that advertises both a clearnet and a Tor address, but understand the privacy implications below.
+**Tor-only nodes have harder routing.** Many nodes will not route payments to Tor-only endpoints. Options: accept lower reliability, use a hybrid node, or use a VPS for LND.
 
 ---
 
 ## Privacy trade-offs
 
-| Scenario | What is visible publicly |
+| Scenario | What is publicly visible |
 |---|---|
-| Tor-only gateway, Tor-only LND | Nothing — no clearnet footprint |
-| Tor gateway, clearnet LND | Your LND node pubkey and IP are on the Lightning graph |
-| Clearnet gateway | Your gateway IP is public; your LND depends on config |
+| Tor-only gateway + Tor-only LND | No clearnet footprint |
+| Tor gateway + clearnet LND | LND node pubkey and IP on Lightning graph |
+| Clearnet gateway | Gateway IP is public; LND depends on config |
 
-**Lightning graph exposure is permanent.** If your LND node advertises a clearnet IP, that IP and your node pubkey are recorded by Lightning explorers (1ML, Amboss, Mempool) and archived. This cannot be undone after the fact.
+Lightning graph exposure is permanent. If your LND node advertises a clearnet IP, that association is recorded by Lightning explorers and cannot be undone.
 
-**Recommendations:**
-
-- Do not expose a home IP on the Lightning network unless you understand and accept the consequence.
-- Use a VPS or hosted server if you want a public, well-connected node without exposing a home address.
-- A Tor-only node trades routing reliability for privacy. This is a valid choice for lower-volume personal use.
-- The gateway itself does not log digests, client IPs, or payment preimages beyond what uvicorn writes to stdout.
+The gateway does not log digests, client IPs, or payment preimages beyond normal uvicorn access logs.
 
 ---
 
 ## Running on home hardware and node boxes
 
-timestamp-gateway runs anywhere Docker runs.
-
 | Platform | Notes |
 |---|---|
-| Raspberry Pi / ARM64 | Works. `python:3.13-slim` and `debian:bookworm-slim` are multi-arch. |
+| Raspberry Pi / ARM64 | Works. All base images are multi-arch. |
 | Home Linux / mini PC | Standard Docker Compose. |
-| Umbrel | Run `docker compose up -d` in the gateway directory. Point `LND_HOST` at the Umbrel LND REST address (usually `umbrel.local:8080`). |
-| Start9 | Run as a Docker Compose stack. Embassy OS can manage arbitrary compose stacks. Retrieve the macaroon from the Embassy LND app. |
-| VPS / data-centre | Standard deployment. See clearnet and privacy trade-offs above. |
-| NGO / university / journalist infrastructure | Tor-only mode recommended. No clearnet exposure required. |
+| Umbrel | Run `docker compose --profile calendar up -d`. Point `LND_HOST` at Umbrel LND REST. |
+| Start9 | Run as a Docker Compose stack. Retrieve the macaroon from the LND app. |
+| VPS / data-centre | Standard deployment. Consider the clearnet privacy trade-offs. |
+| NGO / university / journalist | Tor-only mode recommended. No clearnet exposure required. |
 
 ---
 
@@ -237,11 +296,11 @@ timestamp-gateway runs anywhere Docker runs.
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # fill in LND vars
+cp .env.example .env   # fill in LND vars and set OTS_BACKEND_MODE
 uvicorn main:app --reload
 ```
 
-Run the test suite (no LND or Tor required — all network calls are mocked):
+Run the test suite (no LND, Tor, or otsd required — all network calls are mocked):
 
 ```bash
 pytest -q
@@ -249,23 +308,13 @@ pytest -q
 
 ---
 
-## Browser UI
+## Verifying a proof
 
-The gateway includes a minimal single-page UI at `/ui`. It:
-
-- Accepts a file or a manual digest input.
-- Hashes the file locally using the Web Crypto API (the file never leaves the browser).
-- Guides the user through the payment state.
-- Auto-downloads the `.ots` file on success.
-
----
-
-## Verifying a timestamp
-
-Once the `.ots` file is returned, the digest is pending calendar confirmation. After Bitcoin confirms the anchoring block (~1 hour):
+After receiving a `.ots` file, the proof is pending calendar confirmation. After Bitcoin confirms the anchoring block (~1 hour):
 
 ```bash
-ots verify proof.ots -f yourfile
+ots upgrade proof.ots   # fetches the Bitcoin anchoring from the calendar
+ots verify proof.ots    # verifies against Bitcoin
 ```
 
-Or use the [OpenTimestamps web verifier](https://opentimestamps.org). The proof is independently verifiable against Bitcoin without trusting the gateway.
+Or use the [OpenTimestamps web verifier](https://opentimestamps.org). The proof is independently verifiable against Bitcoin without trusting the gateway or the calendar after the fact.

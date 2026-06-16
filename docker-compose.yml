@@ -22,9 +22,41 @@ services:
     # ports:
     #   - "127.0.0.1:9050:9050"
 
+  # ── OTS calendar backend (otsd) ────────────────────────────────────────────
+  # The operator-controlled OpenTimestamps calendar server.
+  # This is the proof engine. The gateway is the paid front door to this service.
+  #
+  # Usage:
+  #   docker compose --profile calendar up -d
+  #
+  # Or point OTS_CALENDAR_URL at an external otsd instance and omit this service.
+  #
+  # otsd requires access to a Bitcoin Core node (RPC) and a wallet with funds
+  # to pay for on-chain anchoring transactions. See docs/operator-guide.md.
+  #
+  # otsd is NOT publicly exposed. Clients submit digests to the gateway, which
+  # forwards paid digests to otsd over the internal ts_net network.
+  otsd:
+    build: ./otsd
+    profiles: ["calendar"]
+    restart: unless-stopped
+    volumes:
+      - otsd_data:/data
+    networks:
+      - ts_net
+    # Bitcoin Core RPC connection for otsd — supply via environment or .env
+    environment:
+      - BITCOIN_RPC_HOST=${BITCOIN_RPC_HOST:-}
+      - BITCOIN_RPC_PORT=${BITCOIN_RPC_PORT:-8332}
+      - BITCOIN_RPC_USER=${BITCOIN_RPC_USER:-}
+      - BITCOIN_RPC_PASSWORD=${BITCOIN_RPC_PASSWORD:-}
+    # Internal only — not exposed to host or public network.
+    # The gateway reaches otsd at http://otsd:14788 within ts_net.
+
 networks:
   ts_net:
     driver: bridge
 
 volumes:
   tor_keys:
+  otsd_data:
