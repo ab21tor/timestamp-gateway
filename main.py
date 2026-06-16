@@ -80,7 +80,7 @@ def create_invoice(memo: str, amount_sats: int) -> str:
         resp = requests.post(
             url,
             headers=headers,
-            json={"memo": memo, "value": amount_sats},
+            json={"memo": memo, "value": amount_sats, "private": True},
             proxies=proxies,
             verify=LND_TLS_VERIFY,
             timeout=30,
