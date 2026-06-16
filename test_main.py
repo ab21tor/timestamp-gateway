@@ -1,3 +1,4 @@
+import main
 import os
 from unittest.mock import MagicMock, patch
 
@@ -285,3 +286,21 @@ def test_successful_response_returns_ots_bytes_with_filename():
     assert resp.status_code == 200
     assert resp.content == FAKE_OTS
     assert f"{DIGEST}.ots" in resp.headers["content-disposition"]
+
+def test_create_invoice_requests_private_invoice(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        def raise_for_status(self): pass
+        def json(self): return {"payment_request": "lnbc..."}
+
+    def fake_post(url, headers=None, json=None, proxies=None, verify=None, timeout=None):
+        captured["json"] = json
+        return FakeResponse()
+
+    monkeypatch.setattr("main.requests.post", fake_post)
+    invoice = main.create_invoice("a" * 64, 21)
+    assert invoice == "lnbc..."
+    assert captured["json"]["memo"] == "a" * 64
+    assert captured["json"]["value"] == 21
+    assert captured["json"]["private"] is True
