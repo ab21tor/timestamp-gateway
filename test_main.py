@@ -11,9 +11,12 @@ os.environ["LND_PORT"] = "8080"
 os.environ["LND_MACAROON_HEX"] = "deadbeef" * 8
 os.environ["TOR_PROXY"] = "127.0.0.1:9050"
 os.environ["GATEWAY_PRICE_SATS"] = "21"
+os.environ["OTS_BACKEND_MODE"] = "calendar"
+os.environ["OTS_CALENDAR_URL"] = "http://test-calendar:14788"
 
 from fastapi.testclient import TestClient  # noqa: E402
 from main import app, _parse_config, stamp_digest  # noqa: E402
+from opentimestamps.calendar import DEFAULT_AGGREGATORS  # noqa: E402
 from opentimestamps.core.notary import PendingAttestation  # noqa: E402
 from opentimestamps.core.timestamp import Timestamp  # noqa: E402
 
@@ -23,6 +26,7 @@ DIGEST = "a" * 64          # valid 64-char lowercase hex
 PREIMAGE = "b" * 64        # valid 64-char hex preimage
 FAKE_INVOICE = "lnbc210n1pfakeinvoicefortesting"
 FAKE_OTS = b"\x00\x01\x02\x03opentimestamps"
+TEST_CALENDAR_URL = "http://test-calendar:14788"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -43,6 +47,13 @@ def _post_mock():
 
 def _settled_get():
     return _get_mock(True, DIGEST, 21)
+
+
+def _good_calendar_ts():
+    """A Timestamp with a PendingAttestation so serialization succeeds."""
+    ts = Timestamp(bytes.fromhex(DIGEST))
+    ts.attestations.add(PendingAttestation("https://test.calendar.example"))
+    return ts
 
 
 # ── 1. Input validation ───────────────────────────────────────────────────────
@@ -73,7 +84,7 @@ def test_digest_normalized_to_lowercase_in_memo():
     assert patched.call_args.kwargs["json"]["memo"] == "a" * 64
 
 
-# ── 2. Startup config validation ──────────────────────────────────────────────
+# ── 2. Startup config validation — LND ───────────────────────────────────────
 
 def test_non_integer_gateway_price_fails_at_startup():
     with patch.dict(os.environ, {"GATEWAY_PRICE_SATS": "abc"}):
@@ -93,7 +104,29 @@ def test_negative_gateway_price_fails_at_startup():
             _parse_config()
 
 
-# ── 3. Authorization header handling ─────────────────────────────────────────
+# ── 3. Startup config validation — OTS backend ───────────────────────────────
+
+def test_invalid_ots_backend_mode_fails_at_startup():
+    with patch.dict(os.environ, {"OTS_BACKEND_MODE": "invalid"}):
+        with pytest.raises(RuntimeError, match="OTS_BACKEND_MODE must be"):
+            _parse_config()
+
+
+def test_calendar_mode_requires_calendar_url():
+    # Empty OTS_CALENDAR_URL with calendar mode must fail.
+    with patch.dict(os.environ, {"OTS_BACKEND_MODE": "calendar", "OTS_CALENDAR_URL": ""}):
+        with pytest.raises(RuntimeError, match="OTS_CALENDAR_URL is required"):
+            _parse_config()
+
+
+def test_public_mode_rejects_calendar_url():
+    # OTS_CALENDAR_URL is set in module-level env; switching to public mode must fail.
+    with patch.dict(os.environ, {"OTS_BACKEND_MODE": "public"}):
+        with pytest.raises(RuntimeError, match="OTS_CALENDAR_URL must not be set"):
+            _parse_config()
+
+
+# ── 4. Authorization header handling ─────────────────────────────────────────
 
 def test_malformed_authorization_returns_401():
     resp = client.post(
@@ -133,7 +166,7 @@ def test_uppercase_preimage_hex_is_accepted():
     assert resp.status_code == 200
 
 
-# ── 4. Payment verification ───────────────────────────────────────────────────
+# ── 5. Payment verification ───────────────────────────────────────────────────
 
 def test_valid_preimage_unpaid_returns_402():
     with patch("main.requests.get", return_value=_get_mock(False, DIGEST, 0)):
@@ -166,7 +199,7 @@ def test_settled_correct_memo_underpaid_returns_402():
     assert resp.status_code == 402
 
 
-# ── 5. LND errors ─────────────────────────────────────────────────────────────
+# ── 6. LND errors ─────────────────────────────────────────────────────────────
 
 def test_lnd_invoice_creation_http_error_returns_502():
     m = MagicMock()
@@ -228,11 +261,35 @@ def test_lnd_lookup_non_integer_amt_paid_sat_returns_502():
     assert resp.json()["detail"] == "LND error: could not verify payment"
 
 
-# ── 6. OTS ────────────────────────────────────────────────────────────────────
+# ── 7. OTS backend — calendar mode ───────────────────────────────────────────
 
-def test_ots_all_calendars_fail_returns_502():
+def test_calendar_mode_submits_only_to_calendar_url():
+    """Calendar mode must call RemoteCalendar with OTS_CALENDAR_URL, not an aggregator."""
+    calendar_instance = MagicMock()
+    calendar_instance.submit.return_value = _good_calendar_ts()
+    with patch("main.RemoteCalendar") as MockCalendar:
+        MockCalendar.return_value = calendar_instance
+        stamp_digest(DIGEST)
+    MockCalendar.assert_called_once_with(TEST_CALENDAR_URL)
+
+
+def test_calendar_mode_does_not_call_default_aggregators():
+    """Calendar mode must not touch DEFAULT_AGGREGATORS under any circumstance."""
+    calendar_instance = MagicMock()
+    calendar_instance.submit.return_value = _good_calendar_ts()
+    with patch("main.RemoteCalendar") as MockCalendar:
+        MockCalendar.return_value = calendar_instance
+        stamp_digest(DIGEST)
+    assert MockCalendar.call_count == 1
+    called_url = MockCalendar.call_args[0][0]
+    for agg_url in DEFAULT_AGGREGATORS:
+        assert called_url != agg_url, f"calendar mode called aggregator {agg_url}"
+
+
+def test_calendar_backend_fails_returns_502():
+    """A calendar backend failure must return 502 with a generic error message."""
     fail_instance = MagicMock()
-    fail_instance.submit.side_effect = ConnectionError("unreachable")
+    fail_instance.submit.side_effect = ConnectionError("calendar unreachable")
     with patch("main.requests.get", return_value=_settled_get()):
         with patch("main.RemoteCalendar", return_value=fail_instance):
             resp = client.post(
@@ -244,24 +301,91 @@ def test_ots_all_calendars_fail_returns_502():
     assert resp.json()["detail"] == "OTS error: stamping failed"
 
 
-def test_ots_partial_calendar_failure_still_returns_bytes():
-    # First calendar down; rest succeed — result must be valid .ots bytes.
-    # The Timestamp returned by a calendar must carry at least one attestation
-    # so that serialization does not raise "An empty timestamp can't be serialized".
-    good_ts = Timestamp(bytes.fromhex(DIGEST))
-    good_ts.attestations.add(PendingAttestation("https://test.calendar.example"))
+def test_calendar_mode_no_fallback_to_public_on_failure():
+    """When the calendar backend fails, the gateway must not fall back to public aggregators."""
+    fail_instance = MagicMock()
+    fail_instance.submit.side_effect = ConnectionError("calendar unreachable")
+    with patch("main.requests.get", return_value=_settled_get()):
+        with patch("main.RemoteCalendar") as MockCalendar:
+            MockCalendar.return_value = fail_instance
+            resp = client.post(
+                "/timestamp",
+                json={"digest": DIGEST},
+                headers={"Authorization": f"preimage={PREIMAGE}"},
+            )
+    assert resp.status_code == 502
+    # Only one call should have been made — to the calendar URL, not to any aggregator.
+    assert MockCalendar.call_count == 1
+    called_url = MockCalendar.call_args[0][0]
+    for agg_url in DEFAULT_AGGREGATORS:
+        assert called_url != agg_url, f"fell back to public aggregator {agg_url}"
+
+
+def test_calendar_mode_success_returns_ots_bytes():
+    """Successful calendar-mode flow returns raw .ots bytes with octet-stream content type."""
+    calendar_instance = MagicMock()
+    calendar_instance.submit.return_value = _good_calendar_ts()
+    with patch("main.requests.get", return_value=_settled_get()):
+        with patch("main.RemoteCalendar", return_value=calendar_instance):
+            resp = client.post(
+                "/timestamp",
+                json={"digest": DIGEST},
+                headers={"Authorization": f"preimage={PREIMAGE}"},
+            )
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/octet-stream"
+    assert len(resp.content) > 0
+
+
+# ── 8. OTS backend — public mode (compatibility/testing) ─────────────────────
+
+def test_public_mode_submits_to_all_default_aggregators():
+    """Public mode (compatibility/testing) must submit to all DEFAULT_AGGREGATORS."""
+    ok_instance = MagicMock()
+    ok_instance.submit.return_value = _good_calendar_ts()
+    with patch("main.OTS_BACKEND_MODE", "public"):
+        with patch("main.RemoteCalendar") as MockCalendar:
+            MockCalendar.return_value = ok_instance
+            result = stamp_digest(DIGEST)
+    assert isinstance(result, bytes) and len(result) > 0
+    assert MockCalendar.call_count == len(DEFAULT_AGGREGATORS)
+    called_urls = [call[0][0] for call in MockCalendar.call_args_list]
+    for url in DEFAULT_AGGREGATORS:
+        assert url in called_urls, f"public mode did not submit to aggregator {url}"
+
+
+def test_public_mode_partial_calendar_failure_still_returns_bytes():
+    """Public mode: first aggregator fails, rest succeed — result must be valid .ots bytes."""
     fail_instance = MagicMock()
     fail_instance.submit.side_effect = ConnectionError("unreachable")
     ok_instance = MagicMock()
-    ok_instance.submit.return_value = good_ts
-    # DEFAULT_AGGREGATORS has 4 entries; provide enough for all of them.
-    with patch("main.RemoteCalendar", side_effect=[fail_instance, ok_instance, ok_instance, ok_instance]):
-        result = stamp_digest(DIGEST)
-    assert isinstance(result, bytes)
-    assert len(result) > 0
+    ok_instance.submit.return_value = _good_calendar_ts()
+    with patch("main.OTS_BACKEND_MODE", "public"):
+        with patch(
+            "main.RemoteCalendar",
+            side_effect=[fail_instance, ok_instance, ok_instance, ok_instance],
+        ):
+            result = stamp_digest(DIGEST)
+    assert isinstance(result, bytes) and len(result) > 0
 
 
-# ── 7. Happy path ─────────────────────────────────────────────────────────────
+def test_public_mode_all_aggregators_fail_returns_502():
+    """Public mode: all aggregators failing must return 502 — same contract as calendar mode."""
+    fail_instance = MagicMock()
+    fail_instance.submit.side_effect = ConnectionError("unreachable")
+    with patch("main.OTS_BACKEND_MODE", "public"):
+        with patch("main.requests.get", return_value=_settled_get()):
+            with patch("main.RemoteCalendar", return_value=fail_instance):
+                resp = client.post(
+                    "/timestamp",
+                    json={"digest": DIGEST},
+                    headers={"Authorization": f"preimage={PREIMAGE}"},
+                )
+    assert resp.status_code == 502
+    assert resp.json()["detail"] == "OTS error: stamping failed"
+
+
+# ── 9. Happy path ─────────────────────────────────────────────────────────────
 
 def test_successful_response_has_octet_stream_content_type():
     with patch("main.requests.get", return_value=_settled_get()):
