@@ -1,4 +1,3 @@
-import main
 import os
 from unittest.mock import MagicMock, patch
 
@@ -14,6 +13,7 @@ os.environ["GATEWAY_PRICE_SATS"] = "21"
 os.environ["OTS_BACKEND_MODE"] = "calendar"
 os.environ["OTS_CALENDAR_URL"] = "http://test-calendar:14788"
 
+import main  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 from main import app, _parse_config, stamp_digest  # noqa: E402
 from opentimestamps.calendar import DEFAULT_AGGREGATORS  # noqa: E402
@@ -410,6 +410,78 @@ def test_successful_response_returns_ots_bytes_with_filename():
     assert resp.status_code == 200
     assert resp.content == FAKE_OTS
     assert f"{DIGEST}.ots" in resp.headers["content-disposition"]
+
+# ── 10. Health endpoint ───────────────────────────────────────────────────────
+
+def _ok_lnd():
+    m = MagicMock()
+    m.raise_for_status.return_value = None
+    m.json.return_value = {"alias": "test-node"}
+    return m
+
+
+def _ok_otsd():
+    m = MagicMock()
+    m.raise_for_status.return_value = None
+    return m
+
+
+def _fail():
+    m = MagicMock()
+    m.raise_for_status.side_effect = Exception("connection refused")
+    return m
+
+
+def test_health_both_ok_returns_200():
+    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+        resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok", "lnd": "ok", "otsd": "ok"}
+
+
+def test_health_lnd_down_returns_503():
+    with patch("main.requests.get", side_effect=[_fail(), _ok_otsd()]):
+        resp = client.get("/health")
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["status"] == "degraded"
+    assert body["lnd"] == "error"
+    assert body["otsd"] == "ok"
+
+
+def test_health_otsd_down_returns_503():
+    with patch("main.requests.get", side_effect=[_ok_lnd(), _fail()]):
+        resp = client.get("/health")
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["status"] == "degraded"
+    assert body["lnd"] == "ok"
+    assert body["otsd"] == "error"
+
+
+def test_health_both_down_returns_503():
+    with patch("main.requests.get", side_effect=[_fail(), _fail()]):
+        resp = client.get("/health")
+    assert resp.status_code == 503
+    assert resp.json() == {"status": "degraded", "lnd": "error", "otsd": "error"}
+
+
+def test_health_public_mode_otsd_is_na():
+    with patch("main.OTS_CALENDAR_URL", None):
+        with patch("main.requests.get", return_value=_ok_lnd()):
+            resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok", "lnd": "ok", "otsd": "n/a"}
+
+
+def test_health_never_raises():
+    with patch("main.requests.get", side_effect=RuntimeError("unexpected crash")):
+        resp = client.get("/health")
+    assert resp.status_code == 503
+    assert resp.json()["lnd"] == "error"
+
+
+# ── 11. Invoice private flag ──────────────────────────────────────────────────
 
 def test_create_invoice_requests_private_invoice(monkeypatch):
     captured = {}

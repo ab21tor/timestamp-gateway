@@ -8,6 +8,7 @@ import urllib3
 from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
 from opentimestamps.core.op import OpSHA256
@@ -190,6 +191,43 @@ def verify_payment(preimage_hex: str, digest: str) -> bool:
 @app.get("/")
 def root():
     return {"status": "running"}
+
+
+@app.get("/health")
+def health():
+    proxies = {"https": f"socks5h://{TOR_PROXY}"} if TOR_PROXY else None
+    headers = {"Grpc-Metadata-macaroon": LND_MACAROON_HEX}
+
+    lnd_status = "ok"
+    try:
+        resp = requests.get(
+            f"https://{LND_HOST}:{LND_PORT}/v1/getinfo",
+            headers=headers,
+            proxies=proxies,
+            verify=LND_TLS_VERIFY,
+            timeout=5,
+        )
+        resp.raise_for_status()
+    except Exception:
+        logging.warning("Health check: LND unreachable")
+        lnd_status = "error"
+
+    if OTS_CALENDAR_URL:
+        otsd_status = "ok"
+        try:
+            resp = requests.get(OTS_CALENDAR_URL, timeout=5)
+            resp.raise_for_status()
+        except Exception:
+            logging.warning("Health check: otsd unreachable at %s", OTS_CALENDAR_URL)
+            otsd_status = "error"
+    else:
+        otsd_status = "n/a"
+
+    overall = "ok" if lnd_status == "ok" and otsd_status in ("ok", "n/a") else "degraded"
+    return JSONResponse(
+        status_code=200 if overall == "ok" else 503,
+        content={"status": overall, "lnd": lnd_status, "otsd": otsd_status},
+    )
 
 
 @app.post("/timestamp")
