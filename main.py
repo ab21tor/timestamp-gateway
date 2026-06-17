@@ -64,6 +64,7 @@ def _parse_config():
         os.getenv("LND_TLS_VERIFY", "false").lower() == "true",
         mode,
         calendar_url,
+        os.getenv("LND_READONLY_MACAROON_HEX") or None,  # optional; falls back to LND_MACAROON_HEX
     )
 
 
@@ -77,6 +78,7 @@ load_dotenv()
     LND_TLS_VERIFY,
     OTS_BACKEND_MODE,
     OTS_CALENDAR_URL,
+    LND_READONLY_MACAROON_HEX,
 ) = _parse_config()
 
 if not LND_TLS_VERIFY:
@@ -196,7 +198,7 @@ def root():
 @app.get("/health")
 def health():
     proxies = {"https": f"socks5h://{TOR_PROXY}"} if TOR_PROXY else None
-    headers = {"Grpc-Metadata-macaroon": LND_MACAROON_HEX}
+    headers = {"Grpc-Metadata-macaroon": LND_READONLY_MACAROON_HEX or LND_MACAROON_HEX}
 
     lnd_status = "ok"
     try:

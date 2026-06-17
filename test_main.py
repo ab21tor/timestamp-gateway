@@ -481,6 +481,25 @@ def test_health_never_raises():
     assert resp.json()["lnd"] == "error"
 
 
+def test_health_uses_readonly_macaroon_when_set():
+    readonly_mac = "ab" * 32  # 64 hex chars
+    with patch("main.LND_READONLY_MACAROON_HEX", readonly_mac):
+        with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]) as mock_get:
+            resp = client.get("/health")
+    assert resp.status_code == 200
+    lnd_headers = mock_get.call_args_list[0].kwargs["headers"]
+    assert lnd_headers["Grpc-Metadata-macaroon"] == readonly_mac
+
+
+def test_health_falls_back_to_invoice_macaroon_when_readonly_not_set():
+    with patch("main.LND_READONLY_MACAROON_HEX", None):
+        with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]) as mock_get:
+            resp = client.get("/health")
+    assert resp.status_code == 200
+    lnd_headers = mock_get.call_args_list[0].kwargs["headers"]
+    assert lnd_headers["Grpc-Metadata-macaroon"] == "deadbeef" * 8
+
+
 # ── 11. Invoice private flag ──────────────────────────────────────────────────
 
 def test_create_invoice_requests_private_invoice(monkeypatch):
