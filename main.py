@@ -1,8 +1,11 @@
+import base64
 import hashlib
 import io
 import logging
 import os
 import re
+import secrets
+import time
 import requests
 import urllib3
 from pathlib import Path
@@ -11,10 +14,18 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
+from pymacaroons import Macaroon, Verifier
+from pymacaroons.exceptions import MacaroonException
 from opentimestamps.core.op import OpSHA256
 from opentimestamps.core.timestamp import DetachedTimestampFile, Timestamp
 from opentimestamps.core.serialize import StreamSerializationContext
 from opentimestamps.calendar import RemoteCalendar, DEFAULT_AGGREGATORS
+
+
+# L402 token constants. The capability names the endpoint a token authorizes, so a
+# token minted for one action cannot be replayed against another.
+L402_LOCATION = "timestamp-gateway"
+L402_CAPABILITY = "timestamp"
 
 
 def _parse_config():
@@ -55,6 +66,58 @@ def _parse_config():
             "set OTS_BACKEND_MODE=calendar to use a specific calendar backend"
         )
 
+    # ── L402 token signing key ────────────────────────────────────────────────
+    # Root key used to sign and verify L402 macaroons. It is required in
+    # production: a stable key means a paid-but-not-yet-redeemed token still
+    # verifies after a gateway restart. A random per-process key is allowed only
+    # as an explicit development opt-out, because it would invalidate such tokens
+    # on every restart.
+    secret_hex = os.getenv("L402_SECRET_HEX") or None
+    allow_ephemeral = os.getenv("L402_ALLOW_EPHEMERAL_SECRET", "false").lower() == "true"
+    if secret_hex:
+        try:
+            l402_secret = bytes.fromhex(secret_hex)
+        except ValueError:
+            raise RuntimeError("L402_SECRET_HEX must be a hex string")
+        if len(l402_secret) < 16:
+            raise RuntimeError("L402_SECRET_HEX must decode to at least 16 bytes")
+    elif allow_ephemeral:
+        l402_secret = secrets.token_bytes(32)
+        logging.warning(
+            "L402_SECRET_HEX is not set and L402_ALLOW_EPHEMERAL_SECRET=true; using a "
+            "random per-process key. Paid-but-unredeemed tokens will not verify after a "
+            "restart. Development only."
+        )
+    else:
+        raise RuntimeError(
+            "L402_SECRET_HEX is required. Generate one with "
+            "`python -c \"import secrets; print(secrets.token_hex(32))\"`. "
+            "For development only, set L402_ALLOW_EPHEMERAL_SECRET=true to use a "
+            "random per-process key instead."
+        )
+
+    try:
+        l402_expiry = int(os.getenv("L402_TOKEN_EXPIRY_SECONDS", "3600"))
+    except ValueError:
+        raise RuntimeError("L402_TOKEN_EXPIRY_SECONDS must be an integer")
+    if l402_expiry <= 0:
+        raise RuntimeError("L402_TOKEN_EXPIRY_SECONDS must be a positive integer")
+
+    # ── OTS submission retry (otsd-not-ready resilience) ──────────────────────
+    try:
+        ots_max_attempts = int(os.getenv("OTS_SUBMIT_MAX_ATTEMPTS", "5"))
+    except ValueError:
+        raise RuntimeError("OTS_SUBMIT_MAX_ATTEMPTS must be an integer")
+    if ots_max_attempts < 1:
+        raise RuntimeError("OTS_SUBMIT_MAX_ATTEMPTS must be >= 1")
+
+    try:
+        ots_backoff = float(os.getenv("OTS_SUBMIT_BACKOFF_SECONDS", "2"))
+    except ValueError:
+        raise RuntimeError("OTS_SUBMIT_BACKOFF_SECONDS must be a number")
+    if ots_backoff < 0:
+        raise RuntimeError("OTS_SUBMIT_BACKOFF_SECONDS must be >= 0")
+
     return (
         os.getenv("LND_HOST"),
         os.getenv("LND_PORT"),
@@ -65,6 +128,10 @@ def _parse_config():
         mode,
         calendar_url,
         os.getenv("LND_READONLY_MACAROON_HEX") or None,  # optional; falls back to LND_MACAROON_HEX
+        l402_secret,
+        l402_expiry,
+        ots_max_attempts,
+        ots_backoff,
     )
 
 
@@ -79,12 +146,18 @@ load_dotenv()
     OTS_BACKEND_MODE,
     OTS_CALENDAR_URL,
     LND_READONLY_MACAROON_HEX,
+    L402_SECRET,
+    L402_TOKEN_EXPIRY_SECONDS,
+    OTS_SUBMIT_MAX_ATTEMPTS,
+    OTS_SUBMIT_BACKOFF_SECONDS,
 ) = _parse_config()
 
 if not LND_TLS_VERIFY:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-AUTH_RE = re.compile(r"^preimage=([0-9a-fA-F]{64})$")
+# "L402 <macaroon>:<preimage>" — the macaroon is base64 (urlsafe or standard,
+# padded or not) and never contains a colon; the preimage is 64 hex chars.
+L402_AUTH_RE = re.compile(r"^L402\s+([A-Za-z0-9+/=_-]+):([0-9a-fA-F]{64})$")
 
 app = FastAPI()
 app.mount("/ui", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="ui")
@@ -101,13 +174,97 @@ class TimestampRequest(BaseModel):
         return v.lower()
 
 
-def parse_preimage(auth: str) -> str | None:
-    m = AUTH_RE.match(auth)
-    return m.group(1) if m else None
+# ── L402 token (macaroon) ────────────────────────────────────────────────────
+
+def _caveat_text(caveat_id) -> str:
+    """pymacaroons stores caveat ids as str or bytes depending on version; normalize."""
+    if isinstance(caveat_id, bytes):
+        return caveat_id.decode("utf-8", "replace")
+    return caveat_id
 
 
-def create_invoice(memo: str, amount_sats: int) -> str:
-    """Call LND REST API to create a Lightning invoice. Returns the BOLT11 payment_request. Raises HTTPException 502 on any failure."""
+def mint_l402_token(digest: str, payment_hash: str, price: int, expiry_ts: int) -> str:
+    """Mint an L402 macaroon bound to a specific digest, payment hash, price,
+    capability, and expiry. Returned base64-serialized for the WWW-Authenticate header."""
+    m = Macaroon(location=L402_LOCATION, identifier=payment_hash, key=L402_SECRET)
+    m.add_first_party_caveat(f"digest={digest}")
+    m.add_first_party_caveat(f"payment_hash={payment_hash}")
+    m.add_first_party_caveat(f"price={price}")
+    m.add_first_party_caveat(f"capability={L402_CAPABILITY}")
+    m.add_first_party_caveat(f"expiry={expiry_ts}")
+    return m.serialize()
+
+
+def _caveat_value(m: Macaroon, key: str) -> str | None:
+    prefix = f"{key}="
+    for caveat in m.first_party_caveats():
+        text = _caveat_text(caveat.caveat_id)
+        if text.startswith(prefix):
+            return text[len(prefix):]
+    return None
+
+
+def _expiry_satisfier(caveat_id) -> bool:
+    text = _caveat_text(caveat_id)
+    if not text.startswith("expiry="):
+        return False
+    try:
+        return time.time() < int(text[len("expiry="):])
+    except ValueError:
+        return False
+
+
+def _payment_hash_satisfier(caveat_id) -> bool:
+    return re.fullmatch(r"payment_hash=[0-9a-f]{64}", _caveat_text(caveat_id)) is not None
+
+
+def verify_l402_token(macaroon_b64: str, digest: str) -> str:
+    """Verify an L402 macaroon against the request digest and the server root key.
+
+    Checks token integrity (signature), the digest binding, the price binding, the
+    capability binding, and the expiry. On success returns the bound payment hash
+    (hex). Any invalid, expired, tampered, or wrong-digest token raises
+    HTTPException 401 — an authorization failure, not a payment one."""
+    try:
+        m = Macaroon.deserialize(macaroon_b64)
+    except Exception:
+        logging.exception("L402 macaroon could not be parsed")
+        raise HTTPException(status_code=401, detail="Invalid L402 token")
+
+    payment_hash = _caveat_value(m, "payment_hash")
+    if not payment_hash or not re.fullmatch(r"[0-9a-f]{64}", payment_hash):
+        raise HTTPException(status_code=401, detail="Invalid L402 token")
+
+    verifier = Verifier()
+    verifier.satisfy_exact(f"digest={digest}")
+    verifier.satisfy_exact(f"price={GATEWAY_PRICE_SATS}")
+    verifier.satisfy_exact(f"capability={L402_CAPABILITY}")
+    verifier.satisfy_general(_payment_hash_satisfier)
+    verifier.satisfy_general(_expiry_satisfier)
+
+    try:
+        verifier.verify(m, L402_SECRET)
+    except MacaroonException:
+        raise HTTPException(status_code=401, detail="Invalid, expired, or wrong-digest L402 token")
+    except Exception:
+        logging.exception("L402 verification raised unexpectedly")
+        raise HTTPException(status_code=401, detail="Invalid L402 token")
+
+    return payment_hash
+
+
+def parse_l402_auth(auth: str) -> tuple[str, str] | None:
+    """Parse 'L402 <macaroon>:<preimage>'. Returns (macaroon_b64, preimage_hex)
+    or None if the header is not a well-formed L402 authorization."""
+    m = L402_AUTH_RE.match(auth.strip())
+    if not m:
+        return None
+    return m.group(1), m.group(2).lower()
+
+
+def create_invoice(memo: str, amount_sats: int) -> tuple[str, str]:
+    """Call LND REST API to create a Lightning invoice. Returns
+    (payment_request, payment_hash_hex). Raises HTTPException 502 on any failure."""
     proxies = {"https": f"socks5h://{TOR_PROXY}"} if TOR_PROXY else None
     headers = {"Grpc-Metadata-macaroon": LND_MACAROON_HEX}
     url = f"https://{LND_HOST}:{LND_PORT}/v1/invoices"
@@ -121,7 +278,11 @@ def create_invoice(memo: str, amount_sats: int) -> str:
             timeout=30,
         )
         resp.raise_for_status()
-        return resp.json()["payment_request"]
+        data = resp.json()
+        payment_request = data["payment_request"]
+        # LND returns r_hash as standard base64 over REST; normalize to hex.
+        payment_hash = base64.b64decode(data["r_hash"]).hex()
+        return payment_request, payment_hash
     except Exception:
         logging.exception("LND invoice creation failed")
         raise HTTPException(status_code=502, detail="LND error: could not create invoice")
@@ -131,7 +292,10 @@ def stamp_digest(hex_digest: str) -> bytes:
     """Submit a SHA256 digest to the configured OTS backend and return the serialized .ots bytes.
 
     OTS_BACKEND_MODE=calendar  — submit to the operator-controlled OTS calendar at
-                                  OTS_CALENDAR_URL. No fallback. Failure → RuntimeError.
+                                  OTS_CALENDAR_URL, retrying up to OTS_SUBMIT_MAX_ATTEMPTS
+                                  times with a backoff so a paid request does not fail just
+                                  because otsd is still starting. No fallback to public
+                                  calendars. Persistent failure -> RuntimeError.
     OTS_BACKEND_MODE=public    — submit to DEFAULT_AGGREGATORS (compatibility/testing only).
                                   Succeeds if at least one aggregator responds.
     """
@@ -139,13 +303,27 @@ def stamp_digest(hex_digest: str) -> bytes:
     file_timestamp = DetachedTimestampFile(OpSHA256(), Timestamp(digest_bytes))
 
     if OTS_BACKEND_MODE == "calendar":
-        try:
-            calendar_timestamp = RemoteCalendar(OTS_CALENDAR_URL).submit(
-                digest_bytes, timeout=10
+        last_error = None
+        for attempt in range(1, OTS_SUBMIT_MAX_ATTEMPTS + 1):
+            try:
+                calendar_timestamp = RemoteCalendar(OTS_CALENDAR_URL).submit(
+                    digest_bytes, timeout=10
+                )
+                file_timestamp.timestamp.merge(calendar_timestamp)
+                break
+            except Exception as e:
+                last_error = e
+                logging.warning(
+                    "OTS calendar submit attempt %d/%d to %s failed: %s",
+                    attempt, OTS_SUBMIT_MAX_ATTEMPTS, OTS_CALENDAR_URL, e,
+                )
+                if attempt < OTS_SUBMIT_MAX_ATTEMPTS:
+                    time.sleep(OTS_SUBMIT_BACKOFF_SECONDS)
+        else:
+            logging.error(
+                "OTS calendar backend %s failed after %d attempts: %s",
+                OTS_CALENDAR_URL, OTS_SUBMIT_MAX_ATTEMPTS, last_error,
             )
-            file_timestamp.timestamp.merge(calendar_timestamp)
-        except Exception:
-            logging.exception("OTS calendar backend %s failed", OTS_CALENDAR_URL)
             raise RuntimeError("OTS calendar backend failed")
     else:
         # public — compatibility/testing mode only; do not use as the real backend
@@ -165,14 +343,11 @@ def stamp_digest(hex_digest: str) -> bytes:
     return buf.getvalue()
 
 
-def verify_payment(preimage_hex: str, digest: str) -> bool:
-    """SHA256 the preimage to derive the payment hash, fetch the invoice from LND, and confirm
-    it is settled, was issued for the specific digest, and the paid amount meets the price."""
-    try:
-        preimage_bytes = bytes.fromhex(preimage_hex)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid preimage: not a hex string")
-    payment_hash = hashlib.sha256(preimage_bytes).hexdigest()
+def verify_payment(payment_hash: str, digest: str) -> bool:
+    """Fetch the invoice for a payment hash from LND and confirm it is settled, was
+    issued for the specific digest (memo), and the paid amount meets the price. The
+    caller must already have proven that the presented preimage hashes to this
+    payment hash."""
     proxies = {"https": f"socks5h://{TOR_PROXY}"} if TOR_PROXY else None
     headers = {"Grpc-Metadata-macaroon": LND_MACAROON_HEX}
     url = f"https://{LND_HOST}:{LND_PORT}/v1/invoice/{payment_hash}"
@@ -235,14 +410,28 @@ def health():
 @app.post("/timestamp")
 def timestamp(body: TimestampRequest, request: Request):
     auth = request.headers.get("Authorization", "")
-    preimage_hex = parse_preimage(auth) if auth else None
 
-    if auth and not preimage_hex:
-        raise HTTPException(status_code=401, detail="Invalid Authorization header")
+    if auth:
+        parsed = parse_l402_auth(auth)
+        if not parsed:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid Authorization header; expected 'L402 <macaroon>:<preimage>'",
+            )
+        macaroon_b64, preimage_hex = parsed
 
-    if preimage_hex:
-        if not verify_payment(preimage_hex, body.digest):
+        # 1. Token must be valid and bound to THIS digest (401 otherwise).
+        payment_hash = verify_l402_token(macaroon_b64, body.digest)
+
+        # 2. The presented preimage must hash to the token's payment hash.
+        derived = hashlib.sha256(bytes.fromhex(preimage_hex)).hexdigest()
+        if derived != payment_hash:
+            raise HTTPException(status_code=401, detail="Preimage does not match token payment hash")
+
+        # 3. The invoice must be settled, for this digest, at the required amount.
+        if not verify_payment(payment_hash, body.digest):
             raise HTTPException(status_code=402, detail="Payment required or not settled")
+
         try:
             ots_bytes = stamp_digest(body.digest)
         except Exception:
@@ -253,10 +442,18 @@ def timestamp(body: TimestampRequest, request: Request):
             media_type="application/octet-stream",
             headers={"Content-Disposition": f"attachment; filename={body.digest}.ots"},
         )
-    else:
-        payment_request = create_invoice(body.digest, GATEWAY_PRICE_SATS)
-        raise HTTPException(
-            status_code=402,
-            headers={"WWW-Authenticate": f'LSAT invoice="{payment_request}"'},
-            detail={"status": "payment_required", "invoice": payment_request},
-        )
+
+    # No authorization — mint an invoice and an L402 token bound to it.
+    payment_request, payment_hash = create_invoice(body.digest, GATEWAY_PRICE_SATS)
+    expiry_ts = int(time.time()) + L402_TOKEN_EXPIRY_SECONDS
+    token = mint_l402_token(body.digest, payment_hash, GATEWAY_PRICE_SATS, expiry_ts)
+    raise HTTPException(
+        status_code=402,
+        headers={"WWW-Authenticate": f'L402 macaroon="{token}", invoice="{payment_request}"'},
+        detail={
+            "status": "payment_required",
+            "invoice": payment_request,
+            "macaroon": token,
+            "expiry": expiry_ts,
+        },
+    )

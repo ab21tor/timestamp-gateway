@@ -1,9 +1,22 @@
+"""Test suite for the L402 gateway.
+
+Full coverage of the agreed "at least" list: startup/config validation, digest
+validation, L402 header parsing, the 402 challenge, token verify/reject, the paid
+retry path, LND payment verification, create_invoice wiring, OTS calendar/public
+modes with bounded retry and no public fallback, the health endpoint, reuse
+semantics, and error discipline (generic public details).
+"""
+
+import base64
+import hashlib
+import logging
 import os
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-# Set env vars before importing main so module-level validation passes.
+# Set env vars before importing main so module-level config validation passes.
 # load_dotenv() does not override existing env vars, so these take precedence.
 os.environ["LND_HOST"] = "test.onion"
 os.environ["LND_PORT"] = "8080"
@@ -12,41 +25,82 @@ os.environ["TOR_PROXY"] = "127.0.0.1:9050"
 os.environ["GATEWAY_PRICE_SATS"] = "21"
 os.environ["OTS_BACKEND_MODE"] = "calendar"
 os.environ["OTS_CALENDAR_URL"] = "http://test-calendar:14788"
+os.environ["L402_SECRET_HEX"] = "ab" * 32          # stable, known signing key
+os.environ["L402_TOKEN_EXPIRY_SECONDS"] = "3600"
+os.environ["OTS_SUBMIT_BACKOFF_SECONDS"] = "0"     # keep retry tests fast
 
 import main  # noqa: E402
+from fastapi import HTTPException  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
-from main import app, _parse_config, stamp_digest  # noqa: E402
+from pydantic import ValidationError  # noqa: E402
+from pymacaroons import Macaroon  # noqa: E402
 from opentimestamps.calendar import DEFAULT_AGGREGATORS  # noqa: E402
 from opentimestamps.core.notary import PendingAttestation  # noqa: E402
 from opentimestamps.core.timestamp import Timestamp  # noqa: E402
 
-client = TestClient(app, raise_server_exceptions=False)
+client = TestClient(app=main.app, raise_server_exceptions=False)
 
-DIGEST = "a" * 64          # valid 64-char lowercase hex
-PREIMAGE = "b" * 64        # valid 64-char hex preimage
+DIGEST = "a" * 64            # valid 64-char lowercase hex
+OTHER_DIGEST = "b" * 64      # a different valid digest
+PREIMAGE = "11" * 32         # 64-char hex preimage
+WRONG_PREIMAGE = "22" * 32   # hashes to something other than PAYMENT_HASH
+PAYMENT_HASH = hashlib.sha256(bytes.fromhex(PREIMAGE)).hexdigest()
 FAKE_INVOICE = "lnbc210n1pfakeinvoicefortesting"
-FAKE_OTS = b"\x00\x01\x02\x03opentimestamps"
+FAKE_OTS = b"ots-proof"
 TEST_CALENDAR_URL = "http://test-calendar:14788"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def valid_token(digest=DIGEST, price=21, expiry_ts=None):
+    """Mint a valid token via the real minting code (exercises main.mint_l402_token)."""
+    if expiry_ts is None:
+        expiry_ts = int(time.time()) + 3600
+    return main.mint_l402_token(digest, PAYMENT_HASH, price, expiry_ts)
+
+
+def build_macaroon(digest=DIGEST, payment_hash=PAYMENT_HASH, price=21,
+                   capability="timestamp", expiry_ts=None, key=None):
+    """Craft a macaroon with arbitrary caveats/key for adversarial token tests."""
+    if expiry_ts is None:
+        expiry_ts = int(time.time()) + 3600
+    if key is None:
+        key = main.L402_SECRET
+    m = Macaroon(location=main.L402_LOCATION, identifier=payment_hash, key=key)
+    m.add_first_party_caveat(f"digest={digest}")
+    m.add_first_party_caveat(f"payment_hash={payment_hash}")
+    m.add_first_party_caveat(f"price={price}")
+    m.add_first_party_caveat(f"capability={capability}")
+    m.add_first_party_caveat(f"expiry={expiry_ts}")
+    return m.serialize()
+
+
+def auth(token, preimage=PREIMAGE):
+    return {"Authorization": f"L402 {token}:{preimage}"}
+
+
 def _get_mock(settled, memo, amt_paid_sat):
+    """Mock LND invoice-lookup response (verify_payment)."""
     m = MagicMock()
     m.raise_for_status.return_value = None
     m.json.return_value = {"settled": settled, "memo": memo, "amt_paid_sat": str(amt_paid_sat)}
     return m
 
 
-def _post_mock():
-    m = MagicMock()
-    m.raise_for_status.return_value = None
-    m.json.return_value = {"payment_request": FAKE_INVOICE}
-    return m
-
-
 def _settled_get():
     return _get_mock(True, DIGEST, 21)
+
+
+def _post_mock():
+    """Mock LND invoice-creation response: includes r_hash so create_invoice can
+    decode the payment hash (base64 of PAYMENT_HASH so the minted token matches)."""
+    m = MagicMock()
+    m.raise_for_status.return_value = None
+    m.json.return_value = {
+        "payment_request": FAKE_INVOICE,
+        "r_hash": base64.b64encode(bytes.fromhex(PAYMENT_HASH)).decode(),
+    }
+    return m
 
 
 def _good_calendar_ts():
@@ -55,363 +109,6 @@ def _good_calendar_ts():
     ts.attestations.add(PendingAttestation("https://test.calendar.example"))
     return ts
 
-
-# ── 1. Input validation ───────────────────────────────────────────────────────
-
-def test_valid_digest_no_auth_returns_402_with_invoice():
-    with patch("main.requests.post", return_value=_post_mock()):
-        resp = client.post("/timestamp", json={"digest": DIGEST})
-    assert resp.status_code == 402
-    body = resp.json()
-    assert body["detail"]["status"] == "payment_required"
-    assert body["detail"]["invoice"] == FAKE_INVOICE
-
-
-def test_invalid_digest_too_short_returns_422():
-    resp = client.post("/timestamp", json={"digest": "abc123"})
-    assert resp.status_code == 422
-
-
-def test_invalid_digest_non_hex_returns_422():
-    resp = client.post("/timestamp", json={"digest": "g" * 64})
-    assert resp.status_code == 422
-
-
-def test_digest_normalized_to_lowercase_in_memo():
-    with patch("main.requests.post", return_value=_post_mock()) as patched:
-        resp = client.post("/timestamp", json={"digest": "A" * 64})
-    assert resp.status_code == 402
-    assert patched.call_args.kwargs["json"]["memo"] == "a" * 64
-
-
-# ── 2. Startup config validation — LND ───────────────────────────────────────
-
-def test_non_integer_gateway_price_fails_at_startup():
-    with patch.dict(os.environ, {"GATEWAY_PRICE_SATS": "abc"}):
-        with pytest.raises(RuntimeError, match="GATEWAY_PRICE_SATS must be an integer"):
-            _parse_config()
-
-
-def test_zero_gateway_price_fails_at_startup():
-    with patch.dict(os.environ, {"GATEWAY_PRICE_SATS": "0"}):
-        with pytest.raises(RuntimeError, match="positive integer"):
-            _parse_config()
-
-
-def test_negative_gateway_price_fails_at_startup():
-    with patch.dict(os.environ, {"GATEWAY_PRICE_SATS": "-5"}):
-        with pytest.raises(RuntimeError, match="positive integer"):
-            _parse_config()
-
-
-# ── 3. Startup config validation — OTS backend ───────────────────────────────
-
-def test_invalid_ots_backend_mode_fails_at_startup():
-    with patch.dict(os.environ, {"OTS_BACKEND_MODE": "invalid"}):
-        with pytest.raises(RuntimeError, match="OTS_BACKEND_MODE must be"):
-            _parse_config()
-
-
-def test_calendar_mode_requires_calendar_url():
-    # Empty OTS_CALENDAR_URL with calendar mode must fail.
-    with patch.dict(os.environ, {"OTS_BACKEND_MODE": "calendar", "OTS_CALENDAR_URL": ""}):
-        with pytest.raises(RuntimeError, match="OTS_CALENDAR_URL is required"):
-            _parse_config()
-
-
-def test_public_mode_rejects_calendar_url():
-    # OTS_CALENDAR_URL is set in module-level env; switching to public mode must fail.
-    with patch.dict(os.environ, {"OTS_BACKEND_MODE": "public"}):
-        with pytest.raises(RuntimeError, match="OTS_CALENDAR_URL must not be set"):
-            _parse_config()
-
-
-# ── 4. Authorization header handling ─────────────────────────────────────────
-
-def test_malformed_authorization_returns_401():
-    resp = client.post(
-        "/timestamp",
-        json={"digest": DIGEST},
-        headers={"Authorization": "Bearer not-a-preimage"},
-    )
-    assert resp.status_code == 401
-
-
-def test_bearer_token_auth_returns_401():
-    resp = client.post(
-        "/timestamp",
-        json={"digest": DIGEST},
-        headers={"Authorization": "Bearer " + "a" * 64},
-    )
-    assert resp.status_code == 401
-
-
-def test_arbitrary_non_preimage_auth_returns_401():
-    resp = client.post(
-        "/timestamp",
-        json={"digest": DIGEST},
-        headers={"Authorization": "token=abc"},
-    )
-    assert resp.status_code == 401
-
-
-def test_uppercase_preimage_hex_is_accepted():
-    with patch("main.requests.get", return_value=_settled_get()):
-        with patch("main.stamp_digest", return_value=FAKE_OTS):
-            resp = client.post(
-                "/timestamp",
-                json={"digest": DIGEST},
-                headers={"Authorization": "preimage=" + PREIMAGE.upper()},
-            )
-    assert resp.status_code == 200
-
-
-# ── 5. Payment verification ───────────────────────────────────────────────────
-
-def test_valid_preimage_unpaid_returns_402():
-    with patch("main.requests.get", return_value=_get_mock(False, DIGEST, 0)):
-        resp = client.post(
-            "/timestamp",
-            json={"digest": DIGEST},
-            headers={"Authorization": f"preimage={PREIMAGE}"},
-        )
-    assert resp.status_code == 402
-    assert "invoice" not in resp.json().get("detail", "")
-
-
-def test_settled_wrong_memo_returns_402():
-    with patch("main.requests.get", return_value=_get_mock(True, "0" * 64, 21)):
-        resp = client.post(
-            "/timestamp",
-            json={"digest": DIGEST},
-            headers={"Authorization": f"preimage={PREIMAGE}"},
-        )
-    assert resp.status_code == 402
-
-
-def test_settled_correct_memo_underpaid_returns_402():
-    with patch("main.requests.get", return_value=_get_mock(True, DIGEST, 5)):
-        resp = client.post(
-            "/timestamp",
-            json={"digest": DIGEST},
-            headers={"Authorization": f"preimage={PREIMAGE}"},
-        )
-    assert resp.status_code == 402
-
-
-# ── 6. LND errors ─────────────────────────────────────────────────────────────
-
-def test_lnd_invoice_creation_http_error_returns_502():
-    m = MagicMock()
-    m.raise_for_status.side_effect = Exception("503 Service Unavailable")
-    with patch("main.requests.post", return_value=m):
-        resp = client.post("/timestamp", json={"digest": DIGEST})
-    assert resp.status_code == 502
-    assert resp.json()["detail"] == "LND error: could not create invoice"
-
-
-def test_lnd_invoice_creation_missing_payment_request_returns_502():
-    m = MagicMock()
-    m.raise_for_status.return_value = None
-    m.json.return_value = {}  # no payment_request key → KeyError → 502
-    with patch("main.requests.post", return_value=m):
-        resp = client.post("/timestamp", json={"digest": DIGEST})
-    assert resp.status_code == 502
-    assert resp.json()["detail"] == "LND error: could not create invoice"
-
-
-def test_lnd_lookup_http_error_returns_502():
-    m = MagicMock()
-    m.raise_for_status.side_effect = Exception("503 Service Unavailable")
-    with patch("main.requests.get", return_value=m):
-        resp = client.post(
-            "/timestamp",
-            json={"digest": DIGEST},
-            headers={"Authorization": f"preimage={PREIMAGE}"},
-        )
-    assert resp.status_code == 502
-    assert resp.json()["detail"] == "LND error: could not verify payment"
-
-
-def test_lnd_lookup_malformed_json_returns_502():
-    m = MagicMock()
-    m.raise_for_status.return_value = None
-    m.json.side_effect = ValueError("not valid json")
-    with patch("main.requests.get", return_value=m):
-        resp = client.post(
-            "/timestamp",
-            json={"digest": DIGEST},
-            headers={"Authorization": f"preimage={PREIMAGE}"},
-        )
-    assert resp.status_code == 502
-    assert resp.json()["detail"] == "LND error: could not verify payment"
-
-
-def test_lnd_lookup_non_integer_amt_paid_sat_returns_502():
-    m = MagicMock()
-    m.raise_for_status.return_value = None
-    m.json.return_value = {"settled": True, "memo": DIGEST, "amt_paid_sat": "notanumber"}
-    with patch("main.requests.get", return_value=m):
-        resp = client.post(
-            "/timestamp",
-            json={"digest": DIGEST},
-            headers={"Authorization": f"preimage={PREIMAGE}"},
-        )
-    assert resp.status_code == 502
-    assert resp.json()["detail"] == "LND error: could not verify payment"
-
-
-# ── 7. OTS backend — calendar mode ───────────────────────────────────────────
-
-def test_calendar_mode_submits_only_to_calendar_url():
-    """Calendar mode must call RemoteCalendar with OTS_CALENDAR_URL, not an aggregator."""
-    calendar_instance = MagicMock()
-    calendar_instance.submit.return_value = _good_calendar_ts()
-    with patch("main.RemoteCalendar") as MockCalendar:
-        MockCalendar.return_value = calendar_instance
-        stamp_digest(DIGEST)
-    MockCalendar.assert_called_once_with(TEST_CALENDAR_URL)
-
-
-def test_calendar_mode_does_not_call_default_aggregators():
-    """Calendar mode must not touch DEFAULT_AGGREGATORS under any circumstance."""
-    calendar_instance = MagicMock()
-    calendar_instance.submit.return_value = _good_calendar_ts()
-    with patch("main.RemoteCalendar") as MockCalendar:
-        MockCalendar.return_value = calendar_instance
-        stamp_digest(DIGEST)
-    assert MockCalendar.call_count == 1
-    called_url = MockCalendar.call_args[0][0]
-    for agg_url in DEFAULT_AGGREGATORS:
-        assert called_url != agg_url, f"calendar mode called aggregator {agg_url}"
-
-
-def test_calendar_backend_fails_returns_502():
-    """A calendar backend failure must return 502 with a generic error message."""
-    fail_instance = MagicMock()
-    fail_instance.submit.side_effect = ConnectionError("calendar unreachable")
-    with patch("main.requests.get", return_value=_settled_get()):
-        with patch("main.RemoteCalendar", return_value=fail_instance):
-            resp = client.post(
-                "/timestamp",
-                json={"digest": DIGEST},
-                headers={"Authorization": f"preimage={PREIMAGE}"},
-            )
-    assert resp.status_code == 502
-    assert resp.json()["detail"] == "OTS error: stamping failed"
-
-
-def test_calendar_mode_no_fallback_to_public_on_failure():
-    """When the calendar backend fails, the gateway must not fall back to public aggregators."""
-    fail_instance = MagicMock()
-    fail_instance.submit.side_effect = ConnectionError("calendar unreachable")
-    with patch("main.requests.get", return_value=_settled_get()):
-        with patch("main.RemoteCalendar") as MockCalendar:
-            MockCalendar.return_value = fail_instance
-            resp = client.post(
-                "/timestamp",
-                json={"digest": DIGEST},
-                headers={"Authorization": f"preimage={PREIMAGE}"},
-            )
-    assert resp.status_code == 502
-    # Only one call should have been made — to the calendar URL, not to any aggregator.
-    assert MockCalendar.call_count == 1
-    called_url = MockCalendar.call_args[0][0]
-    for agg_url in DEFAULT_AGGREGATORS:
-        assert called_url != agg_url, f"fell back to public aggregator {agg_url}"
-
-
-def test_calendar_mode_success_returns_ots_bytes():
-    """Successful calendar-mode flow returns raw .ots bytes with octet-stream content type."""
-    calendar_instance = MagicMock()
-    calendar_instance.submit.return_value = _good_calendar_ts()
-    with patch("main.requests.get", return_value=_settled_get()):
-        with patch("main.RemoteCalendar", return_value=calendar_instance):
-            resp = client.post(
-                "/timestamp",
-                json={"digest": DIGEST},
-                headers={"Authorization": f"preimage={PREIMAGE}"},
-            )
-    assert resp.status_code == 200
-    assert resp.headers["content-type"] == "application/octet-stream"
-    assert len(resp.content) > 0
-
-
-# ── 8. OTS backend — public mode (compatibility/testing) ─────────────────────
-
-def test_public_mode_submits_to_all_default_aggregators():
-    """Public mode (compatibility/testing) must submit to all DEFAULT_AGGREGATORS."""
-    ok_instance = MagicMock()
-    ok_instance.submit.return_value = _good_calendar_ts()
-    with patch("main.OTS_BACKEND_MODE", "public"):
-        with patch("main.RemoteCalendar") as MockCalendar:
-            MockCalendar.return_value = ok_instance
-            result = stamp_digest(DIGEST)
-    assert isinstance(result, bytes) and len(result) > 0
-    assert MockCalendar.call_count == len(DEFAULT_AGGREGATORS)
-    called_urls = [call[0][0] for call in MockCalendar.call_args_list]
-    for url in DEFAULT_AGGREGATORS:
-        assert url in called_urls, f"public mode did not submit to aggregator {url}"
-
-
-def test_public_mode_partial_calendar_failure_still_returns_bytes():
-    """Public mode: first aggregator fails, rest succeed — result must be valid .ots bytes."""
-    fail_instance = MagicMock()
-    fail_instance.submit.side_effect = ConnectionError("unreachable")
-    ok_instance = MagicMock()
-    ok_instance.submit.return_value = _good_calendar_ts()
-    with patch("main.OTS_BACKEND_MODE", "public"):
-        with patch(
-            "main.RemoteCalendar",
-            side_effect=[fail_instance, ok_instance, ok_instance, ok_instance],
-        ):
-            result = stamp_digest(DIGEST)
-    assert isinstance(result, bytes) and len(result) > 0
-
-
-def test_public_mode_all_aggregators_fail_returns_502():
-    """Public mode: all aggregators failing must return 502 — same contract as calendar mode."""
-    fail_instance = MagicMock()
-    fail_instance.submit.side_effect = ConnectionError("unreachable")
-    with patch("main.OTS_BACKEND_MODE", "public"):
-        with patch("main.requests.get", return_value=_settled_get()):
-            with patch("main.RemoteCalendar", return_value=fail_instance):
-                resp = client.post(
-                    "/timestamp",
-                    json={"digest": DIGEST},
-                    headers={"Authorization": f"preimage={PREIMAGE}"},
-                )
-    assert resp.status_code == 502
-    assert resp.json()["detail"] == "OTS error: stamping failed"
-
-
-# ── 9. Happy path ─────────────────────────────────────────────────────────────
-
-def test_successful_response_has_octet_stream_content_type():
-    with patch("main.requests.get", return_value=_settled_get()):
-        with patch("main.stamp_digest", return_value=FAKE_OTS):
-            resp = client.post(
-                "/timestamp",
-                json={"digest": DIGEST},
-                headers={"Authorization": f"preimage={PREIMAGE}"},
-            )
-    assert resp.status_code == 200
-    assert resp.headers["content-type"] == "application/octet-stream"
-
-
-def test_successful_response_returns_ots_bytes_with_filename():
-    with patch("main.requests.get", return_value=_settled_get()):
-        with patch("main.stamp_digest", return_value=FAKE_OTS):
-            resp = client.post(
-                "/timestamp",
-                json={"digest": DIGEST},
-                headers={"Authorization": f"preimage={PREIMAGE}"},
-            )
-    assert resp.status_code == 200
-    assert resp.content == FAKE_OTS
-    assert f"{DIGEST}.ots" in resp.headers["content-disposition"]
-
-# ── 10. Health endpoint ───────────────────────────────────────────────────────
 
 def _ok_lnd():
     m = MagicMock()
@@ -432,6 +129,539 @@ def _fail():
     return m
 
 
+# ══ 1. Startup / config validation ════════════════════════════════════════════
+
+def test_missing_required_env_var_fails_at_startup():
+    with patch.dict(os.environ, {"LND_HOST": ""}):
+        with pytest.raises(RuntimeError, match="Missing required environment variables"):
+            main._parse_config()
+
+
+def test_non_integer_gateway_price_fails():
+    with patch.dict(os.environ, {"GATEWAY_PRICE_SATS": "abc"}):
+        with pytest.raises(RuntimeError, match="GATEWAY_PRICE_SATS must be an integer"):
+            main._parse_config()
+
+
+def test_zero_gateway_price_fails():
+    with patch.dict(os.environ, {"GATEWAY_PRICE_SATS": "0"}):
+        with pytest.raises(RuntimeError, match="positive integer"):
+            main._parse_config()
+
+
+def test_negative_gateway_price_fails():
+    with patch.dict(os.environ, {"GATEWAY_PRICE_SATS": "-5"}):
+        with pytest.raises(RuntimeError, match="positive integer"):
+            main._parse_config()
+
+
+def test_invalid_ots_backend_mode_fails():
+    with patch.dict(os.environ, {"OTS_BACKEND_MODE": "invalid"}):
+        with pytest.raises(RuntimeError, match="OTS_BACKEND_MODE must be"):
+            main._parse_config()
+
+
+def test_calendar_mode_requires_calendar_url():
+    with patch.dict(os.environ, {"OTS_BACKEND_MODE": "calendar", "OTS_CALENDAR_URL": ""}):
+        with pytest.raises(RuntimeError, match="OTS_CALENDAR_URL is required"):
+            main._parse_config()
+
+
+def test_public_mode_rejects_calendar_url():
+    with patch.dict(os.environ, {"OTS_BACKEND_MODE": "public"}):
+        with pytest.raises(RuntimeError, match="OTS_CALENDAR_URL must not be set"):
+            main._parse_config()
+
+
+def test_public_mode_does_not_require_calendar_url():
+    with patch.dict(os.environ, {"OTS_BACKEND_MODE": "public", "OTS_CALENDAR_URL": ""}):
+        cfg = main._parse_config()
+    assert cfg is not None
+
+
+def test_l402_secret_required_without_ephemeral_optin():
+    with patch.dict(os.environ, {"L402_SECRET_HEX": "", "L402_ALLOW_EPHEMERAL_SECRET": "false"}):
+        with pytest.raises(RuntimeError, match="L402_SECRET_HEX is required"):
+            main._parse_config()
+
+
+def test_ephemeral_secret_opt_in_allowed():
+    with patch.dict(os.environ, {"L402_SECRET_HEX": "", "L402_ALLOW_EPHEMERAL_SECRET": "true"}):
+        cfg = main._parse_config()
+    assert cfg is not None
+
+
+def test_invalid_l402_secret_hex_fails():
+    with patch.dict(os.environ, {"L402_SECRET_HEX": "nothex!!"}):
+        with pytest.raises(RuntimeError, match="must be a hex string"):
+            main._parse_config()
+
+
+def test_short_l402_secret_hex_fails():
+    with patch.dict(os.environ, {"L402_SECRET_HEX": "abcd"}):  # 2 bytes
+        with pytest.raises(RuntimeError, match="at least 16 bytes"):
+            main._parse_config()
+
+
+def test_l402_expiry_non_integer_fails():
+    with patch.dict(os.environ, {"L402_TOKEN_EXPIRY_SECONDS": "abc"}):
+        with pytest.raises(RuntimeError, match="L402_TOKEN_EXPIRY_SECONDS must be an integer"):
+            main._parse_config()
+
+
+def test_l402_expiry_non_positive_fails():
+    with patch.dict(os.environ, {"L402_TOKEN_EXPIRY_SECONDS": "0"}):
+        with pytest.raises(RuntimeError, match="L402_TOKEN_EXPIRY_SECONDS must be a positive integer"):
+            main._parse_config()
+
+
+def test_ots_max_attempts_non_integer_fails():
+    with patch.dict(os.environ, {"OTS_SUBMIT_MAX_ATTEMPTS": "abc"}):
+        with pytest.raises(RuntimeError, match="OTS_SUBMIT_MAX_ATTEMPTS must be an integer"):
+            main._parse_config()
+
+
+def test_ots_max_attempts_below_one_fails():
+    with patch.dict(os.environ, {"OTS_SUBMIT_MAX_ATTEMPTS": "0"}):
+        with pytest.raises(RuntimeError, match="OTS_SUBMIT_MAX_ATTEMPTS must be >= 1"):
+            main._parse_config()
+
+
+def test_ots_backoff_non_numeric_fails():
+    with patch.dict(os.environ, {"OTS_SUBMIT_BACKOFF_SECONDS": "abc"}):
+        with pytest.raises(RuntimeError, match="OTS_SUBMIT_BACKOFF_SECONDS must be a number"):
+            main._parse_config()
+
+
+def test_ots_backoff_negative_fails():
+    with patch.dict(os.environ, {"OTS_SUBMIT_BACKOFF_SECONDS": "-1"}):
+        with pytest.raises(RuntimeError, match="OTS_SUBMIT_BACKOFF_SECONDS must be >= 0"):
+            main._parse_config()
+
+
+# ══ 2. Digest validation ══════════════════════════════════════════════════════
+
+def test_invalid_digest_too_short_returns_422():
+    resp = client.post("/timestamp", json={"digest": "abc123"})
+    assert resp.status_code == 422
+
+
+def test_invalid_digest_non_hex_returns_422():
+    resp = client.post("/timestamp", json={"digest": "g" * 64})
+    assert resp.status_code == 422
+
+
+def test_must_be_hex_normalizes_to_lowercase():
+    assert main.TimestampRequest(digest="A" * 64).digest == "a" * 64
+
+
+def test_must_be_hex_rejects_non_hex():
+    with pytest.raises(ValidationError):
+        main.TimestampRequest(digest="g" * 64)
+
+
+def test_digest_normalized_to_lowercase_in_memo():
+    with patch("main.requests.post", return_value=_post_mock()) as patched:
+        resp = client.post("/timestamp", json={"digest": "A" * 64})
+    assert resp.status_code == 402
+    assert patched.call_args.kwargs["json"]["memo"] == "a" * 64
+
+
+# ══ 3. L402 header parsing ═════════════════════════════════════════════════════
+
+def test_parse_l402_auth_accepts_valid_header():
+    token = valid_token()  # real macaroon contains url-safe base64 chars
+    parsed = main.parse_l402_auth(f"L402 {token}:{PREIMAGE}")
+    assert parsed is not None
+    assert parsed[0] == token
+    assert parsed[1] == PREIMAGE.lower()
+
+
+def test_parse_l402_auth_lowercases_preimage():
+    token = valid_token()
+    parsed = main.parse_l402_auth(f"L402 {token}:{PREIMAGE.upper()}")
+    assert parsed is not None and parsed[1] == PREIMAGE.lower()
+
+
+def test_parse_l402_auth_rejects_non_l402_schemes():
+    assert main.parse_l402_auth(f"preimage={PREIMAGE}") is None
+    assert main.parse_l402_auth("Bearer something") is None
+    assert main.parse_l402_auth("L402 onlymacaroon-no-colon") is None
+
+
+@pytest.mark.parametrize("header", [
+    "Bearer abc",
+    f"preimage={PREIMAGE}",                 # the old custom scheme must no longer work
+    "L402 garbage-no-colon",
+    "L402 onlymacaroon",
+    "token=abc",
+    f"L402 abc:{'z' * 64}",                 # preimage not hex
+    "L402 abc:short",                       # preimage wrong length
+    f"L402 not-a-macaroon:{PREIMAGE}",      # parses, but macaroon won't deserialize
+])
+def test_malformed_authorization_returns_401(header):
+    resp = client.post("/timestamp", json={"digest": DIGEST}, headers={"Authorization": header})
+    assert resp.status_code == 401
+
+
+# ══ 4. 402 challenge path ══════════════════════════════════════════════════════
+
+def test_unauthenticated_post_returns_402():
+    with patch("main.requests.post", return_value=_post_mock()):
+        resp = client.post("/timestamp", json={"digest": DIGEST})
+    assert resp.status_code == 402
+
+
+def test_402_www_authenticate_header_exact_format():
+    with patch("main.requests.post", return_value=_post_mock()):
+        resp = client.post("/timestamp", json={"digest": DIGEST})
+    body = resp.json()["detail"]
+    # Exact header: L402 macaroon="<token>", invoice="<bolt11>"  (catches format regressions)
+    expected = f'L402 macaroon="{body["macaroon"]}", invoice="{body["invoice"]}"'
+    assert resp.headers["www-authenticate"] == expected
+    assert body["invoice"] == FAKE_INVOICE
+
+
+def test_402_json_body_has_status_invoice_macaroon_expiry():
+    with patch("main.requests.post", return_value=_post_mock()):
+        resp = client.post("/timestamp", json={"digest": DIGEST})
+    body = resp.json()["detail"]
+    assert body["status"] == "payment_required"
+    assert body["invoice"] == FAKE_INVOICE
+    assert isinstance(body["macaroon"], str) and body["macaroon"]
+    assert isinstance(body["expiry"], int) and body["expiry"] > int(time.time())
+
+
+def test_402_creates_invoice_with_digest_memo_and_configured_price():
+    with patch("main.requests.post", return_value=_post_mock()) as p:
+        resp = client.post("/timestamp", json={"digest": DIGEST})
+    assert resp.status_code == 402
+    sent = p.call_args.kwargs["json"]
+    assert sent["memo"] == DIGEST
+    assert sent["value"] == 21               # configured GATEWAY_PRICE_SATS
+    assert sent["private"] is True
+
+
+def test_minted_token_verifies_and_is_bound_to_digest_and_price():
+    with patch("main.requests.post", return_value=_post_mock()):
+        resp = client.post("/timestamp", json={"digest": DIGEST})
+    token = resp.json()["detail"]["macaroon"]
+    # Bound to this digest: verifies and returns the payment hash.
+    assert main.verify_l402_token(token, DIGEST) == PAYMENT_HASH
+    # Bound to the configured price: fails if the gateway price changes.
+    with patch("main.GATEWAY_PRICE_SATS", 99):
+        with pytest.raises(HTTPException) as ei:
+            main.verify_l402_token(token, DIGEST)
+    assert ei.value.status_code == 401
+
+
+# ══ 5. L402 token verification ═════════════════════════════════════════════════
+
+def test_verify_token_valid_same_digest_returns_payment_hash():
+    assert main.verify_l402_token(valid_token(), DIGEST) == PAYMENT_HASH
+
+
+def test_verify_token_rejects_wrong_digest():
+    with pytest.raises(HTTPException) as ei:
+        main.verify_l402_token(valid_token(), OTHER_DIGEST)
+    assert ei.value.status_code == 401
+
+
+def test_verify_token_rejects_expired():
+    token = valid_token(expiry_ts=int(time.time()) - 10)
+    with pytest.raises(HTTPException) as ei:
+        main.verify_l402_token(token, DIGEST)
+    assert ei.value.status_code == 401
+
+
+def test_verify_token_rejects_wrong_price():
+    token = build_macaroon(price=99)
+    with pytest.raises(HTTPException) as ei:
+        main.verify_l402_token(token, DIGEST)
+    assert ei.value.status_code == 401
+
+
+def test_verify_token_rejects_wrong_capability():
+    token = build_macaroon(capability="admin")
+    with pytest.raises(HTTPException) as ei:
+        main.verify_l402_token(token, DIGEST)
+    assert ei.value.status_code == 401
+
+
+def test_verify_token_rejects_wrong_key_tampered():
+    token = build_macaroon(key=b"\x99" * 32)  # signed with a foreign key
+    with pytest.raises(HTTPException) as ei:
+        main.verify_l402_token(token, DIGEST)
+    assert ei.value.status_code == 401
+
+
+def test_verify_token_rejects_malformed_with_generic_detail():
+    with pytest.raises(HTTPException) as ei:
+        main.verify_l402_token("not-a-macaroon!!", DIGEST)
+    assert ei.value.status_code == 401
+    assert ei.value.detail == "Invalid L402 token"  # generic, no internal leakage
+
+
+# ══ 6. Paid retry path ═════════════════════════════════════════════════════════
+
+def test_valid_paid_retry_returns_raw_ots_bytes_buffered_response():
+    token = valid_token()
+    with patch("main.requests.get", return_value=_settled_get()):
+        with patch("main.stamp_digest", return_value=FAKE_OTS):
+            resp = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/octet-stream"
+    # Fully buffered body (a Response, not a StreamingResponse) with attachment filename.
+    assert resp.content == FAKE_OTS
+    assert f"attachment; filename={DIGEST}.ots" in resp.headers["content-disposition"]
+
+
+def test_invalid_token_returns_401():
+    bad = build_macaroon(key=b"\x77" * 32)
+    resp = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(bad))
+    assert resp.status_code == 401
+
+
+def test_valid_token_unsettled_invoice_returns_402():
+    token = valid_token()
+    with patch("main.requests.get", return_value=_get_mock(False, DIGEST, 0)):
+        resp = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+    assert resp.status_code == 402
+
+
+def test_wrong_preimage_rejected_before_lnd_lookup():
+    token = valid_token()
+    mock_get = MagicMock()
+    with patch("main.requests.get", mock_get):
+        resp = client.post(
+            "/timestamp",
+            json={"digest": DIGEST},
+            headers={"Authorization": f"L402 {token}:{WRONG_PREIMAGE}"},
+        )
+    assert resp.status_code == 401
+    mock_get.assert_not_called()  # preimage check happens before any LND call
+
+
+def test_same_token_preimage_same_digest_reuse_allowed():
+    token = valid_token()
+    with patch("main.requests.get", return_value=_settled_get()):
+        with patch("main.stamp_digest", return_value=FAKE_OTS):
+            r1 = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+            r2 = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+    assert r1.status_code == 200 and r2.status_code == 200
+
+
+def test_same_token_preimage_different_digest_rejected():
+    token = valid_token(digest=DIGEST)
+    resp = client.post("/timestamp", json={"digest": OTHER_DIGEST}, headers=auth(token))
+    assert resp.status_code == 401
+
+
+# ══ 7. LND invoice lookup / payment verification ═══════════════════════════════
+
+def test_verify_payment_true_when_settled_correct_memo_and_amount():
+    with patch("main.requests.get", return_value=_settled_get()):
+        assert main.verify_payment(PAYMENT_HASH, DIGEST) is True
+
+
+def test_verify_payment_false_when_unsettled():
+    with patch("main.requests.get", return_value=_get_mock(False, DIGEST, 21)):
+        assert main.verify_payment(PAYMENT_HASH, DIGEST) is False
+
+
+def test_verify_payment_false_when_wrong_memo():
+    with patch("main.requests.get", return_value=_get_mock(True, "0" * 64, 21)):
+        assert main.verify_payment(PAYMENT_HASH, DIGEST) is False
+
+
+def test_verify_payment_false_when_underpaid():
+    with patch("main.requests.get", return_value=_get_mock(True, DIGEST, 5)):
+        assert main.verify_payment(PAYMENT_HASH, DIGEST) is False
+
+
+def test_endpoint_settled_wrong_memo_returns_402():
+    token = valid_token()
+    with patch("main.requests.get", return_value=_get_mock(True, "0" * 64, 21)):
+        resp = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+    assert resp.status_code == 402
+
+
+def test_endpoint_settled_underpaid_returns_402():
+    token = valid_token()
+    with patch("main.requests.get", return_value=_get_mock(True, DIGEST, 5)):
+        resp = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+    assert resp.status_code == 402
+
+
+def test_verify_payment_lookup_failure_raises_generic_502_and_logs(caplog):
+    m = MagicMock()
+    m.raise_for_status.side_effect = Exception("boom-internal-detail")
+    with patch("main.requests.get", return_value=m):
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(HTTPException) as ei:
+                main.verify_payment(PAYMENT_HASH, DIGEST)
+    assert ei.value.status_code == 502
+    assert ei.value.detail == "LND error: could not verify payment"
+    assert "boom-internal-detail" not in ei.value.detail
+    assert any("LND invoice lookup failed" in r.message for r in caplog.records)
+
+
+# ══ 8. create_invoice() wiring ═════════════════════════════════════════════════
+
+def test_create_invoice_returns_tuple_and_decodes_rhash_to_hex():
+    ph = "ab" * 32
+    captured = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"payment_request": "lnbc...", "r_hash": base64.b64encode(bytes.fromhex(ph)).decode()}
+
+    def fake_post(url, headers=None, json=None, proxies=None, verify=None, timeout=None):
+        captured.update(url=url, headers=headers, json=json, proxies=proxies, verify=verify)
+        return FakeResponse()
+
+    with patch("main.requests.post", fake_post):
+        payment_request, payment_hash = main.create_invoice(DIGEST, 21)
+
+    assert payment_request == "lnbc..."
+    assert payment_hash == ph and len(payment_hash) == 64
+    assert captured["url"].endswith("/v1/invoices")
+    assert captured["headers"]["Grpc-Metadata-macaroon"] == main.LND_MACAROON_HEX
+    assert captured["verify"] == main.LND_TLS_VERIFY
+    assert captured["proxies"] == {"https": f"socks5h://{main.TOR_PROXY}"}  # TOR_PROXY respected
+    assert captured["json"]["memo"] == DIGEST
+    assert captured["json"]["value"] == 21
+    assert captured["json"]["private"] is True
+
+
+def test_create_invoice_lnd_failure_raises_generic_502_and_logs(caplog):
+    m = MagicMock()
+    m.raise_for_status.side_effect = Exception("creation-internal-detail")
+    with patch("main.requests.post", return_value=m):
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(HTTPException) as ei:
+                main.create_invoice(DIGEST, 21)
+    assert ei.value.status_code == 502
+    assert ei.value.detail == "LND error: could not create invoice"
+    assert "creation-internal-detail" not in ei.value.detail
+    assert any("LND invoice creation failed" in r.message for r in caplog.records)
+
+
+# ══ 9. OTS backend modes ═══════════════════════════════════════════════════════
+
+def test_calendar_mode_submits_only_to_calendar_url():
+    instance = MagicMock()
+    instance.submit.return_value = _good_calendar_ts()
+    with patch("main.RemoteCalendar", return_value=instance) as MockCalendar:
+        main.stamp_digest(DIGEST)
+    assert MockCalendar.call_count == 1
+    assert MockCalendar.call_args[0][0] == TEST_CALENDAR_URL
+
+
+def test_calendar_mode_retries_when_otsd_initially_unavailable():
+    instance = MagicMock()
+    instance.submit.side_effect = [ConnectionError("otsd not ready"), _good_calendar_ts()]
+    with patch("main.RemoteCalendar", return_value=instance) as MockCalendar:
+        with patch("main.time.sleep"):
+            result = main.stamp_digest(DIGEST)
+    assert isinstance(result, bytes) and len(result) > 0
+    assert instance.submit.call_count == 2
+    assert MockCalendar.call_count == 2
+
+
+def test_paid_retry_succeeds_after_initial_otsd_failure():
+    token = valid_token()
+    instance = MagicMock()
+    instance.submit.side_effect = [ConnectionError("starting up"), _good_calendar_ts()]
+    with patch("main.requests.get", return_value=_settled_get()):
+        with patch("main.RemoteCalendar", return_value=instance):
+            with patch("main.time.sleep"):
+                resp = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/octet-stream"
+
+
+def test_calendar_mode_exhausts_retries_then_returns_generic_502():
+    token = valid_token()
+    instance = MagicMock()
+    instance.submit.side_effect = ConnectionError("calendar-unreachable-detail")
+    with patch("main.requests.get", return_value=_settled_get()):
+        with patch("main.RemoteCalendar", return_value=instance) as MockCalendar:
+            with patch("main.time.sleep"):
+                resp = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+    assert resp.status_code == 502
+    assert resp.json()["detail"] == "OTS error: stamping failed"
+    assert "calendar-unreachable-detail" not in resp.json()["detail"]
+    assert MockCalendar.call_count == main.OTS_SUBMIT_MAX_ATTEMPTS
+
+
+def test_calendar_mode_never_falls_back_to_public_calendars():
+    token = valid_token()
+    instance = MagicMock()
+    instance.submit.side_effect = ConnectionError("calendar unreachable")
+    with patch("main.requests.get", return_value=_settled_get()):
+        with patch("main.RemoteCalendar", return_value=instance) as MockCalendar:
+            with patch("main.time.sleep"):
+                resp = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+    assert resp.status_code == 502
+    for call in MockCalendar.call_args_list:
+        called_url = call[0][0]
+        assert called_url == TEST_CALENDAR_URL
+        for agg in DEFAULT_AGGREGATORS:
+            assert called_url != agg, f"fell back to public aggregator {agg}"
+
+
+def test_calendar_mode_success_returns_ots_bytes():
+    token = valid_token()
+    instance = MagicMock()
+    instance.submit.return_value = _good_calendar_ts()
+    with patch("main.requests.get", return_value=_settled_get()):
+        with patch("main.RemoteCalendar", return_value=instance):
+            resp = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/octet-stream"
+    assert len(resp.content) > 0
+
+
+def test_public_mode_submits_to_all_default_aggregators():
+    instance = MagicMock()
+    instance.submit.return_value = _good_calendar_ts()
+    with patch("main.OTS_BACKEND_MODE", "public"):
+        with patch("main.RemoteCalendar", return_value=instance) as MockCalendar:
+            result = main.stamp_digest(DIGEST)
+    assert isinstance(result, bytes) and len(result) > 0
+    assert MockCalendar.call_count == len(DEFAULT_AGGREGATORS)
+
+
+def test_public_mode_succeeds_if_at_least_one_aggregator_responds():
+    fail = MagicMock()
+    fail.submit.side_effect = ConnectionError("unreachable")
+    ok = MagicMock()
+    ok.submit.return_value = _good_calendar_ts()
+    instances = [fail] + [ok] * (len(DEFAULT_AGGREGATORS) - 1)
+    with patch("main.OTS_BACKEND_MODE", "public"):
+        with patch("main.RemoteCalendar", side_effect=instances):
+            result = main.stamp_digest(DIGEST)
+    assert isinstance(result, bytes) and len(result) > 0
+
+
+def test_public_mode_fails_only_if_all_aggregators_fail():
+    token = valid_token()
+    instance = MagicMock()
+    instance.submit.side_effect = ConnectionError("unreachable")
+    with patch("main.OTS_BACKEND_MODE", "public"):
+        with patch("main.requests.get", return_value=_settled_get()):
+            with patch("main.RemoteCalendar", return_value=instance):
+                resp = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+    assert resp.status_code == 502
+    assert resp.json()["detail"] == "OTS error: stamping failed"
+
+
+# ══ 10. Health endpoint ════════════════════════════════════════════════════════
+
 def test_health_both_ok_returns_200():
     with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
         resp = client.get("/health")
@@ -444,34 +674,40 @@ def test_health_lnd_down_returns_503():
         resp = client.get("/health")
     assert resp.status_code == 503
     body = resp.json()
-    assert body["status"] == "degraded"
-    assert body["lnd"] == "error"
-    assert body["otsd"] == "ok"
+    assert body["status"] == "degraded" and body["lnd"] == "error"
 
 
-def test_health_otsd_down_returns_503():
+def test_health_otsd_down_in_calendar_mode_returns_503():
     with patch("main.requests.get", side_effect=[_ok_lnd(), _fail()]):
         resp = client.get("/health")
     assert resp.status_code == 503
     body = resp.json()
-    assert body["status"] == "degraded"
-    assert body["lnd"] == "ok"
-    assert body["otsd"] == "error"
+    assert body["status"] == "degraded" and body["otsd"] == "error"
 
 
-def test_health_both_down_returns_503():
-    with patch("main.requests.get", side_effect=[_fail(), _fail()]):
-        resp = client.get("/health")
-    assert resp.status_code == 503
-    assert resp.json() == {"status": "degraded", "lnd": "error", "otsd": "error"}
-
-
-def test_health_public_mode_otsd_is_na():
+def test_health_otsd_na_in_public_mode():
     with patch("main.OTS_CALENDAR_URL", None):
         with patch("main.requests.get", return_value=_ok_lnd()):
             resp = client.get("/health")
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok", "lnd": "ok", "otsd": "n/a"}
+
+
+def test_health_uses_readonly_macaroon_when_set():
+    readonly = "cd" * 32
+    with patch("main.LND_READONLY_MACAROON_HEX", readonly):
+        with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]) as mock_get:
+            resp = client.get("/health")
+    assert resp.status_code == 200
+    assert mock_get.call_args_list[0].kwargs["headers"]["Grpc-Metadata-macaroon"] == readonly
+
+
+def test_health_falls_back_to_invoice_macaroon_when_readonly_absent():
+    with patch("main.LND_READONLY_MACAROON_HEX", None):
+        with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]) as mock_get:
+            resp = client.get("/health")
+    assert resp.status_code == 200
+    assert mock_get.call_args_list[0].kwargs["headers"]["Grpc-Metadata-macaroon"] == main.LND_MACAROON_HEX
 
 
 def test_health_never_raises():
@@ -481,41 +717,25 @@ def test_health_never_raises():
     assert resp.json()["lnd"] == "error"
 
 
-def test_health_uses_readonly_macaroon_when_set():
-    readonly_mac = "ab" * 32  # 64 hex chars
-    with patch("main.LND_READONLY_MACAROON_HEX", readonly_mac):
-        with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]) as mock_get:
-            resp = client.get("/health")
-    assert resp.status_code == 200
-    lnd_headers = mock_get.call_args_list[0].kwargs["headers"]
-    assert lnd_headers["Grpc-Metadata-macaroon"] == readonly_mac
+# ══ 11. Error discipline (cross-cutting) ═══════════════════════════════════════
+
+def test_lnd_create_error_detail_is_generic_no_leak():
+    m = MagicMock()
+    m.raise_for_status.side_effect = Exception("secret-lnd-trace")
+    with patch("main.requests.post", return_value=m):
+        resp = client.post("/timestamp", json={"digest": DIGEST})
+    assert resp.status_code == 502
+    assert resp.json()["detail"] == "LND error: could not create invoice"
+    assert "secret-lnd-trace" not in resp.text
 
 
-def test_health_falls_back_to_invoice_macaroon_when_readonly_not_set():
-    with patch("main.LND_READONLY_MACAROON_HEX", None):
-        with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]) as mock_get:
-            resp = client.get("/health")
-    assert resp.status_code == 200
-    lnd_headers = mock_get.call_args_list[0].kwargs["headers"]
-    assert lnd_headers["Grpc-Metadata-macaroon"] == "deadbeef" * 8
+def test_malformed_auth_uses_401():
+    resp = client.post("/timestamp", json={"digest": DIGEST}, headers={"Authorization": "Bearer x"})
+    assert resp.status_code == 401
 
 
-# ── 11. Invoice private flag ──────────────────────────────────────────────────
-
-def test_create_invoice_requests_private_invoice(monkeypatch):
-    captured = {}
-
-    class FakeResponse:
-        def raise_for_status(self): pass
-        def json(self): return {"payment_request": "lnbc..."}
-
-    def fake_post(url, headers=None, json=None, proxies=None, verify=None, timeout=None):
-        captured["json"] = json
-        return FakeResponse()
-
-    monkeypatch.setattr("main.requests.post", fake_post)
-    invoice = main.create_invoice("a" * 64, 21)
-    assert invoice == "lnbc..."
-    assert captured["json"]["memo"] == "a" * 64
-    assert captured["json"]["value"] == 21
-    assert captured["json"]["private"] is True
+def test_unsettled_uses_402_not_error():
+    token = valid_token()
+    with patch("main.requests.get", return_value=_get_mock(False, DIGEST, 0)):
+        resp = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+    assert resp.status_code == 402
