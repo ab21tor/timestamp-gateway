@@ -128,6 +128,7 @@
 <script>
   let digest = '';
   let invoice = '';
+  let macaroon = '';
 
   async function hashFile(input) {
     const file = input.files[0];
@@ -148,6 +149,13 @@
 
   function setError(id, msg) {
     document.getElementById(id).textContent = msg;
+  }
+
+  // Parse:  L402 macaroon="<token>", invoice="<bolt11>"
+  function parseL402(headerValue) {
+    if (!headerValue) return null;
+    const m = headerValue.match(/^L402\s+macaroon="([^"]+)",\s*invoice="([^"]+)"$/);
+    return m ? { macaroon: m[1], invoice: m[2] } : null;
   }
 
   async function submitDigest() {
@@ -172,8 +180,14 @@
     }
 
     if (resp.status === 402) {
-      const data = await resp.json();
-      invoice = data.detail.invoice;
+      const challenge = parseL402(resp.headers.get('WWW-Authenticate'));
+      const data = await resp.json().catch(() => null);
+      macaroon = (challenge && challenge.macaroon) || (data && data.detail && data.detail.macaroon) || '';
+      invoice = (challenge && challenge.invoice) || (data && data.detail && data.detail.invoice) || '';
+      if (!macaroon || !invoice) {
+        setError('input-error', 'Malformed 402 challenge from gateway.');
+        return;
+      }
       renderPayment(invoice);
     } else {
       setError('input-error', 'Unexpected response: ' + resp.status);
@@ -212,7 +226,7 @@
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': 'preimage=' + preimage
+          'Authorization': 'L402 ' + macaroon + ':' + preimage
         },
         body: JSON.stringify({ digest })
       });
@@ -226,9 +240,9 @@
       triggerDownload(blob, digest + '.ots');
       setState('receipt');
     } else if (resp.status === 402) {
-      setError('payment-error', 'Payment not settled or preimage mismatch. Try again.');
+      setError('payment-error', 'Payment not settled yet. Pay the invoice, then try again.');
     } else if (resp.status === 401) {
-      setError('payment-error', 'Invalid preimage format.');
+      setError('payment-error', 'Invalid L402 preimage format. Enter the 64-character payment preimage.');
     } else {
       setError('payment-error', 'Error ' + resp.status + '. Check server logs.');
     }
@@ -253,6 +267,7 @@
   function reset() {
     digest = '';
     invoice = '';
+    macaroon = '';
     document.getElementById('digest-input').value = '';
     setError('input-error', '');
     setState('input');
