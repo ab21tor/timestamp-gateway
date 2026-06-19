@@ -91,12 +91,14 @@ curl -i -X POST http://localhost:8000/timestamp \
   -d "{\"digest\":\"$DIGEST\"}"
 ```
 
-A working gateway returns HTTP 402 with a Lightning invoice. Pay it, then:
+A working gateway returns HTTP 402 with an L402 challenge in the
+`WWW-Authenticate` header: `L402 macaroon="<token>", invoice="<bolt11>"`.
+Pay the invoice, then retry with the macaroon and the payment preimage:
 
 ```bash
 curl -X POST http://localhost:8000/timestamp \
   -H "Content-Type: application/json" \
-  -H "Authorization: preimage=<64-char-hex-preimage>" \
+  -H "Authorization: L402 <macaroon>:<preimage>" \
   -d "{\"digest\":\"$DIGEST\"}" \
   -o proof.ots
 ```
