@@ -190,28 +190,11 @@ class VerifyRequest(BaseModel):
 MAX_VERIFY_OTS_BYTES = 256 * 1024
 
 
-def _verify_ots_bytes(digest: str, ots_bytes: bytes) -> dict:
-    try:
-        ctx = StreamDeserializationContext(io.BytesIO(ots_bytes))
-        detached = DetachedTimestampFile.deserialize(ctx)
-    except Exception:
-        logging.info("Verify failed: invalid OTS proof", exc_info=True)
-        return {
-            "digest": digest,
-            "proof_digest": None,
-            "status": "invalid",
-            "valid_ots": False,
-            "digest_match": False,
-            "bitcoin_anchored": False,
-            "verified": False,
-            "attestations": [],
-        }
-
-    proof_digest = detached.file_digest.hex()
-    digest_match = proof_digest == digest
+def _extract_attestations(timestamp) -> list:
+    """Walk a timestamp's attestations into a JSON-serializable list. Shared by
+    /verify and /upgrade so both report attestations identically."""
     attestations = []
-
-    for _msg, attestation in detached.timestamp.all_attestations():
+    for _msg, attestation in timestamp.all_attestations():
         if isinstance(attestation, PendingAttestation):
             attestations.append(
                 {
@@ -235,6 +218,29 @@ def _verify_ots_bytes(digest: str, ots_bytes: bytes) -> dict:
                     "description": repr(attestation),
                 }
             )
+    return attestations
+
+
+def _verify_ots_bytes(digest: str, ots_bytes: bytes) -> dict:
+    try:
+        ctx = StreamDeserializationContext(io.BytesIO(ots_bytes))
+        detached = DetachedTimestampFile.deserialize(ctx)
+    except Exception:
+        logging.info("Verify failed: invalid OTS proof", exc_info=True)
+        return {
+            "digest": digest,
+            "proof_digest": None,
+            "status": "invalid",
+            "valid_ots": False,
+            "digest_match": False,
+            "bitcoin_anchored": False,
+            "verified": False,
+            "attestations": [],
+        }
+
+    proof_digest = detached.file_digest.hex()
+    digest_match = proof_digest == digest
+    attestations = _extract_attestations(detached.timestamp)
 
     bitcoin_anchored = any(a["type"] == "bitcoin" for a in attestations)
     has_pending = any(a["type"] == "pending_calendar" for a in attestations)
@@ -258,6 +264,82 @@ def _verify_ots_bytes(digest: str, ots_bytes: bytes) -> dict:
         "verified": status == "anchored",
         "attestations": attestations,
     }
+
+
+def _upgrade_pending_against_operator(timestamp, timeout) -> None:
+    calendar = RemoteCalendar(OTS_CALENDAR_URL)
+    def walk(stamp):
+        yield stamp
+        for sub in stamp.ops.values():
+            yield from walk(sub)
+    for sub_stamp in walk(timestamp):
+        if not any(isinstance(a, PendingAttestation) for a in sub_stamp.attestations):
+            continue
+        try:
+            upgraded = calendar.get_timestamp(sub_stamp.msg, timeout=timeout)
+        except Exception:
+            logging.info("Upgrade: no operator attestation available", exc_info=True)
+            continue
+        try:
+            sub_stamp.merge(upgraded)
+        except Exception:
+            logging.warning("Upgrade: failed to merge operator attestation", exc_info=True)
+
+
+def _upgrade_ots_bytes(digest: str, ots_bytes: bytes) -> dict:
+    try:
+        ctx = StreamDeserializationContext(io.BytesIO(ots_bytes))
+        detached = DetachedTimestampFile.deserialize(ctx)
+    except Exception:
+        logging.info("Upgrade failed: invalid OTS proof", exc_info=True)
+        return {
+            "digest": digest,
+            "proof_digest": None,
+            "status": "invalid",
+            "valid_ots": False,
+            "digest_match": False,
+            "bitcoin_anchored": False,
+            "verified": False,
+            "ots": None,
+            "attestations": [],
+        }
+    proof_digest = detached.file_digest.hex()
+    digest_match = proof_digest == digest
+    original_b64 = base64.b64encode(ots_bytes).decode()
+    def result(status: str, ots_b64: str | None) -> dict:
+        attestations = _extract_attestations(detached.timestamp)
+        bitcoin_anchored = any(a["type"] == "bitcoin" for a in attestations)
+        return {
+            "digest": digest,
+            "proof_digest": proof_digest,
+            "status": status,
+            "valid_ots": True,
+            "digest_match": digest_match,
+            "bitcoin_anchored": bitcoin_anchored,
+            "verified": status == "anchored",
+            "ots": ots_b64,
+            "attestations": attestations,
+        }
+    if not digest_match:
+        return result("mismatch", original_b64)
+    attestations = _extract_attestations(detached.timestamp)
+    bitcoin_anchored = any(a["type"] == "bitcoin" for a in attestations)
+    has_pending = any(a["type"] == "pending_calendar" for a in attestations)
+    if bitcoin_anchored:
+        return result("anchored", original_b64)
+    if not has_pending:
+        return result("invalid", original_b64)
+    if OTS_CALENDAR_URL:
+        _upgrade_pending_against_operator(detached.timestamp, timeout=10)
+    now_anchored = any(
+        a["type"] == "bitcoin" for a in _extract_attestations(detached.timestamp)
+    )
+    if now_anchored:
+        buf = io.BytesIO()
+        detached.serialize(StreamSerializationContext(buf))
+        upgraded_b64 = base64.b64encode(buf.getvalue()).decode()
+        return result("anchored", upgraded_b64)
+    return result("pending", original_b64)
 
 
 # ── L402 token (macaroon) ────────────────────────────────────────────────────
@@ -516,6 +598,30 @@ def verify(body: VerifyRequest):
         raise HTTPException(status_code=413, detail="OTS proof too large")
 
     return JSONResponse(content=_verify_ots_bytes(body.digest, ots_bytes))
+
+
+@app.post("/upgrade")
+def upgrade(body: VerifyRequest):
+    try:
+        ots_bytes = base64.b64decode(body.ots, validate=True)
+    except Exception:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "digest": body.digest,
+                "proof_digest": None,
+                "status": "invalid",
+                "valid_ots": False,
+                "digest_match": False,
+                "bitcoin_anchored": False,
+                "verified": False,
+                "ots": None,
+                "attestations": [],
+            },
+        )
+    if len(ots_bytes) > MAX_VERIFY_OTS_BYTES:
+        raise HTTPException(status_code=413, detail="OTS proof too large")
+    return JSONResponse(content=_upgrade_ots_bytes(body.digest, ots_bytes))
 
 
 @app.post("/timestamp")

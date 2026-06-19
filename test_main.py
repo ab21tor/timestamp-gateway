@@ -846,3 +846,132 @@ def test_verify_rejects_oversized_ots_with_413():
     resp = client.post("/verify", json={"digest": DIGEST, "ots": ots_b64})
 
     assert resp.status_code == 413
+
+
+def test_upgrade_invalid_base64_returns_invalid():
+    resp = client.post("/upgrade", json={"digest": DIGEST, "ots": "not base64!!!"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "invalid"
+    assert body["valid_ots"] is False
+    assert body["digest_match"] is False
+    assert body["bitcoin_anchored"] is False
+    assert body["verified"] is False
+    assert body["ots"] is None
+
+
+def test_upgrade_invalid_ots_bytes_returns_invalid():
+    ots_b64 = base64.b64encode(b"not an ots proof").decode()
+    resp = client.post("/upgrade", json={"digest": DIGEST, "ots": ots_b64})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "invalid"
+    assert body["valid_ots"] is False
+    assert body["digest_match"] is False
+    assert body["bitcoin_anchored"] is False
+    assert body["verified"] is False
+    assert body["ots"] is None
+
+
+def test_upgrade_oversized_ots_returns_413():
+    ots_b64 = base64.b64encode(b"x" * (main.MAX_VERIFY_OTS_BYTES + 1)).decode()
+    resp = client.post("/upgrade", json={"digest": DIGEST, "ots": ots_b64})
+    assert resp.status_code == 413
+
+
+def test_upgrade_mismatched_digest_no_calendar_contact():
+    ots_b64 = base64.b64encode(make_detached_ots_bytes(digest=OTHER_DIGEST)).decode()
+    with patch("main.RemoteCalendar") as mock_calendar:
+        resp = client.post("/upgrade", json={"digest": DIGEST, "ots": ots_b64})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "mismatch"
+    assert body["valid_ots"] is True
+    assert body["digest_match"] is False
+    assert body["bitcoin_anchored"] is False
+    assert body["verified"] is False
+    assert body["ots"] == ots_b64
+    mock_calendar.assert_not_called()
+
+
+def test_upgrade_already_anchored_no_calendar_contact():
+    ots_b64 = base64.b64encode(
+        make_detached_ots_bytes(
+            attestation=main.BitcoinBlockHeaderAttestation(954112)
+        )
+    ).decode()
+    with patch("main.RemoteCalendar") as mock_calendar:
+        resp = client.post("/upgrade", json={"digest": DIGEST, "ots": ots_b64})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "anchored"
+    assert body["valid_ots"] is True
+    assert body["digest_match"] is True
+    assert body["bitcoin_anchored"] is True
+    assert body["verified"] is True
+    assert body["ots"] == ots_b64
+    mock_calendar.assert_not_called()
+
+
+def test_upgrade_pending_no_calendar_upgrade_returns_pending():
+    ots_b64 = base64.b64encode(make_detached_ots_bytes()).decode()
+    instance = MagicMock()
+    instance.get_timestamp.side_effect = Exception("commitment not found")
+    with patch("main.RemoteCalendar", return_value=instance) as mock_calendar:
+        resp = client.post("/upgrade", json={"digest": DIGEST, "ots": ots_b64})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "pending"
+    assert body["valid_ots"] is True
+    assert body["digest_match"] is True
+    assert body["bitcoin_anchored"] is False
+    assert body["verified"] is False
+    assert body["ots"] == ots_b64
+    mock_calendar.assert_called_once_with(main.OTS_CALENDAR_URL)
+    assert instance.get_timestamp.called
+
+
+def test_upgrade_pending_calendar_returns_bitcoin_anchored():
+    ots_b64 = base64.b64encode(make_detached_ots_bytes()).decode()
+    upgraded_ts = main.Timestamp(bytes.fromhex(DIGEST))
+    upgraded_ts.attestations.add(main.BitcoinBlockHeaderAttestation(954112))
+    instance = MagicMock()
+    instance.get_timestamp.return_value = upgraded_ts
+    with patch("main.RemoteCalendar", return_value=instance) as mock_calendar:
+        resp = client.post("/upgrade", json={"digest": DIGEST, "ots": ots_b64})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "anchored"
+    assert body["valid_ots"] is True
+    assert body["digest_match"] is True
+    assert body["bitcoin_anchored"] is True
+    assert body["verified"] is True
+    assert body["ots"] is not None
+    assert body["ots"] != ots_b64
+    assert any(a["type"] == "bitcoin" for a in body["attestations"])
+    mock_calendar.assert_called_once_with(main.OTS_CALENDAR_URL)
+    assert instance.get_timestamp.called
+
+
+def test_upgrade_override_allowlist_contacts_only_operator_calendar():
+    ots_b64 = base64.b64encode(
+        make_detached_ots_bytes(
+            attestation=main.PendingAttestation("http://evil.example")
+        )
+    ).decode()
+    instance = MagicMock()
+    instance.get_timestamp.side_effect = Exception("commitment not found")
+    with patch("main.RemoteCalendar", return_value=instance) as mock_calendar:
+        resp = client.post("/upgrade", json={"digest": DIGEST, "ots": ots_b64})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "pending"
+    assert body["valid_ots"] is True
+    assert body["digest_match"] is True
+    assert body["bitcoin_anchored"] is False
+    assert body["verified"] is False
+    assert body["ots"] == ots_b64
+    mock_calendar.assert_called_once_with(main.OTS_CALENDAR_URL)
+    assert mock_calendar.call_args.args[0] == main.OTS_CALENDAR_URL
+    assert mock_calendar.call_args.args[0] != "http://evil.example"
+    assert instance.get_timestamp.called
