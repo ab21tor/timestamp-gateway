@@ -18,8 +18,9 @@ from pymacaroons import Macaroon, Verifier
 from pymacaroons.exceptions import MacaroonException
 from opentimestamps.core.op import OpSHA256
 from opentimestamps.core.timestamp import DetachedTimestampFile, Timestamp
-from opentimestamps.core.serialize import StreamSerializationContext
+from opentimestamps.core.serialize import StreamSerializationContext, StreamDeserializationContext
 from opentimestamps.calendar import RemoteCalendar, DEFAULT_AGGREGATORS
+from opentimestamps.core.notary import PendingAttestation, BitcoinBlockHeaderAttestation
 
 
 # L402 token constants. The capability names the endpoint a token authorizes, so a
@@ -172,6 +173,91 @@ class TimestampRequest(BaseModel):
         if not re.fullmatch(r"[0-9a-fA-F]{64}", v):
             raise ValueError("digest must be a 64-character hex string (SHA256)")
         return v.lower()
+
+
+class VerifyRequest(BaseModel):
+    digest: str
+    ots: str
+
+    @field_validator("digest")
+    @classmethod
+    def must_be_hex(cls, v: str) -> str:
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", v):
+            raise ValueError("digest must be a 64-character hex string (SHA256)")
+        return v.lower()
+
+
+MAX_VERIFY_OTS_BYTES = 256 * 1024
+
+
+def _verify_ots_bytes(digest: str, ots_bytes: bytes) -> dict:
+    try:
+        ctx = StreamDeserializationContext(io.BytesIO(ots_bytes))
+        detached = DetachedTimestampFile.deserialize(ctx)
+    except Exception:
+        logging.info("Verify failed: invalid OTS proof", exc_info=True)
+        return {
+            "digest": digest,
+            "proof_digest": None,
+            "status": "invalid",
+            "valid_ots": False,
+            "digest_match": False,
+            "bitcoin_anchored": False,
+            "verified": False,
+            "attestations": [],
+        }
+
+    proof_digest = detached.file_digest.hex()
+    digest_match = proof_digest == digest
+    attestations = []
+
+    for _msg, attestation in detached.timestamp.all_attestations():
+        if isinstance(attestation, PendingAttestation):
+            attestations.append(
+                {
+                    "type": "pending_calendar",
+                    "calendar_url": attestation.uri,
+                }
+            )
+        elif isinstance(attestation, BitcoinBlockHeaderAttestation):
+            height = attestation.height
+            attestations.append(
+                {
+                    "type": "bitcoin",
+                    "block_height": height,
+                    "mempool_block_height_url": f"https://mempool.space/block-height/{height}",
+                }
+            )
+        else:
+            attestations.append(
+                {
+                    "type": "unknown",
+                    "description": repr(attestation),
+                }
+            )
+
+    bitcoin_anchored = any(a["type"] == "bitcoin" for a in attestations)
+    has_pending = any(a["type"] == "pending_calendar" for a in attestations)
+
+    if not digest_match:
+        status = "mismatch"
+    elif bitcoin_anchored:
+        status = "anchored"
+    elif has_pending:
+        status = "pending"
+    else:
+        status = "invalid"
+
+    return {
+        "digest": digest,
+        "proof_digest": proof_digest,
+        "status": status,
+        "valid_ots": True,
+        "digest_match": digest_match,
+        "bitcoin_anchored": bitcoin_anchored,
+        "verified": status == "anchored",
+        "attestations": attestations,
+    }
 
 
 # ── L402 token (macaroon) ────────────────────────────────────────────────────
@@ -405,6 +491,31 @@ def health():
         status_code=200 if overall == "ok" else 503,
         content={"status": overall, "lnd": lnd_status, "otsd": otsd_status},
     )
+
+
+@app.post("/verify")
+def verify(body: VerifyRequest):
+    try:
+        ots_bytes = base64.b64decode(body.ots, validate=True)
+    except Exception:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "digest": body.digest,
+                "proof_digest": None,
+                "status": "invalid",
+                "valid_ots": False,
+                "digest_match": False,
+                "bitcoin_anchored": False,
+                "verified": False,
+                "attestations": [],
+            },
+        )
+
+    if len(ots_bytes) > MAX_VERIFY_OTS_BYTES:
+        raise HTTPException(status_code=413, detail="OTS proof too large")
+
+    return JSONResponse(content=_verify_ots_bytes(body.digest, ots_bytes))
 
 
 @app.post("/timestamp")

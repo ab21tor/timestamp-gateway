@@ -9,6 +9,7 @@ semantics, and error discipline (generic public details).
 
 import base64
 import hashlib
+import io
 import logging
 import os
 import time
@@ -739,3 +740,109 @@ def test_unsettled_uses_402_not_error():
     with patch("main.requests.get", return_value=_get_mock(False, DIGEST, 0)):
         resp = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
     assert resp.status_code == 402
+
+
+# ── /verify endpoint ─────────────────────────────────────────────────────────
+
+def make_detached_ots_bytes(digest=DIGEST, attestation=None):
+    timestamp = main.Timestamp(bytes.fromhex(digest))
+    if attestation is None:
+        attestation = main.PendingAttestation("http://127.0.0.1:14788")
+    timestamp.attestations.add(attestation)
+    detached = main.DetachedTimestampFile(main.OpSHA256(), timestamp)
+    buf = io.BytesIO()
+    detached.serialize(main.StreamSerializationContext(buf))
+    return buf.getvalue()
+
+
+def test_verify_pending_proof_returns_pending_status():
+    ots_b64 = base64.b64encode(make_detached_ots_bytes()).decode()
+    resp = client.post("/verify", json={"digest": DIGEST, "ots": ots_b64})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["digest"] == DIGEST
+    assert body["proof_digest"] == DIGEST
+    assert body["status"] == "pending"
+    assert body["valid_ots"] is True
+    assert body["digest_match"] is True
+    assert body["bitcoin_anchored"] is False
+    assert body["verified"] is False
+    assert body["attestations"] == [
+        {"type": "pending_calendar", "calendar_url": "http://127.0.0.1:14788"}
+    ]
+
+
+def test_verify_mismatched_digest_returns_mismatch_status():
+    ots_b64 = base64.b64encode(make_detached_ots_bytes(digest=OTHER_DIGEST)).decode()
+    resp = client.post("/verify", json={"digest": DIGEST, "ots": ots_b64})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "mismatch"
+    assert body["valid_ots"] is True
+    assert body["digest_match"] is False
+    assert body["bitcoin_anchored"] is False
+    assert body["verified"] is False
+    assert body["proof_digest"] == OTHER_DIGEST
+
+
+def test_verify_bitcoin_attestation_returns_anchored_status():
+    ots_b64 = base64.b64encode(
+        make_detached_ots_bytes(attestation=main.BitcoinBlockHeaderAttestation(954112))
+    ).decode()
+    resp = client.post("/verify", json={"digest": DIGEST, "ots": ots_b64})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "anchored"
+    assert body["valid_ots"] is True
+    assert body["digest_match"] is True
+    assert body["bitcoin_anchored"] is True
+    assert body["verified"] is True
+    assert body["attestations"] == [
+        {
+            "type": "bitcoin",
+            "block_height": 954112,
+            "mempool_block_height_url": "https://mempool.space/block-height/954112",
+        }
+    ]
+
+
+def test_verify_invalid_base64_returns_invalid_status():
+    resp = client.post("/verify", json={"digest": DIGEST, "ots": "not base64!!!"})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "invalid"
+    assert body["valid_ots"] is False
+    assert body["digest_match"] is False
+    assert body["bitcoin_anchored"] is False
+    assert body["verified"] is False
+
+
+def test_verify_invalid_ots_bytes_returns_invalid_status():
+    ots_b64 = base64.b64encode(b"not an ots proof").decode()
+    resp = client.post("/verify", json={"digest": DIGEST, "ots": ots_b64})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "invalid"
+    assert body["valid_ots"] is False
+    assert body["digest_match"] is False
+    assert body["bitcoin_anchored"] is False
+    assert body["verified"] is False
+
+
+def test_verify_rejects_invalid_digest_with_422():
+    ots_b64 = base64.b64encode(make_detached_ots_bytes()).decode()
+    resp = client.post("/verify", json={"digest": "g" * 64, "ots": ots_b64})
+
+    assert resp.status_code == 422
+
+
+def test_verify_rejects_oversized_ots_with_413():
+    ots_b64 = base64.b64encode(b"x" * (main.MAX_VERIFY_OTS_BYTES + 1)).decode()
+    resp = client.post("/verify", json={"digest": DIGEST, "ots": ots_b64})
+
+    assert resp.status_code == 413
