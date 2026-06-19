@@ -1,4 +1,70 @@
+# Environment / secrets
 .env
+.env.*
+!.env.example
+*.env
+*.local
+
+# Lightning / Bitcoin credentials
+*.macaroon
+*.cookie
+*.key
+*.pem
+*.crt
+*.cert
+tls.cert
+tls.key
+admin.macaroon
+invoice.macaroon
+readonly.macaroon
+
+# L402 / payment artifacts
+l402_*
+*l402*
+*invoice*
+*preimage*
+*macaroon*
+headers.txt
+*_headers.txt
+*_response.bin
+*.bin
+
+# OpenTimestamps proofs / proof artifacts
+*.ots
+proof.ots
+*.proof
+proofs/
+artifacts/
+live-artifacts/
+timestamp-gateway-live-artifacts/
+
+# Python
 .venv/
+venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local scratch / temp
+scratch/
+tmp/
+temp/
+*.tmp
+*.bak
+*.backup
+*.log
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
+
+# Runtime data
+data/
+db/
+calendar/
+calendars/
+bitcoin/
+lnd/
