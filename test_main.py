@@ -975,3 +975,116 @@ def test_upgrade_override_allowlist_contacts_only_operator_calendar():
     assert mock_calendar.call_args.args[0] == main.OTS_CALENDAR_URL
     assert mock_calendar.call_args.args[0] != "http://evil.example"
     assert instance.get_timestamp.called
+
+
+# PAYMENT BACKEND TESTS
+
+def test_payment_backend_default_is_lnd():
+    assert main.PAYMENT_BACKEND_TYPE == "lnd"
+    assert isinstance(main.PAYMENT_BACKEND, main.LndPaymentBackend)
+
+
+def test_make_payment_backend_lnd():
+    backend = main._make_payment_backend("lnd")
+    assert isinstance(backend, main.LndPaymentBackend)
+
+
+def test_make_payment_backend_phoenixd():
+    backend = main._make_payment_backend("phoenixd")
+    assert isinstance(backend, main.PhoenixdPaymentBackend)
+
+
+def test_make_payment_backend_invalid():
+    with pytest.raises(RuntimeError):
+        main._make_payment_backend("invalid")
+
+
+def test_parse_config_rejects_invalid_payment_backend():
+    with patch.dict(os.environ, {"PAYMENT_BACKEND_TYPE": "invalid"}):
+        with pytest.raises(RuntimeError):
+            main._parse_config()
+
+
+def test_phoenixd_create_invoice_uses_form_data():
+    backend = main.PhoenixdPaymentBackend()
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {
+        "serialized": FAKE_INVOICE,
+        "paymentHash": PAYMENT_HASH.upper(),
+    }
+    with patch("main.requests.post", return_value=resp) as post:
+        invoice = backend.create_invoice(DIGEST, 21)
+    assert invoice.bolt11 == FAKE_INVOICE
+    assert invoice.payment_hash == PAYMENT_HASH
+    assert post.call_args.args[0].endswith("/createinvoice")
+    kwargs = post.call_args.kwargs
+    assert "data" in kwargs
+    assert "json" not in kwargs
+    assert kwargs["data"]["amountSat"] == 21
+    assert kwargs["data"]["description"] == DIGEST
+    assert kwargs["data"]["externalId"].startswith(DIGEST[:16])
+
+
+def test_phoenixd_lookup_invoice_maps_neutral_status_only():
+    backend = main.PhoenixdPaymentBackend()
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {
+        "isPaid": True,
+        "receivedSat": 21,
+        "description": DIGEST,
+        "isExpired": False,
+        "preimage": "ff" * 32,
+        "invoice": FAKE_INVOICE,
+    }
+    with patch("main.requests.get", return_value=resp) as get:
+        status = backend.lookup_invoice(PAYMENT_HASH)
+    assert status.settled is True
+    assert status.amount_paid_sat == 21
+    assert status.memo == DIGEST
+    assert status.expired is False
+    assert not hasattr(status, "preimage")
+    assert not hasattr(status, "invoice")
+    assert get.call_args.args[0].endswith("/payments/incoming/" + PAYMENT_HASH)
+
+
+def test_phoenixd_lookup_invoice_expired_none_when_absent():
+    backend = main.PhoenixdPaymentBackend()
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {
+        "isPaid": False,
+        "receivedSat": 0,
+        "description": DIGEST,
+    }
+    with patch("main.requests.get", return_value=resp):
+        status = backend.lookup_invoice(PAYMENT_HASH)
+    assert status.expired is None
+
+
+def test_phoenixd_health_success_and_failure():
+    backend = main.PhoenixdPaymentBackend()
+    ok = MagicMock()
+    ok.raise_for_status.return_value = None
+    with patch("main.requests.get", return_value=ok):
+        assert backend.health() is True
+    with patch("main.requests.get", side_effect=Exception("boom")):
+        assert backend.health() is False
+
+
+def test_phoenixd_password_not_logged(caplog):
+    backend = main.PhoenixdPaymentBackend()
+    secret = "phoenix-secret-for-test"
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {
+        "serialized": FAKE_INVOICE,
+        "paymentHash": PAYMENT_HASH,
+    }
+    with patch("main.PHOENIXD_HTTP_PASSWORD", secret):
+        assert backend._auth() == ("", secret)
+        with caplog.at_level(logging.DEBUG):
+            with patch("main.requests.post", return_value=resp):
+                backend.create_invoice(DIGEST, 21)
+    assert secret not in caplog.text

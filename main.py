@@ -6,6 +6,7 @@ import os
 import re
 import secrets
 import time
+import uuid
 import requests
 import urllib3
 from dataclasses import dataclass
@@ -121,6 +122,12 @@ def _parse_config():
     if ots_backoff < 0:
         raise RuntimeError("OTS_SUBMIT_BACKOFF_SECONDS must be >= 0")
 
+    payment_backend_type = os.getenv("PAYMENT_BACKEND_TYPE", "lnd").lower()
+    if payment_backend_type not in ("lnd", "phoenixd"):
+        raise RuntimeError("PAYMENT_BACKEND_TYPE must be 'lnd' or 'phoenixd'")
+    phoenixd_url = os.getenv("PHOENIXD_URL", "http://127.0.0.1:9740")
+    phoenixd_http_password = os.getenv("PHOENIXD_HTTP_PASSWORD") or None
+
     return (
         os.getenv("LND_HOST"),
         os.getenv("LND_PORT"),
@@ -135,6 +142,9 @@ def _parse_config():
         l402_expiry,
         ots_max_attempts,
         ots_backoff,
+        payment_backend_type,
+        phoenixd_url,
+        phoenixd_http_password,
     )
 
 
@@ -153,6 +163,9 @@ load_dotenv()
     L402_TOKEN_EXPIRY_SECONDS,
     OTS_SUBMIT_MAX_ATTEMPTS,
     OTS_SUBMIT_BACKOFF_SECONDS,
+    PAYMENT_BACKEND_TYPE,
+    PHOENIXD_URL,
+    PHOENIXD_HTTP_PASSWORD,
 ) = _parse_config()
 
 if not LND_TLS_VERIFY:
@@ -543,8 +556,85 @@ class LndPaymentBackend:
             return False
 
 
-# Production runs on LND. A future backend swap happens here only.
-PAYMENT_BACKEND: PaymentBackend = LndPaymentBackend()
+class PhoenixdPaymentBackend:
+    """PaymentBackend backed by the phoenixd HTTP API."""
+
+    def _auth(self):
+        return ("", PHOENIXD_HTTP_PASSWORD) if PHOENIXD_HTTP_PASSWORD else None
+
+    def create_invoice(self, digest: str, amount_sats: int) -> Invoice:
+        external_id = f"{digest[:16]}-{uuid.uuid4().hex}"
+        try:
+            resp = requests.post(
+                f"{PHOENIXD_URL}/createinvoice",
+                data={
+                    "amountSat": amount_sats,
+                    "description": digest,
+                    "externalId": external_id,
+                },
+                auth=self._auth(),
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return Invoice(
+                bolt11=data["serialized"],
+                payment_hash=data["paymentHash"].lower(),
+            )
+        except Exception:
+            logging.exception("phoenixd invoice creation failed")
+            raise HTTPException(
+                status_code=502,
+                detail="Payment backend error: could not create invoice",
+            )
+
+    def lookup_invoice(self, payment_hash: str) -> InvoiceStatus:
+        try:
+            resp = requests.get(
+                f"{PHOENIXD_URL}/payments/incoming/{payment_hash}",
+                auth=self._auth(),
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:
+            logging.exception("phoenixd invoice lookup failed")
+            raise HTTPException(
+                status_code=502,
+                detail="Payment backend error: could not verify payment",
+            )
+
+        return InvoiceStatus(
+            settled=bool(data.get("isPaid", False)),
+            amount_paid_sat=int(data.get("receivedSat") or 0),
+            memo=data.get("description"),
+            expired=data.get("isExpired") if "isExpired" in data else None,
+        )
+
+    def health(self) -> bool:
+        try:
+            resp = requests.get(
+                f"{PHOENIXD_URL}/getinfo",
+                auth=self._auth(),
+                timeout=5,
+            )
+            resp.raise_for_status()
+            return True
+        except Exception:
+            logging.warning("Health check: phoenixd unreachable")
+            return False
+
+
+def _make_payment_backend(backend_type: str) -> PaymentBackend:
+    if backend_type == "lnd":
+        return LndPaymentBackend()
+    if backend_type == "phoenixd":
+        return PhoenixdPaymentBackend()
+    raise RuntimeError(f"Unknown PAYMENT_BACKEND_TYPE: {backend_type!r}")
+
+
+# Production/default runs on LND; PAYMENT_BACKEND_TYPE may select phoenixd.
+PAYMENT_BACKEND: PaymentBackend = _make_payment_backend(PAYMENT_BACKEND_TYPE)
 
 
 def create_invoice(memo: str, amount_sats: int) -> tuple[str, str]:
