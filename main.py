@@ -719,7 +719,7 @@ def root():
 
 @app.get("/health")
 def health():
-    lnd_status = "ok" if PAYMENT_BACKEND.health() else "error"
+    payment_status = "ok" if PAYMENT_BACKEND.health() else "error"
 
     if OTS_CALENDAR_URL:
         otsd_status = "ok"
@@ -732,10 +732,15 @@ def health():
     else:
         otsd_status = "n/a"
 
-    overall = "ok" if lnd_status == "ok" and otsd_status in ("ok", "n/a") else "degraded"
+    overall = "ok" if payment_status == "ok" and otsd_status in ("ok", "n/a") else "degraded"
     return JSONResponse(
         status_code=200 if overall == "ok" else 503,
-        content={"status": overall, "lnd": lnd_status, "otsd": otsd_status},
+        content={
+            "status": overall,
+            "payment": payment_status,
+            "payment_backend": PAYMENT_BACKEND_TYPE,
+            "otsd": otsd_status,
+        },
     )
 
 
