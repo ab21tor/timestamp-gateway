@@ -8,7 +8,9 @@ import secrets
 import time
 import requests
 import urllib3
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
@@ -430,30 +432,126 @@ def parse_l402_auth(auth: str) -> tuple[str, str] | None:
     return m.group(1), m.group(2).lower()
 
 
+# ── Payment backend abstraction ──────────────────────────────────────────────
+# Typed result objects and the operations the gateway depends on from a Lightning
+# node, so endpoint logic doesn't depend on any one node implementation.
+
+
+@dataclass(frozen=True)
+class Invoice:
+    """A newly created Lightning invoice."""
+    bolt11: str
+    payment_hash: str
+
+
+@dataclass(frozen=True)
+class InvoiceStatus:
+    """The current state of a previously created invoice, as reported by the node.
+
+    ``expired`` is ``None`` when the backend exposes no expiry signal,
+    distinguishing "not expired" from "unknown".
+    """
+    settled: bool
+    amount_paid_sat: int
+    memo: str | None
+    expired: bool | None
+
+
+class PaymentBackend(Protocol):
+    """Lightning payment operations the gateway depends on."""
+
+    def create_invoice(self, digest: str, amount_sats: int) -> Invoice:
+        """Create an invoice for ``amount_sats``, bound to ``digest`` (as the memo)."""
+        ...
+
+    def lookup_invoice(self, payment_hash: str) -> InvoiceStatus:
+        """Look up the current state of the invoice for ``payment_hash``."""
+        ...
+
+    def health(self) -> bool:
+        """Return True iff the backing node is reachable and responding."""
+        ...
+
+
+class LndPaymentBackend:
+    """PaymentBackend backed by the LND REST API.
+
+    Reads the ``LND_*`` / ``TOR_PROXY`` / ``LND_TLS_VERIFY`` module globals at call
+    time (not construction) so configuration stays patchable and the backend never
+    holds a stale copy of connection settings. Wire behavior is preserved exactly
+    from the prior module-level functions.
+    """
+
+    def _proxies(self):
+        return {"https": f"socks5h://{TOR_PROXY}"} if TOR_PROXY else None
+
+    def create_invoice(self, digest: str, amount_sats: int) -> Invoice:
+        headers = {"Grpc-Metadata-macaroon": LND_MACAROON_HEX}
+        url = f"https://{LND_HOST}:{LND_PORT}/v1/invoices"
+        try:
+            resp = requests.post(
+                url,
+                headers=headers,
+                json={"memo": digest, "value": amount_sats, "private": True},
+                proxies=self._proxies(),
+                verify=LND_TLS_VERIFY,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            payment_request = data["payment_request"]
+            # LND returns r_hash as standard base64 over REST; normalize to hex.
+            payment_hash = base64.b64decode(data["r_hash"]).hex()
+            return Invoice(bolt11=payment_request, payment_hash=payment_hash)
+        except Exception:
+            logging.exception("LND invoice creation failed")
+            raise HTTPException(status_code=502, detail="LND error: could not create invoice")
+
+    def lookup_invoice(self, payment_hash: str) -> InvoiceStatus:
+        headers = {"Grpc-Metadata-macaroon": LND_MACAROON_HEX}
+        url = f"https://{LND_HOST}:{LND_PORT}/v1/invoice/{payment_hash}"
+        try:
+            resp = requests.get(
+                url, headers=headers, proxies=self._proxies(), verify=LND_TLS_VERIFY, timeout=30
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:
+            logging.exception("LND invoice lookup failed")
+            raise HTTPException(status_code=502, detail="LND error: could not verify payment")
+        return InvoiceStatus(
+            settled=bool(data.get("settled", False)),
+            amount_paid_sat=int(data.get("amt_paid_sat") or 0),
+            memo=data.get("memo"),
+            expired=None,
+        )
+
+    def health(self) -> bool:
+        headers = {"Grpc-Metadata-macaroon": LND_READONLY_MACAROON_HEX or LND_MACAROON_HEX}
+        try:
+            resp = requests.get(
+                f"https://{LND_HOST}:{LND_PORT}/v1/getinfo",
+                headers=headers,
+                proxies=self._proxies(),
+                verify=LND_TLS_VERIFY,
+                timeout=5,
+            )
+            resp.raise_for_status()
+            return True
+        except Exception:
+            logging.warning("Health check: LND unreachable")
+            return False
+
+
+# Production runs on LND. A future backend swap happens here only.
+PAYMENT_BACKEND: PaymentBackend = LndPaymentBackend()
+
+
 def create_invoice(memo: str, amount_sats: int) -> tuple[str, str]:
     """Call LND REST API to create a Lightning invoice. Returns
     (payment_request, payment_hash_hex). Raises HTTPException 502 on any failure."""
-    proxies = {"https": f"socks5h://{TOR_PROXY}"} if TOR_PROXY else None
-    headers = {"Grpc-Metadata-macaroon": LND_MACAROON_HEX}
-    url = f"https://{LND_HOST}:{LND_PORT}/v1/invoices"
-    try:
-        resp = requests.post(
-            url,
-            headers=headers,
-            json={"memo": memo, "value": amount_sats, "private": True},
-            proxies=proxies,
-            verify=LND_TLS_VERIFY,
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        payment_request = data["payment_request"]
-        # LND returns r_hash as standard base64 over REST; normalize to hex.
-        payment_hash = base64.b64decode(data["r_hash"]).hex()
-        return payment_request, payment_hash
-    except Exception:
-        logging.exception("LND invoice creation failed")
-        raise HTTPException(status_code=502, detail="LND error: could not create invoice")
+    invoice = PAYMENT_BACKEND.create_invoice(memo, amount_sats)
+    return invoice.bolt11, invoice.payment_hash
 
 
 def stamp_digest(hex_digest: str) -> bytes:
@@ -516,21 +614,12 @@ def verify_payment(payment_hash: str, digest: str) -> bool:
     issued for the specific digest (memo), and the paid amount meets the price. The
     caller must already have proven that the presented preimage hashes to this
     payment hash."""
-    proxies = {"https": f"socks5h://{TOR_PROXY}"} if TOR_PROXY else None
-    headers = {"Grpc-Metadata-macaroon": LND_MACAROON_HEX}
-    url = f"https://{LND_HOST}:{LND_PORT}/v1/invoice/{payment_hash}"
-    try:
-        resp = requests.get(url, headers=headers, proxies=proxies, verify=LND_TLS_VERIFY, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        return (
-            data.get("settled", False)
-            and data.get("memo") == digest
-            and int(data.get("amt_paid_sat") or 0) >= GATEWAY_PRICE_SATS
-        )
-    except Exception:
-        logging.exception("LND invoice lookup failed")
-        raise HTTPException(status_code=502, detail="LND error: could not verify payment")
+    status = PAYMENT_BACKEND.lookup_invoice(payment_hash)
+    return (
+        status.settled
+        and status.memo == digest
+        and status.amount_paid_sat >= GATEWAY_PRICE_SATS
+    )
 
 
 @app.get("/")
@@ -540,22 +629,7 @@ def root():
 
 @app.get("/health")
 def health():
-    proxies = {"https": f"socks5h://{TOR_PROXY}"} if TOR_PROXY else None
-    headers = {"Grpc-Metadata-macaroon": LND_READONLY_MACAROON_HEX or LND_MACAROON_HEX}
-
-    lnd_status = "ok"
-    try:
-        resp = requests.get(
-            f"https://{LND_HOST}:{LND_PORT}/v1/getinfo",
-            headers=headers,
-            proxies=proxies,
-            verify=LND_TLS_VERIFY,
-            timeout=5,
-        )
-        resp.raise_for_status()
-    except Exception:
-        logging.warning("Health check: LND unreachable")
-        lnd_status = "error"
+    lnd_status = "ok" if PAYMENT_BACKEND.health() else "error"
 
     if OTS_CALENDAR_URL:
         otsd_status = "ok"
