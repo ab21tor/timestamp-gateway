@@ -667,7 +667,12 @@ def test_health_both_ok_returns_200():
     with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
         resp = client.get("/health")
     assert resp.status_code == 200
-    assert resp.json() == {"status": "ok", "lnd": "ok", "otsd": "ok"}
+    assert resp.json() == {
+        "status": "ok",
+        "payment": "ok",
+        "payment_backend": main.PAYMENT_BACKEND_TYPE,
+        "otsd": "ok",
+    }
 
 
 def test_health_lnd_down_returns_503():
@@ -675,7 +680,7 @@ def test_health_lnd_down_returns_503():
         resp = client.get("/health")
     assert resp.status_code == 503
     body = resp.json()
-    assert body["status"] == "degraded" and body["lnd"] == "error"
+    assert body["status"] == "degraded" and body["payment"] == "error"
 
 
 def test_health_otsd_down_in_calendar_mode_returns_503():
@@ -691,7 +696,12 @@ def test_health_otsd_na_in_public_mode():
         with patch("main.requests.get", return_value=_ok_lnd()):
             resp = client.get("/health")
     assert resp.status_code == 200
-    assert resp.json() == {"status": "ok", "lnd": "ok", "otsd": "n/a"}
+    assert resp.json() == {
+        "status": "ok",
+        "payment": "ok",
+        "payment_backend": main.PAYMENT_BACKEND_TYPE,
+        "otsd": "n/a",
+    }
 
 
 def test_health_uses_readonly_macaroon_when_set():
@@ -715,7 +725,7 @@ def test_health_never_raises():
     with patch("main.requests.get", side_effect=RuntimeError("unexpected crash")):
         resp = client.get("/health")
     assert resp.status_code == 503
-    assert resp.json()["lnd"] == "error"
+    assert resp.json()["payment"] == "error"
 
 
 # ══ 11. Error discipline (cross-cutting) ═══════════════════════════════════════
