@@ -1,0 +1,11 @@
+[Unit]
+Description=Run timestamp-gateway proof upgrade scan periodically
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=30min
+Persistent=true
+Unit=timestamp-gateway-upgrade-proofs.service
+
+[Install]
+WantedBy=timers.target
