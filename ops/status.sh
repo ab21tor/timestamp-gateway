@@ -75,3 +75,83 @@ echo
 
 echo "=== latest artifacts ==="
 ls -lt "$ARTIFACTS" 2>/dev/null | head -10 || true
+
+echo "=== anchoring cadence ==="
+WAITING=$(docker logs otsd 2>/dev/null | grep "Waiting" | tail -1 | grep -o '[0-9]*' | head -1 || echo "")
+if [ -n "$WAITING" ]; then
+  HOURS=$(( WAITING / 3600 ))
+  MINS=$(( (WAITING % 3600) / 60 ))
+  SECS=$(( WAITING % 60 ))
+  echo "next_anchor_in: ${WAITING}s (${HOURS}h ${MINS}m ${SECS}s)"
+else
+  echo "next_anchor_in: unavailable"
+fi
+BTC_TARGET=$(docker inspect otsd 2>/dev/null | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+args = d[0].get('Args', [])
+for i, a in enumerate(args):
+    if a == '--btc-conf-target' and i+1 < len(args):
+        print(args[i+1])
+        break
+" 2>/dev/null || echo "unavailable")
+echo "btc_conf_target: ${BTC_TARGET} blocks"
+echo
+
+echo "=== network fees ==="
+FEES=$(curl -sS --max-time 5 https://mempool.space/api/v1/fees/recommended 2>/dev/null || echo "")
+if [ -n "$FEES" ]; then
+  echo "$FEES" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+fastest = d.get('fastestFee', '?')
+half    = d.get('halfHourFee', '?')
+hour    = d.get('hourFee', '?')
+economy = d.get('economyFee', '?')
+print(f'fastest_fee:   {fastest} sat/vB')
+print(f'half_hour_fee: {half} sat/vB')
+print(f'hour_fee:      {hour} sat/vB')
+print(f'economy_fee:   {economy} sat/vB')
+est = hour * 256
+print(f'est_anchor_tx: ~{est} sats (hour_fee x 256 vB)')
+" 2>/dev/null
+else
+  echo "fees: unavailable"
+fi
+echo
+
+echo "=== anchor economics ==="
+BATCH_SIZE=$(awk 'NR > 1 && $1=="waiting_for_bitcoin" {count++} END {print (count ? count : 1)}' "$ARTIFACTS/proofs.tsv" 2>/dev/null || echo 1)
+if [ -n "$FEES" ] && [ -n "${PRICE:-}" ]; then
+  echo "$FEES" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+hour    = d.get('hourFee', 0)
+fastest = d.get('fastestFee', 0)
+anchor_tx_sats = hour * 256
+batch = $BATCH_SIZE
+cost_per_proof = anchor_tx_sats / batch if batch > 0 else anchor_tx_sats
+price = ${PRICE:-500}
+margin = price - cost_per_proof
+pct = (margin / price * 100) if price > 0 else 0
+print(f'current_batch_size:      {batch} proofs (waiting_for_bitcoin)')
+print(f'anchor_tx_fee:           ~{anchor_tx_sats:.0f} sats ({hour} sat/vB x 256 vB)')
+print(f'anchor_cost_per_proof:   ~{cost_per_proof:.1f} sats (tx_fee / batch_size)')
+print(f'proof_price:             {price} sats')
+print(f'margin_per_proof:        ~{margin:.1f} sats ({pct:.1f}%)')
+print(f'batch_revenue:           ~{price * batch:.0f} sats ({batch} proofs x {price} sats)')
+print()
+
+" 2>/dev/null
+else
+  echo "economics: unavailable"
+fi
+echo
+
+echo "=== proof ledger ==="
+TSV="$ARTIFACTS/proofs.tsv"
+if [ -f "$TSV" ]; then
+  awk 'NR > 1 {print $1}' "$TSV" | sort | uniq -c | awk '{print $2": "$1}'
+else
+  echo "ledger: not found"
+fi
