@@ -9,7 +9,7 @@ Gateway service:
 Payment backend:
 
 - Phoenixd
-- service: `phoenixd-sandbox.service`
+- service: `phoenixd.service`
 - API: `127.0.0.1:9740`
 - enabled on boot
 
@@ -53,7 +53,7 @@ Do not print or paste the Phoenixd password.
 
 Phoenixd state lives here:
 
-`/home/gateway/phoenixd-sandbox/home/.phoenix`
+`/home/gateway/phoenixd/home/.phoenix`
 
 Important files:
 
