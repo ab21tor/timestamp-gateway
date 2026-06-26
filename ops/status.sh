@@ -3,7 +3,7 @@ set -u
 
 REPO="/home/gateway/timestamp-gateway"
 ARTIFACTS="/home/gateway/timestamp-gateway-live-artifacts"
-GATEWAY_URL="http://100.98.161.106:8000"
+GATEWAY_URL="${GATEWAY_URL:-$(grep "^GATEWAY_URL=" "$REPO/.env" 2>/dev/null | cut -d= -f2- || echo "http://100.98.161.106:8000")}"
 
 echo "=== timestamp-gateway operator status ==="
 echo "time_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"

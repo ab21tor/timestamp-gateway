@@ -25,7 +25,7 @@ Current service shape:
 - user: `gateway`
 - working directory: `/home/gateway/timestamp-gateway`
 - env file: `/home/gateway/timestamp-gateway/.env`
-- bind: `100.98.161.106:8000`
+- bind: `<gateway_url>`
 - restart: always
 
 ### Phoenixd
