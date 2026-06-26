@@ -24,6 +24,8 @@ os.environ["LND_PORT"] = "8080"
 os.environ["LND_MACAROON_HEX"] = "deadbeef" * 8
 os.environ["TOR_PROXY"] = "127.0.0.1:9050"
 os.environ["GATEWAY_PRICE_SATS"] = "21"
+os.environ["MIN_GATEWAY_PRICE_SATS"] = "1"
+os.environ["PAYMENT_BACKEND_TYPE"] = "lnd"
 os.environ["OTS_BACKEND_MODE"] = "calendar"
 os.environ["OTS_CALENDAR_URL"] = "http://test-calendar:14788"
 os.environ["L402_SECRET_HEX"] = "ab" * 32          # stable, known signing key
@@ -669,6 +671,7 @@ def test_health_both_ok_returns_200():
     assert resp.status_code == 200
     assert resp.json() == {
         "status": "ok",
+        "paused": False,
         "payment": "ok",
         "payment_backend": main.PAYMENT_BACKEND_TYPE,
         "otsd": "ok",
@@ -698,6 +701,7 @@ def test_health_otsd_na_in_public_mode():
     assert resp.status_code == 200
     assert resp.json() == {
         "status": "ok",
+        "paused": False,
         "payment": "ok",
         "payment_backend": main.PAYMENT_BACKEND_TYPE,
         "otsd": "n/a",
@@ -1098,3 +1102,39 @@ def test_phoenixd_password_not_logged(caplog):
             with patch("main.requests.post", return_value=resp):
                 backend.create_invoice(DIGEST, 21)
     assert secret not in caplog.text
+
+
+def test_gateway_price_below_minimum_fails():
+    with patch.dict(os.environ, {"GATEWAY_PRICE_SATS": "20", "MIN_GATEWAY_PRICE_SATS": "21"}):
+        with pytest.raises(RuntimeError, match="GATEWAY_PRICE_SATS must be >= MIN_GATEWAY_PRICE_SATS"):
+            main._parse_config()
+
+
+def test_non_integer_min_gateway_price_fails():
+    with patch.dict(os.environ, {"MIN_GATEWAY_PRICE_SATS": "abc"}):
+        with pytest.raises(RuntimeError, match="MIN_GATEWAY_PRICE_SATS must be an integer"):
+            main._parse_config()
+
+
+def test_paused_health_returns_503(tmp_path):
+    pause_file = tmp_path / "PAUSED"
+    pause_file.write_text("paused\n")
+
+    with patch("main.PAUSE_FILE", str(pause_file)):
+        with patch.object(main.PAYMENT_BACKEND, "health", return_value=True), patch("requests.get", return_value=_ok_otsd()):
+            resp = client.get("/health")
+
+    assert resp.status_code == 503
+    assert resp.json()["status"] == "paused"
+    assert resp.json()["paused"] is True
+
+
+def test_paused_timestamp_returns_503(tmp_path):
+    pause_file = tmp_path / "PAUSED"
+    pause_file.write_text("paused\n")
+
+    with patch("main.PAUSE_FILE", str(pause_file)):
+        resp = client.post("/timestamp", json={"digest": DIGEST})
+
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == "Gateway is paused by operator"
