@@ -34,15 +34,19 @@ L402_CAPABILITY = "timestamp"
 
 def _parse_config():
     """Parse and validate all required env vars. Raises RuntimeError on misconfiguration."""
-    missing = [
-        name for name, val in {
-            "LND_HOST": os.getenv("LND_HOST"),
-            "LND_PORT": os.getenv("LND_PORT"),
-            "LND_MACAROON_HEX": os.getenv("LND_MACAROON_HEX"),
-            "GATEWAY_PRICE_SATS": os.getenv("GATEWAY_PRICE_SATS"),
-            "OTS_BACKEND_MODE": os.getenv("OTS_BACKEND_MODE"),
-        }.items() if not val
-    ]
+    # Determine payment backend type early so we know which vars are required.
+    payment_backend_type_early = os.getenv("PAYMENT_BACKEND_TYPE", "lnd").lower()
+
+    required = {
+        "GATEWAY_PRICE_SATS": os.getenv("GATEWAY_PRICE_SATS"),
+        "OTS_BACKEND_MODE": os.getenv("OTS_BACKEND_MODE"),
+    }
+    if payment_backend_type_early == "lnd":
+        required["LND_HOST"] = os.getenv("LND_HOST")
+        required["LND_PORT"] = os.getenv("LND_PORT")
+        required["LND_MACAROON_HEX"] = os.getenv("LND_MACAROON_HEX")
+
+    missing = [name for name, val in required.items() if not val]
     if missing:
         raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
 
