@@ -8,3 +8,4 @@ Type=oneshot
 User=gateway
 WorkingDirectory=/home/gateway/timestamp-gateway
 ExecStart=/home/gateway/timestamp-gateway/ops/upgrade-all-proofs.sh
+ExecStart=/home/gateway/timestamp-gateway/ops/rebuild-proof-index.sh
