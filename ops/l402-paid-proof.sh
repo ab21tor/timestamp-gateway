@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 GATEWAY_URL="${GATEWAY_URL:-http://100.98.161.106:8000}"
 ENDPOINT="${ENDPOINT:-/timestamp}"
