@@ -66,6 +66,35 @@ Important files:
 
 `seed.dat` is critical. Treat it as secret wallet material.
 
+## Enterprise payment model
+
+Enterprise clients do not manage Lightning wallets directly.
+
+The model is:
+
+1. Client funds a Lightning wallet via a fiat wrapper (e.g. Strike API)
+2. The wrapper converts fiat to sats automatically
+3. notarie calls the wrapper API to pay each gateway invoice
+4. Gateway receives sats via Phoenixd per proof
+5. Proof issued and receipt saved
+
+The client sees: pay fiat, get proofs.
+You see: sats arriving per proof, stacking automatically.
+The wrapper (Strike or equivalent) handles: fiat conversion, Lightning payments, liquidity.
+
+The gateway does not change. It creates Lightning invoices via Phoenixd and verifies settlement as normal. The quoted price per proof is dynamic based on network conditions and the operator floor.
+
+You never touch fiat conversion.
+You never custody client funds.
+You never see client files.
+
+notarie must support a configurable payment provider:
+
+  PAYMENT_PROVIDER=strike    → enterprise fiat wrapper
+  PAYMENT_PROVIDER=phoenixd  → self-sovereign tier
+
+This is a notarie concern, not a gateway concern. The gateway always speaks Lightning.
+
 ## LND role in this deployment
 
 LND is present on this VPS but is NOT the active payment backend.
