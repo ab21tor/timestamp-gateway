@@ -1013,6 +1013,22 @@ def test_make_payment_backend_invalid():
         main._make_payment_backend("invalid")
 
 
+def test_phoenixd_backend_does_not_require_lnd_vars():
+    """PAYMENT_BACKEND_TYPE=phoenixd must not require LND_HOST/PORT/MACAROON."""
+    env = {
+        "PAYMENT_BACKEND_TYPE": "phoenixd",
+        "GATEWAY_PRICE_SATS": "500",
+        "MIN_GATEWAY_PRICE_SATS": "500",
+        "OTS_BACKEND_MODE": "calendar",
+        "OTS_CALENDAR_URL": "http://127.0.0.1:14788",
+        "L402_SECRET_HEX": "ab" * 16,
+        "PHOENIXD_HTTP_PASSWORD": "testpassword",
+    }
+    with patch.dict(os.environ, env, clear=True):
+        result = main._parse_config()
+    assert result is not None
+
+
 def test_parse_config_rejects_invalid_payment_backend():
     with patch.dict(os.environ, {"PAYMENT_BACKEND_TYPE": "invalid"}):
         with pytest.raises(RuntimeError):
