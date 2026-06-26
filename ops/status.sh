@@ -29,6 +29,37 @@ systemctl --no-pager show timestamp-gateway.service \
   -p User || true
 echo
 
+echo "=== gateway safety ==="
+if [ -f "$REPO/.env" ]; then
+  PRICE="$(grep '^GATEWAY_PRICE_SATS=' "$REPO/.env" | cut -d= -f2-)"
+  MIN_PRICE="$(grep '^MIN_GATEWAY_PRICE_SATS=' "$REPO/.env" | cut -d= -f2-)"
+  PAUSE_FILE="$(grep '^PAUSE_FILE=' "$REPO/.env" | cut -d= -f2-)"
+  PAYMENT_BACKEND="$(grep '^PAYMENT_BACKEND_TYPE=' "$REPO/.env" | cut -d= -f2-)"
+else
+  PRICE=""
+  MIN_PRICE=""
+  PAUSE_FILE=""
+  PAYMENT_BACKEND=""
+fi
+
+echo "payment_backend: ${PAYMENT_BACKEND:-unknown}"
+echo "price_sats: ${PRICE:-unknown}"
+echo "min_price_sats: ${MIN_PRICE:-unknown}"
+echo "pause_file: ${PAUSE_FILE:-unknown}"
+
+if [ -n "$PAUSE_FILE" ] && [ -e "$PAUSE_FILE" ]; then
+  echo "paused: true"
+else
+  echo "paused: false"
+fi
+
+if [ -n "$PRICE" ] && [ -n "$MIN_PRICE" ] && [ "$PRICE" -ge "$MIN_PRICE" ] 2>/dev/null; then
+  echo "price_floor: ok"
+else
+  echo "price_floor: needs_attention"
+fi
+echo
+
 echo "=== gateway health ==="
 curl -sS --max-time 5 "$GATEWAY_URL/health" || true
 echo
