@@ -54,7 +54,8 @@ echo "=== tests ==="
 
 echo
 echo "=== live health ==="
-curl -sS http://100.98.161.106:8000/health
+GATEWAY_URL="${GATEWAY_URL:-http://100.98.161.106:8000}"
+curl -sS "$GATEWAY_URL/health"
 echo
 
 echo

@@ -50,7 +50,7 @@ Minimum v1 shape:
     "digest": "87571e11ca692ab728b4ae7897fc7fd164a176b508f786abe5e6b9f3d8534c5a"
   },
   "gateway": {
-    "url": "http://100.98.161.106:8000",
+    "url": "<gateway_url>",
     "endpoint": "/timestamp",
     "auth": "L402"
   },
