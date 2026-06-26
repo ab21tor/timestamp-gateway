@@ -33,14 +33,14 @@ echo "=== writing metadata ==="
 
 docker inspect otsd > "$OUTDIR/otsd-docker-inspect.json" 2>&1 || true
 systemctl --no-pager cat timestamp-gateway.service > "$OUTDIR/timestamp-gateway.service.txt" 2>&1 || true
-systemctl --no-pager cat phoenixd-sandbox.service > "$OUTDIR/phoenixd-sandbox.service.txt" 2>&1 || true
+systemctl --no-pager cat phoenixd.service > "$OUTDIR/phoenixd.service.txt" 2>&1 || true
 
 echo "=== creating sensitive archive ==="
 sudo tar -czf "$ARCHIVE" \
   /home/gateway/timestamp-gateway/.env \
   /etc/systemd/system/timestamp-gateway.service \
-  /etc/systemd/system/phoenixd-sandbox.service \
-  /home/gateway/phoenixd-sandbox/home/.phoenix \
+  /etc/systemd/system/phoenixd.service \
+  /home/gateway/phoenixd/home/.phoenix \
   /var/lib/otsd/calendar \
   /home/gateway/timestamp-gateway-live-artifacts \
   "$OUTDIR" \

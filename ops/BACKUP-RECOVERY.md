@@ -32,15 +32,15 @@ Current service shape:
 
 Systemd unit:
 
-`/etc/systemd/system/phoenixd-sandbox.service`
+`/etc/systemd/system/phoenixd.service`
 
 Phoenixd binary directory:
 
-`/home/gateway/phoenixd-sandbox/phoenixd-0.8.0-linux-x64`
+`/home/gateway/phoenixd/phoenixd-0.8.0-linux-x64`
 
 Phoenixd home/state directory:
 
-`/home/gateway/phoenixd-sandbox/home/.phoenix`
+`/home/gateway/phoenixd/home/.phoenix`
 
 Critical files:
 
@@ -53,7 +53,7 @@ Critical files:
 Log files are useful but less critical:
 
 - `phoenix.log`
-- `/home/gateway/phoenixd-sandbox/phoenixd-systemd.log`
+- `/home/gateway/phoenixd/phoenixd-systemd.log`
 
 `seed.dat` is wallet material. Treat it as secret.
 
@@ -63,7 +63,7 @@ Phoenixd listens only on:
 
 Phoenixd service:
 
-`phoenixd-sandbox.service`
+`phoenixd.service`
 
 It is enabled on boot.
 
@@ -123,7 +123,7 @@ On a replacement box:
 3. Restore `timestamp-gateway.service`.
 4. Restore Phoenixd binary directory.
 5. Restore Phoenixd home/state directory.
-6. Restore `phoenixd-sandbox.service`.
+6. Restore `phoenixd.service`.
 7. Restore `/var/lib/otsd/calendar`.
 8. Restore or rebuild `/home/gateway/opentimestamps-server`.
 9. Recreate the `otsd` Docker container with the same mounts and command.
