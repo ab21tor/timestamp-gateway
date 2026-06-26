@@ -33,6 +33,14 @@ find "$ARTIFACTS" -maxdepth 2 -name proof.ots -printf '%T@ %p\n' 2>/dev/null \
       echo -e "${state}\t${block:-}\t${txid:-}\t${digest:-}\t${proof}\t${artifact}\t${updated_utc}" >> "$TMP"
     done
 
+PROOF_COUNT=$(grep -c "proof.ots" "$TMP" || true)
+if [ "$PROOF_COUNT" -eq 0 ] && [ -f "$INDEX" ]; then
+  echo "state: needs_attention"
+  echo "message: no proofs found, preserving existing index"
+  rm -f "$TMP"
+  exit 1
+fi
+
 mv "$TMP" "$INDEX"
 chmod 600 "$INDEX"
 
