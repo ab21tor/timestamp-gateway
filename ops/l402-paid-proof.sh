@@ -64,6 +64,8 @@ print("invoice_saved:", invoice_path)
 print("macaroon_saved:", macaroon_path)
 PY
 
+chmod 600 "$ART/invoice.txt" "$ART/macaroon.txt" "$ART/challenge.json" "$ART/challenge.headers" 2>/dev/null || true
+
 INVOICE="$(cat "$ART/invoice.txt")"
 MACAROON="$(cat "$ART/macaroon.txt")"
 
@@ -82,6 +84,7 @@ PAY_RC=$?
 set -e
 
 echo "lncli_pay_exit: $PAY_RC"
+chmod 600 "$ART/lncli-pay.json" "$ART/lncli-pay.stderr" 2>/dev/null || true
 
 if [ "$PAY_RC" -ne 0 ]; then
   echo "state: payment_failed"
@@ -167,6 +170,7 @@ HTTP_CODE="$(
 )"
 
 echo "proof_http_code: $HTTP_CODE"
+chmod 644 "$ART/proof.ots" "$ART/proof.headers" 2>/dev/null || true
 
 if [ "$HTTP_CODE" != "200" ]; then
   echo "state: proof_failed"
