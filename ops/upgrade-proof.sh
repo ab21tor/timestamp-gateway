@@ -40,6 +40,7 @@ if echo "$INFO" | grep -q "BitcoinBlockHeaderAttestation"; then
   exit 0
 fi
 
+cp "$PROOF" "$PROOF.bak"
 UPGRADE="$("$OTS" upgrade -c "$CALENDAR_URL" "$PROOF" 2>&1)"
 UPGRADE_EXIT=$?
 
@@ -47,6 +48,7 @@ if [ "$UPGRADE_EXIT" -eq 0 ] && echo "$UPGRADE" | grep -qi "Success! Timestamp c
   INFO2="$("$OTS" info "$PROOF" 2>&1)"
   BLOCK="$(echo "$INFO2" | sed -n 's/.*BitcoinBlockHeaderAttestation(\([0-9][0-9]*\)).*/\1/p' | tail -1)"
   TXID="$(echo "$INFO2" | sed -n 's/^# Transaction id //p' | tail -1)"
+  rm -f "$PROOF.bak"
   echo "state: bitcoin_backed"
   echo "message: proof upgraded"
   echo "proof: $PROOF"
