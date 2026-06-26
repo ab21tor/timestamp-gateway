@@ -114,6 +114,25 @@ This is a testing artifact. In production:
 
 Do not confuse LND's presence with it being the active payment backend.
 
+## LND role in this deployment
+
+LND is present on this VPS but is NOT the active payment backend.
+
+Current payment backend: Phoenixd
+
+LND is used only as a test payer in operator scripts:
+
+- ops/l402-paid-proof.sh uses lncli to pay Phoenixd invoices for testing
+- This creates a local loop: LND pays → Phoenixd receives
+
+This is a testing artifact. In production:
+
+- Client wallets pay Phoenixd invoices over the Lightning network
+- Enterprise clients pay via a fiat wrapper (e.g. Strike API)
+- LND is not involved in the live payment flow
+
+Do not confuse LND's presence with it being the active payment backend.
+
 ## Phoenixd first payment warning
 
 On a fresh Phoenixd node with no open channel, the first received payment triggers an automatic channel open by ACINQ.
