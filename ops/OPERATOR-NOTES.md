@@ -66,6 +66,28 @@ Important files:
 
 `seed.dat` is critical. Treat it as secret wallet material.
 
+## Phoenixd first payment warning
+
+On a fresh Phoenixd node with no open channel, the first received payment triggers an automatic channel open by ACINQ.
+
+ACINQ deducts a liquidity fee from the received amount:
+
+- mining fee: ~137-411 sats (depends on mempool)
+- service fee: ~1,000-21,000 sats (depends on amount received)
+
+This means the first payment may arrive with less than the invoiced amount.
+
+The gateway verify_payment check requires amount_paid >= GATEWAY_PRICE_SATS.
+
+If the liquidity fee causes the received amount to fall below the price floor, the proof will be refused with 402.
+
+Mitigations:
+- Pre-fund the Phoenixd node by receiving a payment before going live
+- Set GATEWAY_PRICE_SATS high enough to absorb the worst-case liquidity fee on first receive
+- Accept that the first proof on a fresh node may fail and require the client to retry
+
+Once a channel is open, subsequent payments arrive at full value with no deduction.
+
 ## otsd boundary
 
 The local calendar is your own `otsd`, not the public OpenTimestamps calendars.
