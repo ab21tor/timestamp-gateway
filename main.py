@@ -53,6 +53,22 @@ def _parse_config():
     if price <= 0:
         raise RuntimeError(f"GATEWAY_PRICE_SATS must be a positive integer, got {price}")
 
+    try:
+        min_price = int(os.getenv("MIN_GATEWAY_PRICE_SATS", "1"))
+    except ValueError:
+        raise RuntimeError("MIN_GATEWAY_PRICE_SATS must be an integer")
+    if min_price <= 0:
+        raise RuntimeError(
+            f"MIN_GATEWAY_PRICE_SATS must be a positive integer, got {min_price}"
+        )
+    if price < min_price:
+        raise RuntimeError(
+            f"GATEWAY_PRICE_SATS must be >= MIN_GATEWAY_PRICE_SATS "
+            f"({price} < {min_price})"
+        )
+
+    pause_file = os.getenv("PAUSE_FILE", "/var/lib/timestamp-gateway/PAUSED")
+
     mode = os.getenv("OTS_BACKEND_MODE").lower()
     if mode not in ("calendar", "public"):
         raise RuntimeError(
@@ -134,6 +150,8 @@ def _parse_config():
         os.getenv("LND_MACAROON_HEX"),
         os.getenv("TOR_PROXY") or None,  # optional; None = direct connection
         price,
+        min_price,
+        pause_file,
         os.getenv("LND_TLS_VERIFY", "false").lower() == "true",
         mode,
         calendar_url,
@@ -155,6 +173,8 @@ load_dotenv()
     LND_MACAROON_HEX,
     TOR_PROXY,
     GATEWAY_PRICE_SATS,
+    MIN_GATEWAY_PRICE_SATS,
+    PAUSE_FILE,
     LND_TLS_VERIFY,
     OTS_BACKEND_MODE,
     OTS_CALENDAR_URL,
@@ -177,6 +197,10 @@ L402_AUTH_RE = re.compile(r"^L402\s+([A-Za-z0-9+/=_-]+):([0-9a-fA-F]{64})$")
 
 app = FastAPI()
 app.mount("/ui", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="ui")
+
+
+def is_paused() -> bool:
+    return bool(PAUSE_FILE and Path(PAUSE_FILE).exists())
 
 
 class TimestampRequest(BaseModel):
@@ -719,6 +743,7 @@ def root():
 
 @app.get("/health")
 def health():
+    paused = is_paused()
     payment_status = "ok" if PAYMENT_BACKEND.health() else "error"
 
     if OTS_CALENDAR_URL:
@@ -732,11 +757,16 @@ def health():
     else:
         otsd_status = "n/a"
 
-    overall = "ok" if payment_status == "ok" and otsd_status in ("ok", "n/a") else "degraded"
+    if paused:
+        overall = "paused"
+    else:
+        overall = "ok" if payment_status == "ok" and otsd_status in ("ok", "n/a") else "degraded"
+
     return JSONResponse(
         status_code=200 if overall == "ok" else 503,
         content={
             "status": overall,
+            "paused": paused,
             "payment": payment_status,
             "payment_backend": PAYMENT_BACKEND_TYPE,
             "otsd": otsd_status,
@@ -795,6 +825,12 @@ def upgrade(body: VerifyRequest):
 
 @app.post("/timestamp")
 def timestamp(body: TimestampRequest, request: Request):
+    if is_paused():
+        raise HTTPException(
+            status_code=503,
+            detail="Gateway is paused by operator",
+        )
+
     auth = request.headers.get("Authorization", "")
 
     if auth:
