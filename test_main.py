@@ -134,6 +134,13 @@ def _fail():
 
 # ══ 1. Startup / config validation ════════════════════════════════════════════
 
+@pytest.fixture(autouse=True)
+def clear_proof_cache():
+    main._proof_cache.clear()
+    yield
+    main._proof_cache.clear()
+
+
 def test_missing_required_env_var_fails_at_startup():
     with patch.dict(os.environ, {"LND_HOST": ""}):
         with pytest.raises(RuntimeError, match="Missing required environment variables"):
@@ -1011,6 +1018,26 @@ def test_make_payment_backend_phoenixd():
 def test_make_payment_backend_invalid():
     with pytest.raises(RuntimeError):
         main._make_payment_backend("invalid")
+
+
+def test_same_token_preimage_reuse_returns_cached_proof_not_double_stamp():
+    """A replayed valid token returns the cached proof without re-submitting to otsd."""
+    token = valid_token()
+    submit_calls = 0
+
+    def counting_submit(digest_bytes, timeout=10):
+        nonlocal submit_calls
+        submit_calls += 1
+        return MagicMock(ops={}, attestations=[])
+
+    with patch("main.requests.get", return_value=_settled_get()):
+        with patch("main.stamp_digest", side_effect=lambda d: b"fake-ots-proof") as mock_stamp:
+            resp1 = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+            resp2 = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+
+    assert resp1.status_code == 200
+    assert resp2.status_code == 200
+    assert mock_stamp.call_count == 1  # stamp_digest only called once despite two requests
 
 
 def test_phoenixd_backend_does_not_require_lnd_vars():

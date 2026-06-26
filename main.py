@@ -202,6 +202,12 @@ L402_AUTH_RE = re.compile(r"^L402\s+([A-Za-z0-9+/=_-]+):([0-9a-fA-F]{64})$")
 app = FastAPI()
 app.mount("/ui", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="ui")
 
+# Process-level cache mapping payment_hash -> ots_bytes.
+# Prevents the same paid token from submitting the same digest to otsd multiple times
+# within the token expiry window. Resets on process restart (acceptable: the invoice
+# is still settled in Phoenixd so the client can re-present the token after restart).
+_proof_cache: dict[str, bytes] = {}
+
 
 def is_paused() -> bool:
     return bool(PAUSE_FILE and Path(PAUSE_FILE).exists())
@@ -858,11 +864,23 @@ def timestamp(body: TimestampRequest, request: Request):
         if not verify_payment(payment_hash, body.digest):
             raise HTTPException(status_code=402, detail="Payment required or not settled")
 
+        # 4. Return cached proof if this payment_hash was already redeemed.
+        if payment_hash in _proof_cache:
+            logging.info("Returning cached proof for payment_hash %s", payment_hash)
+            ots_bytes = _proof_cache[payment_hash]
+            return Response(
+                content=ots_bytes,
+                media_type="application/octet-stream",
+                headers={"Content-Disposition": f"attachment; filename={body.digest}.ots"},
+            )
+
         try:
             ots_bytes = stamp_digest(body.digest)
         except Exception:
             logging.exception("OTS stamping failed")
             raise HTTPException(status_code=502, detail="OTS error: stamping failed")
+
+        _proof_cache[payment_hash] = ots_bytes
         return Response(
             content=ots_bytes,
             media_type="application/octet-stream",
