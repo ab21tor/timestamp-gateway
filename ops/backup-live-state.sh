@@ -36,12 +36,17 @@ systemctl --no-pager cat timestamp-gateway.service > "$OUTDIR/timestamp-gateway.
 systemctl --no-pager cat phoenixd.service > "$OUTDIR/phoenixd.service.txt" 2>&1 || true
 
 echo "=== creating sensitive archive ==="
+# /var/lib/timestamp-gateway holds the durable obligation log
+# (obligations.db plus its WAL -wal/-shm sidecars) and the operator PAUSED
+# switch. Archiving the whole directory captures the database and both sidecar
+# files together, so a settled-but-unstamped obligation survives a rebuild.
 sudo tar -czf "$ARCHIVE" \
   /home/gateway/timestamp-gateway/.env \
   /etc/systemd/system/timestamp-gateway.service \
   /etc/systemd/system/phoenixd.service \
   /home/gateway/phoenixd/home/.phoenix \
   /var/lib/otsd/calendar \
+  /var/lib/timestamp-gateway \
   /home/gateway/timestamp-gateway-live-artifacts \
   "$OUTDIR" \
   2>"$OUTDIR/tar-warnings.txt"

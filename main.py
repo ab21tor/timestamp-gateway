@@ -5,10 +5,13 @@ import logging
 import os
 import re
 import secrets
+import sqlite3
+import threading
 import time
 import uuid
 import requests
 import urllib3
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -148,6 +151,20 @@ def _parse_config():
     phoenixd_url = os.getenv("PHOENIXD_URL", "http://127.0.0.1:9740")
     phoenixd_http_password = os.getenv("PHOENIXD_HTTP_PASSWORD") or None
 
+    # ── Durable obligation log ────────────────────────────────────────────────
+    # Path to the SQLite obligation store and how often the backstop sweeper
+    # retries obligations left in needs_stamp. The store is what guarantees a
+    # settled payment is never lost if calendar submission fails.
+    obligations_db_path = os.getenv(
+        "OBLIGATIONS_DB_PATH", "/var/lib/timestamp-gateway/obligations.db"
+    )
+    try:
+        obligation_sweep_interval = int(os.getenv("OBLIGATION_SWEEP_INTERVAL", "1800"))
+    except ValueError:
+        raise RuntimeError("OBLIGATION_SWEEP_INTERVAL must be an integer")
+    if obligation_sweep_interval <= 0:
+        raise RuntimeError("OBLIGATION_SWEEP_INTERVAL must be a positive integer")
+
     return (
         os.getenv("LND_HOST"),
         os.getenv("LND_PORT"),
@@ -167,6 +184,8 @@ def _parse_config():
         payment_backend_type,
         phoenixd_url,
         phoenixd_http_password,
+        obligations_db_path,
+        obligation_sweep_interval,
     )
 
 
@@ -190,6 +209,8 @@ load_dotenv()
     PAYMENT_BACKEND_TYPE,
     PHOENIXD_URL,
     PHOENIXD_HTTP_PASSWORD,
+    OBLIGATIONS_DB_PATH,
+    OBLIGATION_SWEEP_INTERVAL,
 ) = _parse_config()
 
 if not LND_TLS_VERIFY:
@@ -199,14 +220,166 @@ if not LND_TLS_VERIFY:
 # padded or not) and never contains a colon; the preimage is 64 hex chars.
 L402_AUTH_RE = re.compile(r"^L402\s+([A-Za-z0-9+/=_-]+):([0-9a-fA-F]{64})$")
 
-app = FastAPI()
-app.mount("/ui", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="ui")
-
 # Process-level cache mapping payment_hash -> ots_bytes.
 # Prevents the same paid token from submitting the same digest to otsd multiple times
 # within the token expiry window. Resets on process restart (acceptable: the invoice
 # is still settled in Phoenixd so the client can re-present the token after restart).
 _proof_cache: dict[str, bytes] = {}
+
+
+# ── Durable obligation log ────────────────────────────────────────────────────
+# A SQLite table recording each settled payment as an obligation to stamp. The
+# in-memory _proof_cache is the instant re-serve path; this DB is the durable
+# backstop. When a payment settles but stamping fails (e.g. otsd down past the
+# retry window), the row is left in 'needs_stamp' and the background sweeper
+# retries it until it is stamped — a paid obligation is never dropped.
+#
+# The store is NEVER consulted to validate a proof. Payment only admits a
+# request; a finished proof verifies with zero dependency on this DB.
+#
+# Every operation uses a fresh, short-lived connection (the sweeper runs in a
+# separate thread; sharing one sqlite3 connection across threads is unsafe).
+
+
+def _obligation_connect() -> sqlite3.Connection:
+    """Open a fresh connection to the obligation store. Reads the module global
+    at call time so tests can repoint OBLIGATIONS_DB_PATH."""
+    conn = sqlite3.connect(OBLIGATIONS_DB_PATH, timeout=30)
+    conn.execute("PRAGMA busy_timeout=30000")
+    return conn
+
+
+def init_obligation_db() -> None:
+    """Create the obligations table if it does not exist. Fails loud (RuntimeError)
+    if the path is unwritable, so the process refuses to start rather than silently
+    running without a durable obligation log."""
+    path = OBLIGATIONS_DB_PATH
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        conn = _obligation_connect()
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS obligations (
+                    payment_hash    TEXT PRIMARY KEY,
+                    digest          TEXT NOT NULL,
+                    created_at      INTEGER NOT NULL,
+                    status          TEXT NOT NULL
+                                    CHECK (status IN ('needs_stamp', 'stamped')),
+                    attempts        INTEGER NOT NULL DEFAULT 0,
+                    last_attempt_at INTEGER
+                )
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        raise RuntimeError(f"Cannot initialize obligations DB at {path}: {e}")
+
+
+def record_obligation(payment_hash: str, digest: str) -> None:
+    """Durably record a paid obligation as 'needs_stamp' before stamping.
+    INSERT OR IGNORE keyed on payment_hash: a duplicate paid token is idempotent
+    (single row, no state change, no new invoice)."""
+    conn = _obligation_connect()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO obligations "
+            "(payment_hash, digest, created_at, status, attempts) "
+            "VALUES (?, ?, ?, 'needs_stamp', 0)",
+            (payment_hash, digest, int(time.time())),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def mark_obligation_stamped(payment_hash: str) -> None:
+    """Mark an obligation complete after a successful stamp."""
+    conn = _obligation_connect()
+    try:
+        conn.execute(
+            "UPDATE obligations SET status='stamped' WHERE payment_hash=?",
+            (payment_hash,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _sweep_obligations_once() -> None:
+    """Retry every 'needs_stamp' obligation once. Each row uses short, independent
+    transactions so a mid-run crash is safe and the sweeper never holds a long lock.
+    attempts/last_attempt_at are always bumped; on success the row is marked
+    'stamped' and _proof_cache is populated (mirroring the endpoint's success path).
+    On failure the row stays 'needs_stamp' for the next sweep — a paid obligation is
+    retried indefinitely, never capped-and-dropped."""
+    conn = _obligation_connect()
+    try:
+        rows = conn.execute(
+            "SELECT payment_hash, digest FROM obligations WHERE status='needs_stamp'"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    for payment_hash, digest in rows:
+        conn = _obligation_connect()
+        try:
+            conn.execute(
+                "UPDATE obligations SET attempts=attempts+1, last_attempt_at=? "
+                "WHERE payment_hash=?",
+                (int(time.time()), payment_hash),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        try:
+            ots_bytes = stamp_digest(digest)
+        except Exception:
+            logging.warning(
+                "Sweeper: stamping still failing for %s; leaving needs_stamp",
+                payment_hash, exc_info=True,
+            )
+            continue
+
+        _proof_cache[payment_hash] = ots_bytes
+        mark_obligation_stamped(payment_hash)
+        logging.info("Sweeper: recovered obligation %s", payment_hash)
+
+
+def _sweeper_loop(stop_event: threading.Event) -> None:
+    while not stop_event.is_set():
+        try:
+            _sweep_obligations_once()
+        except Exception:
+            logging.exception("Obligation sweep failed; will retry next interval")
+        stop_event.wait(OBLIGATION_SWEEP_INTERVAL)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Fail loud on an unwritable DB path before serving any request.
+    init_obligation_db()
+    stop_event = threading.Event()
+    thread = threading.Thread(
+        target=_sweeper_loop, args=(stop_event,),
+        name="obligation-sweeper", daemon=True,
+    )
+    thread.start()
+    app.state.sweeper_stop = stop_event
+    app.state.sweeper_thread = thread
+    try:
+        yield
+    finally:
+        stop_event.set()
+        thread.join(timeout=10)
+
+
+app = FastAPI(lifespan=lifespan)
+app.mount("/ui", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="ui")
 
 
 def is_paused() -> bool:
@@ -874,13 +1047,20 @@ def timestamp(body: TimestampRequest, request: Request):
                 headers={"Content-Disposition": f"attachment; filename={body.digest}.ots"},
             )
 
+        # 5. Durably record the paid obligation BEFORE stamping. If stamping fails
+        #    below, the row stays 'needs_stamp' and the sweeper recovers it — the
+        #    settled payment is never lost. Idempotent on payment_hash.
+        record_obligation(payment_hash, body.digest)
+
         try:
             ots_bytes = stamp_digest(body.digest)
         except Exception:
             logging.exception("OTS stamping failed")
             raise HTTPException(status_code=502, detail="OTS error: stamping failed")
 
+        # 6. Stamped: populate the instant re-serve cache AND close the obligation.
         _proof_cache[payment_hash] = ots_bytes
+        mark_obligation_stamped(payment_hash)
         return Response(
             content=ots_bytes,
             media_type="application/octet-stream",

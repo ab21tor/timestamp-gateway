@@ -135,6 +135,41 @@ The `.ots` file returned immediately by the gateway is a valid receipt. It is no
 
 ---
 
+## Durable obligation log
+
+Payment settlement and calendar submission are two separate steps. A caller can pay, the invoice can settle in the payment backend, and then the OTS calendar (otsd) can be unreachable past the submission retry window. Without a durable record, that settled payment would be lost: the caller paid but no proof was ever produced.
+
+The gateway closes that gap with an **obligation log** — a small SQLite database, separate from the OTS proof path.
+
+### How it works
+
+1. On a fully verified paid request (macaroon valid and digest-bound, preimage matches the payment hash, invoice settled for this digest at the required amount), the gateway records an obligation row keyed on the payment hash with status `needs_stamp` **before** it submits the digest to otsd. The write is committed to disk first.
+2. If stamping succeeds, the row is marked `stamped` and the proof is also placed in the in-memory proof cache for instant re-serve. The caller gets their `.ots`.
+3. If stamping fails, the caller gets a `502` and the row stays `needs_stamp`.
+4. A background **sweeper** thread (started with the gateway) retries every `needs_stamp` row on an interval. On success it stamps the digest, marks the row `stamped`, and populates the proof cache. It retries indefinitely and never drops a paid obligation.
+
+The obligation log and the proof cache coexist: the cache is the instant path for a re-presented token, the DB is the durable backstop. Both are always live for every paying caller.
+
+### What it is not
+
+- It is **not** part of proof validity. The database is never consulted to verify a proof. A finished `.ots` verifies against Bitcoin with zero dependency on this database, the payment backend, or the gateway itself.
+- It is **not** proof storage. It records payment-hash → digest → status only; it never holds proof bytes durably (the proof cache is in-memory and resets on restart, which is fine — the obligation row drives re-stamping, and re-stamping the same digest is idempotent).
+
+### Configuration
+
+Two environment variables (see `.env.example`):
+
+- `OBLIGATIONS_DB_PATH` — path to the SQLite file. Default `/var/lib/timestamp-gateway/obligations.db`. The process **fails loud at startup** if this path is unwritable, rather than running without a durable log.
+- `OBLIGATION_SWEEP_INTERVAL` — how often the sweeper retries `needs_stamp` rows, in seconds. Default `1800` (30 minutes).
+
+### Persistence
+
+Under Docker Compose the database lives on the persistent `gateway_data` volume, mounted at `/var/lib/timestamp-gateway`. This volume must survive container recreation — otherwise a settled-but-unstamped obligation could be lost. SQLite runs in WAL mode, so the database is accompanied by `-wal` and `-shm` sidecar files; back up all three together (see the backup notes below).
+
+> Backup: on the live VPS, `ops/backup-live-state.sh` and `ops/BACKUP-RECOVERY.md` cover the operational backup set and now include the obligations database and its `-wal`/`-shm` sidecars. If you run the gateway outside that layout, ensure your own backups capture `OBLIGATIONS_DB_PATH` and its two sidecar files while the gateway is stopped (or use SQLite's `.backup`/`VACUUM INTO` for a consistent hot copy).
+
+---
+
 ## Getting the invoice macaroon
 
 The invoice macaroon authorises creating and reading invoices. It cannot spend funds, open channels, or take any other action.
@@ -287,8 +322,10 @@ The gateway logs one line per request (uvicorn access log) and logs warnings/err
 ```bash
 docker compose --profile calendar down        # stop; preserve volumes
 docker compose --profile calendar down -v     # stop and delete all volumes
-                                              # WARNING: destroys onion key (address lost)
-                                              # and otsd calendar state (proofs unverifiable)
+                                              # WARNING: destroys onion key (address lost),
+                                              # otsd calendar state (proofs unverifiable),
+                                              # and the gateway obligation log (pending
+                                              # settled payments can no longer be recovered)
 ```
 
 ---
@@ -303,6 +340,15 @@ pip install -r requirements.txt
 cp .env.example .env   # fill in all vars
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
+
+**Create the durable state directory first.** The gateway writes its obligation log (and the `PAUSED` switch) under `OBLIGATIONS_DB_PATH` — default `/var/lib/timestamp-gateway`. On a bare-metal/systemd deployment the service runs as an unprivileged user (e.g. `gateway`) that cannot create a directory under `/var/lib`, and the process **fails loud at startup** if the path is unwritable. Create it once, owned by the service user, before first start:
+
+```bash
+sudo mkdir -p /var/lib/timestamp-gateway
+sudo chown gateway:gateway /var/lib/timestamp-gateway
+```
+
+Substitute your service user for `gateway`. If you point `OBLIGATIONS_DB_PATH` elsewhere, create and chown that directory instead. (Under Docker this is handled automatically by the persistent `gateway_data` volume — see below.)
 
 For a bare-metal otsd:
 
@@ -330,6 +376,7 @@ sudo cat /var/lib/tor/timestamp_gateway/hostname
 
 - [ ] `OTS_BACKEND_MODE=calendar` is set (not `public`).
 - [ ] `OTS_CALENDAR_URL` points to a running otsd instance.
+- [ ] `OBLIGATIONS_DB_PATH` is writable by the service user (bare-metal: `mkdir -p` + `chown` it; Docker: the `gateway_data` volume handles this).
 - [ ] Bitcoin RPC credentials are configured and otsd can reach Bitcoin Core.
 - [ ] A wallet is loaded in Bitcoin Core and has enough BTC to pay anchoring fees.
 - [ ] LND node has inbound Lightning liquidity.
