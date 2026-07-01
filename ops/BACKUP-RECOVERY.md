@@ -28,6 +28,24 @@ Current service shape:
 - bind: `<gateway_url>`
 - restart: always
 
+Durable state directory:
+
+`/var/lib/timestamp-gateway`
+
+This is critical. It holds the durable obligation log — the record of settled payments that must still be stamped — and the operator `PAUSED` switch. If it is lost, a payment that settled but was not yet anchored can no longer be recovered.
+
+Critical files (the DB runs in SQLite WAL mode, so back up all three sidecars together):
+
+- `obligations.db`
+- `obligations.db-wal`
+- `obligations.db-shm`
+
+Also present:
+
+- `PAUSED` (only when the operator has paused the gateway)
+
+For a consistent copy, back it up while the gateway is stopped, or use `sqlite3 obligations.db ".backup <dest>"`. `ops/backup-live-state.sh` archives the whole `/var/lib/timestamp-gateway` directory, which captures the database and both sidecars together.
+
 ### Phoenixd
 
 Systemd unit:
@@ -121,6 +139,7 @@ On a replacement box:
 1. Restore the repository.
 2. Restore `.env`.
 3. Restore `timestamp-gateway.service`.
+   - Also restore `/var/lib/timestamp-gateway` (obligation log + `PAUSED`). On a fresh box the gateway recreates this directory and an empty obligation log at startup; restore it only if you are recovering pending obligations from the old box.
 4. Restore Phoenixd binary directory.
 5. Restore Phoenixd home/state directory.
 6. Restore `phoenixd.service`.

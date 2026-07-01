@@ -7,6 +7,12 @@ services:
       - tor
     networks:
       - ts_net
+    # Persistent state: the durable obligation log (obligations.db) and the
+    # operator PAUSED switch live under /var/lib/timestamp-gateway. This volume
+    # must survive container recreation or a settled-but-unstamped obligation
+    # could be lost. See OBLIGATIONS_DB_PATH in .env.example.
+    volumes:
+      - gateway_data:/var/lib/timestamp-gateway
     # Uncomment to expose the gateway on clearnet in addition to the onion address:
     # ports:
     #   - "8000:8000"
@@ -60,3 +66,4 @@ networks:
 volumes:
   tor_keys:
   otsd_data:
+  gateway_data:

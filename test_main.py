@@ -31,6 +31,7 @@ os.environ["OTS_CALENDAR_URL"] = "http://test-calendar:14788"
 os.environ["L402_SECRET_HEX"] = "ab" * 32          # stable, known signing key
 os.environ["L402_TOKEN_EXPIRY_SECONDS"] = "3600"
 os.environ["OTS_SUBMIT_BACKOFF_SECONDS"] = "0"     # keep retry tests fast
+os.environ["OBLIGATIONS_DB_PATH"] = ":memory:"     # overridden per-test by fixture below
 
 import main  # noqa: E402
 from fastapi import HTTPException  # noqa: E402
@@ -139,6 +140,43 @@ def clear_proof_cache():
     main._proof_cache.clear()
     yield
     main._proof_cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def obligations_db(tmp_path, monkeypatch):
+    """Point the obligation store at a fresh, writable per-test SQLite DB and
+    initialize its schema. Keeps the durable-log integration in /timestamp from
+    touching the production default path during the whole suite."""
+    db_path = tmp_path / "obligations.db"
+    monkeypatch.setattr(main, "OBLIGATIONS_DB_PATH", str(db_path))
+    main.init_obligation_db()
+    yield db_path
+
+
+def _obligation_row(payment_hash=PAYMENT_HASH):
+    """Read a single obligation row as a dict, or None if absent."""
+    import sqlite3
+    conn = sqlite3.connect(main.OBLIGATIONS_DB_PATH)
+    try:
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(
+            "SELECT payment_hash, digest, status, attempts, last_attempt_at "
+            "FROM obligations WHERE payment_hash=?",
+            (payment_hash,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def _obligation_count():
+    import sqlite3
+    conn = sqlite3.connect(main.OBLIGATIONS_DB_PATH)
+    try:
+        return conn.execute("SELECT COUNT(*) FROM obligations").fetchone()[0]
+    finally:
+        conn.close()
 
 
 def test_missing_required_env_var_fails_at_startup():
@@ -1181,3 +1219,106 @@ def test_paused_timestamp_returns_503(tmp_path):
 
     assert resp.status_code == 503
     assert resp.json()["detail"] == "Gateway is paused by operator"
+
+
+# ══ 12. Durable obligation log ═════════════════════════════════════════════════
+# The obligation store guarantees a settled payment is never lost if calendar
+# submission fails. It coexists with _proof_cache: the cache is the instant
+# re-serve path, the DB is the durable backstop the sweeper drains. Payment only
+# admits a request; the DB is never consulted to validate a proof.
+
+def test_obligation_success_marks_stamped():
+    """A fully paid + stamped request leaves the obligation row 'stamped'."""
+    token = valid_token()
+    with patch("main.requests.get", return_value=_settled_get()):
+        with patch("main.stamp_digest", return_value=FAKE_OTS):
+            resp = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+    assert resp.status_code == 200
+    row = _obligation_row()
+    assert row is not None
+    assert row["status"] == "stamped"
+    assert row["digest"] == DIGEST
+
+
+def test_obligation_stamp_failure_returns_502_and_persists_needs_stamp():
+    """Payment settled but stamping fails -> 502, and the obligation is durably
+    recorded as 'needs_stamp' so the sweeper can recover it later."""
+    token = valid_token()
+    with patch("main.requests.get", return_value=_settled_get()):
+        with patch("main.stamp_digest", side_effect=RuntimeError("otsd down")):
+            resp = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+    assert resp.status_code == 502
+    row = _obligation_row()
+    assert row is not None
+    assert row["status"] == "needs_stamp"
+    assert row["digest"] == DIGEST
+
+
+def test_sweeper_completes_pending_obligation_and_bumps_attempts():
+    """The sweeper stamps a needs_stamp row, marks it stamped, bumps attempts,
+    and populates _proof_cache (mirroring the endpoint success path)."""
+    main.record_obligation(PAYMENT_HASH, DIGEST)
+    assert _obligation_row()["status"] == "needs_stamp"
+
+    with patch("main.stamp_digest", return_value=FAKE_OTS) as stamp:
+        main._sweep_obligations_once()
+
+    stamp.assert_called_once_with(DIGEST)
+    row = _obligation_row()
+    assert row["status"] == "stamped"
+    assert row["attempts"] == 1
+    assert row["last_attempt_at"] is not None
+    assert main._proof_cache[PAYMENT_HASH] == FAKE_OTS
+
+
+def test_sweeper_records_attempt_on_repeated_failure():
+    """A still-failing stamp leaves the row needs_stamp but records the attempt,
+    so a paid obligation is retried indefinitely, never dropped."""
+    main.record_obligation(PAYMENT_HASH, DIGEST)
+
+    with patch("main.stamp_digest", side_effect=RuntimeError("still down")):
+        main._sweep_obligations_once()
+
+    row = _obligation_row()
+    assert row["status"] == "needs_stamp"
+    assert row["attempts"] == 1
+    assert row["last_attempt_at"] is not None
+    assert PAYMENT_HASH not in main._proof_cache
+
+
+def test_token_representation_stays_instant_via_proof_cache():
+    """Re-presenting a redeemed token serves from _proof_cache without re-stamping
+    or re-recording — the instant path is preserved alongside the durable log."""
+    token = valid_token()
+    with patch("main.requests.get", return_value=_settled_get()):
+        with patch("main.stamp_digest", return_value=FAKE_OTS) as stamp:
+            r1 = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+            r2 = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+    assert r1.status_code == 200 and r2.status_code == 200
+    assert r1.content == FAKE_OTS and r2.content == FAKE_OTS
+    stamp.assert_called_once()  # second request hit the cache, did not re-stamp
+    assert _obligation_count() == 1
+
+
+def test_duplicate_payment_hash_single_row_no_new_invoice():
+    """Two paid calls with the same token yield exactly one obligation row and
+    mint no new invoice (INSERT OR IGNORE is idempotent on payment_hash)."""
+    token = valid_token()
+    with patch("main.requests.post") as post:  # invoice creation must never be called
+        with patch("main.requests.get", return_value=_settled_get()):
+            with patch("main.stamp_digest", return_value=FAKE_OTS):
+                client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+                client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+    assert _obligation_count() == 1
+    post.assert_not_called()
+
+
+def test_unwritable_obligation_db_fails_loud(tmp_path):
+    """An unwritable DB path makes init fail loud, so the process refuses to start
+    rather than run without a durable obligation log."""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory\n")
+    bad_path = blocker / "obligations.db"  # parent is a regular file -> mkdir fails
+    with patch("main.OBLIGATIONS_DB_PATH", str(bad_path)):
+        with pytest.raises(RuntimeError, match="Cannot initialize obligations DB"):
+            main.init_obligation_db()
