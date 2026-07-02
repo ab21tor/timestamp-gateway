@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import io
+import json
 import logging
 import os
 import re
@@ -166,6 +167,19 @@ def _parse_config():
     if obligation_sweep_interval <= 0:
         raise RuntimeError("OBLIGATION_SWEEP_INTERVAL must be a positive integer")
 
+    # ── Wallet liquidity alarm (file-mediated; NO Bitcoin RPC from the gateway)
+    # /health reads the status file written by ops/wallet-balance-check.sh.
+    # The gateway never holds wallet credentials — the rails stay separate.
+    wallet_status_path = os.getenv(
+        "WALLET_STATUS_PATH", "/var/lib/timestamp-gateway/wallet-status"
+    )
+    try:
+        wallet_status_max_age = int(os.getenv("WALLET_STATUS_MAX_AGE_SECONDS", "3600"))
+    except ValueError:
+        raise RuntimeError("WALLET_STATUS_MAX_AGE_SECONDS must be an integer")
+    if wallet_status_max_age <= 0:
+        raise RuntimeError("WALLET_STATUS_MAX_AGE_SECONDS must be a positive integer")
+
     return (
         os.getenv("LND_HOST"),
         os.getenv("LND_PORT"),
@@ -187,6 +201,8 @@ def _parse_config():
         phoenixd_http_password,
         obligations_db_path,
         obligation_sweep_interval,
+        wallet_status_path,
+        wallet_status_max_age,
     )
 
 
@@ -212,6 +228,8 @@ load_dotenv()
     PHOENIXD_HTTP_PASSWORD,
     OBLIGATIONS_DB_PATH,
     OBLIGATION_SWEEP_INTERVAL,
+    WALLET_STATUS_PATH,
+    WALLET_STATUS_MAX_AGE_SECONDS,
 ) = _parse_config()
 
 if not LND_TLS_VERIFY:
@@ -385,6 +403,39 @@ app.mount("/ui", StaticFiles(directory=Path(__file__).parent / "static", html=Tr
 
 def is_paused() -> bool:
     return bool(PAUSE_FILE and Path(PAUSE_FILE).exists())
+
+
+def _wallet_status() -> str:
+    """Classify the wallet-status file written by ops/wallet-balance-check.sh.
+
+    File-mediated like the PAUSED switch: the gateway never talks to Bitcoin
+    RPC and never holds wallet credentials — it only reads the file the timer
+    leaves behind. Returns one of:
+      ok       — balance at or above the minimum
+      low      — balance below the minimum (wallet draining; anchoring at risk)
+      unknown  — the check ran but could not read the balance, or the file is
+                 malformed
+      stale    — the file is older than WALLET_STATUS_MAX_AGE_SECONDS (the
+                 timer itself died)
+      absent   — no file (alarm not installed)
+    Never raises — /health must never crash."""
+    try:
+        raw = Path(WALLET_STATUS_PATH).read_text()
+    except FileNotFoundError:
+        return "absent"
+    except Exception:
+        return "unknown"
+    try:
+        data = json.loads(raw)
+        status = data["status"]
+        checked_at = int(data["checked_at"])
+    except Exception:
+        return "unknown"
+    if status not in ("ok", "low", "unknown"):
+        return "unknown"
+    if time.time() - checked_at > WALLET_STATUS_MAX_AGE_SECONDS:
+        return "stale"
+    return status
 
 
 class TimestampRequest(BaseModel):
@@ -942,10 +993,21 @@ def health():
     else:
         otsd_status = "n/a"
 
+    # Wallet liquidity alarm: read the status file left by the balance-check
+    # timer. "absent" (alarm not installed) reports but does not degrade;
+    # "low"/"unknown"/"stale" degrade like a backend failure.
+    wallet_status = _wallet_status()
+
     if paused:
         overall = "paused"
     else:
-        overall = "ok" if payment_status == "ok" and otsd_status in ("ok", "n/a") else "degraded"
+        overall = (
+            "ok"
+            if payment_status == "ok"
+            and otsd_status in ("ok", "n/a")
+            and wallet_status in ("ok", "absent")
+            else "degraded"
+        )
 
     return JSONResponse(
         status_code=200 if overall == "ok" else 503,
@@ -955,6 +1017,7 @@ def health():
             "payment": payment_status,
             "payment_backend": PAYMENT_BACKEND_TYPE,
             "otsd": otsd_status,
+            "wallet": wallet_status,
         },
     )
 

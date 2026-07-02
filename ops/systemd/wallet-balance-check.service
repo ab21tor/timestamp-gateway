@@ -1,0 +1,10 @@
+# Install: sudo cp ops/systemd/wallet-balance-check.{service,timer} /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now wallet-balance-check.timer
+[Unit]
+Description=timestamp-gateway otsd wallet balance check
+After=network.target
+
+[Service]
+Type=oneshot
+User=gateway
+WorkingDirectory=/home/gateway/timestamp-gateway
+ExecStart=/home/gateway/timestamp-gateway/ops/wallet-balance-check.sh

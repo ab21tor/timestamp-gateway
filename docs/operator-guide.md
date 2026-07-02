@@ -338,6 +338,28 @@ docker compose logs -f otsd      # OTS calendar server
 
 The gateway logs one line per request (uvicorn access log) and logs warnings/errors for payment backend and OTS backend failures at `WARNING`/`ERROR` level. It does not log digests or preimages.
 
+### Wallet liquidity alarm
+
+The otsd-hot wallet funds anchoring transactions. If it drains, anchoring silently stops — so its balance is checked unattended and surfaced through `/health`.
+
+**How it works:** `ops/wallet-balance-check.sh` (run by a systemd timer every 30 minutes) reads the wallet balance over Bitcoin JSON-RPC (`getbalances`, via `BITCOIN_RPC_SERVICE_URL` from `.env`), compares it against `WALLET_MIN_SATS` (default 50000), and atomically writes a one-line JSON status file (`WALLET_STATUS_PATH`, default `/var/lib/timestamp-gateway/wallet-status`). `/health` reads only that file — the gateway never talks to Bitcoin RPC and never holds wallet credentials.
+
+**Install the timer:**
+
+```bash
+sudo cp ops/systemd/wallet-balance-check.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now wallet-balance-check.timer
+```
+
+**What `/health` reports** in its `wallet` field:
+
+- `ok` — balance at or above `WALLET_MIN_SATS`.
+- `low` — balance below the minimum: refill the wallet. Degrades health to 503. Also logged to the journal (`logger -p user.warning`).
+- `unknown` — the check ran but could not read the balance (RPC/tunnel down, or malformed status file). Degrades to 503.
+- `stale` — the status file is older than `WALLET_STATUS_MAX_AGE_SECONDS` (default 3600 = 2× the timer interval): the timer itself died. Degrades to 503.
+- `absent` — no status file: the alarm is not installed. Reported but does **not** degrade health (operators without the calendar profile don't need it).
+
 ---
 
 ## Stopping and removing

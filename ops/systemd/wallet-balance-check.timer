@@ -1,0 +1,12 @@
+# Install: see wallet-balance-check.service
+[Unit]
+Description=Run timestamp-gateway wallet balance check periodically
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=30min
+Persistent=true
+Unit=wallet-balance-check.service
+
+[Install]
+WantedBy=timers.target

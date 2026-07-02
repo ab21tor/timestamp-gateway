@@ -10,6 +10,7 @@ semantics, and error discipline (generic public details).
 import base64
 import hashlib
 import io
+import json
 import logging
 import os
 import time
@@ -140,6 +141,15 @@ def clear_proof_cache():
     main._proof_cache.clear()
     yield
     main._proof_cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def wallet_status_file(tmp_path, monkeypatch):
+    """Point WALLET_STATUS_PATH at a per-test path (no file by default, so
+    /health reports wallet 'absent') — deterministic regardless of the host."""
+    path = tmp_path / "wallet-status"
+    monkeypatch.setattr(main, "WALLET_STATUS_PATH", str(path))
+    return path
 
 
 @pytest.fixture(autouse=True)
@@ -720,6 +730,7 @@ def test_health_both_ok_returns_200():
         "payment": "ok",
         "payment_backend": main.PAYMENT_BACKEND_TYPE,
         "otsd": "ok",
+        "wallet": "absent",
     }
 
 
@@ -750,6 +761,7 @@ def test_health_otsd_na_in_public_mode():
         "payment": "ok",
         "payment_backend": main.PAYMENT_BACKEND_TYPE,
         "otsd": "n/a",
+        "wallet": "absent",
     }
 
 
@@ -1338,3 +1350,68 @@ def test_unwritable_obligation_db_fails_loud(tmp_path):
     with patch("main.OBLIGATIONS_DB_PATH", str(bad_path)):
         with pytest.raises(RuntimeError, match="Cannot initialize obligations DB"):
             main.init_obligation_db()
+
+
+# ══ 13. Wallet liquidity alarm (/health wallet field) ═══════════════════════════
+# /health reads the status file written by ops/wallet-balance-check.sh — no
+# Bitcoin RPC from the gateway. "absent" (alarm not installed) does not degrade;
+# "low"/"stale"/"unknown" degrade to 503 like a backend failure.
+
+def _write_wallet_status(path, status="ok", checked_at=None, balance_sats=100000):
+    if checked_at is None:
+        checked_at = int(time.time())
+    path.write_text(json.dumps({
+        "balance_sats": balance_sats,
+        "min_sats": 50000,
+        "status": status,
+        "checked_at": checked_at,
+    }))
+
+
+def test_health_wallet_ok_returns_200(wallet_status_file):
+    _write_wallet_status(wallet_status_file, status="ok")
+    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+        resp = client.get("/health")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok" and body["wallet"] == "ok"
+
+
+def test_health_wallet_low_returns_503(wallet_status_file):
+    _write_wallet_status(wallet_status_file, status="low", balance_sats=1000)
+    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+        resp = client.get("/health")
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["status"] == "degraded" and body["wallet"] == "low"
+
+
+def test_health_wallet_stale_returns_503(wallet_status_file):
+    """An 'ok' file older than WALLET_STATUS_MAX_AGE_SECONDS means the timer
+    itself died — that must degrade health, not pass as ok."""
+    old = int(time.time()) - main.WALLET_STATUS_MAX_AGE_SECONDS - 60
+    _write_wallet_status(wallet_status_file, status="ok", checked_at=old)
+    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+        resp = client.get("/health")
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["status"] == "degraded" and body["wallet"] == "stale"
+
+
+def test_health_wallet_absent_reports_but_stays_healthy(wallet_status_file):
+    """No status file = alarm not installed. Reported, but operators without
+    the calendar profile must not fail health."""
+    assert not wallet_status_file.exists()
+    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+        resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json()["wallet"] == "absent"
+
+
+def test_health_wallet_malformed_returns_503_unknown(wallet_status_file):
+    wallet_status_file.write_text("not json{{{")
+    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+        resp = client.get("/health")
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["status"] == "degraded" and body["wallet"] == "unknown"
