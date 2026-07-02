@@ -1092,7 +1092,7 @@ def test_payment_backend_default_is_phoenixd():
     }
     with patch.dict(os.environ, env, clear=True):
         result = main._parse_config()
-    assert result[15] == "phoenixd"  # payment_backend_type slot
+    assert result.payment_backend_type == "phoenixd"
 
 
 def test_payment_backend_env_var_selects_lnd():

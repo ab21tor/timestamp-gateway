@@ -36,7 +36,35 @@ L402_LOCATION = "timestamp-gateway"
 L402_CAPABILITY = "timestamp"
 
 
-def _parse_config():
+@dataclass(frozen=True)
+class GatewayConfig:
+    """Validated gateway configuration. One field per module global, named as
+    the lowercase of the global it populates. Built only by _parse_config()."""
+    lnd_host: str | None
+    lnd_port: str | None
+    lnd_macaroon_hex: str | None
+    tor_proxy: str | None
+    gateway_price_sats: int
+    min_gateway_price_sats: int
+    pause_file: str
+    lnd_tls_verify: bool
+    ots_backend_mode: str
+    ots_calendar_url: str | None
+    lnd_readonly_macaroon_hex: str | None
+    l402_secret: bytes
+    l402_token_expiry_seconds: int
+    ots_submit_max_attempts: int
+    ots_submit_backoff_seconds: float
+    payment_backend_type: str
+    phoenixd_url: str
+    phoenixd_http_password: str | None
+    obligations_db_path: str
+    obligation_sweep_interval: int
+    wallet_status_path: str
+    wallet_status_max_age_seconds: int
+
+
+def _parse_config() -> GatewayConfig:
     """Parse and validate all required env vars. Raises RuntimeError on misconfiguration."""
     # Determine payment backend type early so we know which vars are required.
     # phoenixd is the live default; lnd is the test payer / alternative backend.
@@ -180,57 +208,61 @@ def _parse_config():
     if wallet_status_max_age <= 0:
         raise RuntimeError("WALLET_STATUS_MAX_AGE_SECONDS must be a positive integer")
 
-    return (
-        os.getenv("LND_HOST"),
-        os.getenv("LND_PORT"),
-        os.getenv("LND_MACAROON_HEX"),
-        os.getenv("TOR_PROXY") or None,  # optional; None = direct connection
-        price,
-        min_price,
-        pause_file,
-        os.getenv("LND_TLS_VERIFY", "false").lower() == "true",
-        mode,
-        calendar_url,
-        os.getenv("LND_READONLY_MACAROON_HEX") or None,  # optional; falls back to LND_MACAROON_HEX
-        l402_secret,
-        l402_expiry,
-        ots_max_attempts,
-        ots_backoff,
-        payment_backend_type,
-        phoenixd_url,
-        phoenixd_http_password,
-        obligations_db_path,
-        obligation_sweep_interval,
-        wallet_status_path,
-        wallet_status_max_age,
+    return GatewayConfig(
+        lnd_host=os.getenv("LND_HOST"),
+        lnd_port=os.getenv("LND_PORT"),
+        lnd_macaroon_hex=os.getenv("LND_MACAROON_HEX"),
+        tor_proxy=os.getenv("TOR_PROXY") or None,  # optional; None = direct connection
+        gateway_price_sats=price,
+        min_gateway_price_sats=min_price,
+        pause_file=pause_file,
+        lnd_tls_verify=os.getenv("LND_TLS_VERIFY", "false").lower() == "true",
+        ots_backend_mode=mode,
+        ots_calendar_url=calendar_url,
+        # optional; falls back to LND_MACAROON_HEX
+        lnd_readonly_macaroon_hex=os.getenv("LND_READONLY_MACAROON_HEX") or None,
+        l402_secret=l402_secret,
+        l402_token_expiry_seconds=l402_expiry,
+        ots_submit_max_attempts=ots_max_attempts,
+        ots_submit_backoff_seconds=ots_backoff,
+        payment_backend_type=payment_backend_type,
+        phoenixd_url=phoenixd_url,
+        phoenixd_http_password=phoenixd_http_password,
+        obligations_db_path=obligations_db_path,
+        obligation_sweep_interval=obligation_sweep_interval,
+        wallet_status_path=wallet_status_path,
+        wallet_status_max_age_seconds=wallet_status_max_age,
     )
 
 
 load_dotenv()
-(
-    LND_HOST,
-    LND_PORT,
-    LND_MACAROON_HEX,
-    TOR_PROXY,
-    GATEWAY_PRICE_SATS,
-    MIN_GATEWAY_PRICE_SATS,
-    PAUSE_FILE,
-    LND_TLS_VERIFY,
-    OTS_BACKEND_MODE,
-    OTS_CALENDAR_URL,
-    LND_READONLY_MACAROON_HEX,
-    L402_SECRET,
-    L402_TOKEN_EXPIRY_SECONDS,
-    OTS_SUBMIT_MAX_ATTEMPTS,
-    OTS_SUBMIT_BACKOFF_SECONDS,
-    PAYMENT_BACKEND_TYPE,
-    PHOENIXD_URL,
-    PHOENIXD_HTTP_PASSWORD,
-    OBLIGATIONS_DB_PATH,
-    OBLIGATION_SWEEP_INTERVAL,
-    WALLET_STATUS_PATH,
-    WALLET_STATUS_MAX_AGE_SECONDS,
-) = _parse_config()
+_CONFIG = _parse_config()
+
+# Module globals mirror the config fields one-to-one. Kept as globals (not
+# attribute reads at call sites) so tests can patch individual values via
+# patch("main.<NAME>", ...) — the established seam throughout the suite.
+LND_HOST = _CONFIG.lnd_host
+LND_PORT = _CONFIG.lnd_port
+LND_MACAROON_HEX = _CONFIG.lnd_macaroon_hex
+TOR_PROXY = _CONFIG.tor_proxy
+GATEWAY_PRICE_SATS = _CONFIG.gateway_price_sats
+MIN_GATEWAY_PRICE_SATS = _CONFIG.min_gateway_price_sats
+PAUSE_FILE = _CONFIG.pause_file
+LND_TLS_VERIFY = _CONFIG.lnd_tls_verify
+OTS_BACKEND_MODE = _CONFIG.ots_backend_mode
+OTS_CALENDAR_URL = _CONFIG.ots_calendar_url
+LND_READONLY_MACAROON_HEX = _CONFIG.lnd_readonly_macaroon_hex
+L402_SECRET = _CONFIG.l402_secret
+L402_TOKEN_EXPIRY_SECONDS = _CONFIG.l402_token_expiry_seconds
+OTS_SUBMIT_MAX_ATTEMPTS = _CONFIG.ots_submit_max_attempts
+OTS_SUBMIT_BACKOFF_SECONDS = _CONFIG.ots_submit_backoff_seconds
+PAYMENT_BACKEND_TYPE = _CONFIG.payment_backend_type
+PHOENIXD_URL = _CONFIG.phoenixd_url
+PHOENIXD_HTTP_PASSWORD = _CONFIG.phoenixd_http_password
+OBLIGATIONS_DB_PATH = _CONFIG.obligations_db_path
+OBLIGATION_SWEEP_INTERVAL = _CONFIG.obligation_sweep_interval
+WALLET_STATUS_PATH = _CONFIG.wallet_status_path
+WALLET_STATUS_MAX_AGE_SECONDS = _CONFIG.wallet_status_max_age_seconds
 
 if not LND_TLS_VERIFY:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
