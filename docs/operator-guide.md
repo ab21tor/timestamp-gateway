@@ -346,6 +346,16 @@ The otsd-hot wallet funds anchoring transactions. If it drains, anchoring silent
 
 **Install the timer:**
 
+First, make sure `BITCOIN_RPC_SERVICE_URL` is set in `.env` — the check fails with `BITCOIN_RPC_SERVICE_URL not set` (status `unknown`) without it:
+
+```
+BITCOIN_RPC_SERVICE_URL=http://<rpc-user>:<rpc-password>@<host:port>/wallet/<wallet-name>
+```
+
+The whole URL goes on one line, no quotes.
+
+Then install and start the timer:
+
 ```bash
 sudo cp ops/systemd/wallet-balance-check.{service,timer} /etc/systemd/system/
 sudo systemctl daemon-reload

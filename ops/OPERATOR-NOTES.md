@@ -108,28 +108,11 @@ LND is used only as a test payer in operator scripts:
 
 This is a testing artifact. In production:
 
-- Client wallets pay Phoenixd invoices over the Lightning network
+- Client wallets pay Phoenixd invoices directly over the Lightning network
 - LND is not involved in the payment flow
 - LND may be removed or replaced in a future deployment
 
-Do not confuse LND's presence with it being the active payment backend.
-
-## LND role in this deployment
-
-LND is present on this VPS but is NOT the active payment backend.
-
-Current payment backend: Phoenixd
-
-LND is used only as a test payer in operator scripts:
-
-- ops/l402-paid-proof.sh uses lncli to pay Phoenixd invoices for testing
-- This creates a local loop: LND pays → Phoenixd receives
-
-This is a testing artifact. In production:
-
-- Client wallets pay Phoenixd invoices over the Lightning network
-- Enterprise clients pay via a fiat wrapper (e.g. Strike API)
-- LND is not involved in the live payment flow
+A fiat funding on-ramp (e.g. Strike API) may be offered later to help customers fund wallets; it would sit outside the gateway — the gateway only ever sees Lightning payments.
 
 Do not confuse LND's presence with it being the active payment backend.
 
