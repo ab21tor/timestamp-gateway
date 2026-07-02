@@ -21,8 +21,8 @@ The gateway cannot produce Bitcoin-anchored proofs on its own. It requires a run
 ## Prerequisites
 
 - Docker Engine 24+ and Docker Compose v2
-- An LND node with REST API enabled and the invoice macaroon available
-- Inbound Lightning liquidity on the LND node
+- A running phoenixd instance (the live payment backend) — or an LND node with REST API and invoice macaroon if using the LND test-payer / alternative backend
+- Inbound Lightning liquidity on the payment backend
 - An OTS calendar backend (otsd) — bundled via `--profile calendar` or external
 - A Bitcoin Core node reachable by otsd, with a wallet loaded and funded
 
@@ -33,10 +33,10 @@ You do not need a VPS. You do not need a static IP. You do not need to expose an
 ## First-run checklist
 
 1. Clone the repository and copy `.env.example` to `.env`.
-2. Fill in `LND_HOST`, `LND_PORT`, `LND_MACAROON_HEX`.
-3. Set `TOR_PROXY=tor:9050` if `LND_HOST` is a `.onion` address; leave blank otherwise.
-4. Set `OTS_BACKEND_MODE=calendar` and `OTS_CALENDAR_URL=http://otsd:14788`.
-5. Fill in `BITCOIN_RPC_HOST`, `BITCOIN_RPC_USER`, `BITCOIN_RPC_PASSWORD` for otsd.
+2. Set `PAYMENT_BACKEND_TYPE=phoenixd` (the default) and fill in `PHOENIXD_URL` and `PHOENIXD_HTTP_PASSWORD`. Only fill in `LND_*` if using the LND test-payer / alternative backend.
+3. (lnd test-payer backend only) Set `TOR_PROXY=tor:9050` if `LND_HOST` is a `.onion` address; leave blank otherwise.
+4. Set `OTS_BACKEND_MODE=calendar` and `OTS_CALENDAR_URL=http://127.0.0.1:14788`.
+5. Set `BITCOIN_RPC_SERVICE_URL` for otsd (full URL including credentials, in `.env` only).
 6. Start the full stack: `docker compose --profile calendar up -d`.
 7. Check logs: `docker compose logs -f`.
 8. Retrieve onion address: `docker compose exec tor cat /var/lib/tor/timestamp_gateway/hostname`.
@@ -50,7 +50,7 @@ You do not need a VPS. You do not need a static IP. You do not need to expose an
 
 ```
 OTS_BACKEND_MODE=calendar
-OTS_CALENDAR_URL=http://otsd:14788
+OTS_CALENDAR_URL=http://127.0.0.1:14788
 ```
 
 The gateway forwards paid digests to the operator's own otsd instance. otsd aggregates submissions and anchors the Merkle root in Bitcoin once per block cycle. This is the only production mode.
@@ -91,18 +91,13 @@ otsd will stop anchoring if the wallet is empty. Proofs submitted during a gap a
 
 ### Bitcoin RPC configuration
 
-Pass via `.env` or the `environment:` block in `docker-compose.yml`:
+otsd reads a single env var — the full RPC URL including credentials. Set it in gitignored `.env` ONLY (never in tracked files, never on a command line):
 
 ```
-BITCOIN_RPC_HOST=       # IP or hostname of your Bitcoin Core node
-BITCOIN_RPC_PORT=8332   # default Bitcoin Core RPC port
-BITCOIN_RPC_USER=       # rpcuser from bitcoin.conf
-BITCOIN_RPC_PASSWORD=   # rpcpassword from bitcoin.conf
+BITCOIN_RPC_SERVICE_URL=http://rpcuser:rpcpassword@127.0.0.1:18332/wallet/otsd-hot
 ```
 
-If Bitcoin Core is on the same Docker host as otsd (not inside the Compose stack), use the host's Docker bridge IP (e.g. `172.17.0.1`) rather than `127.0.0.1` or `localhost`.
-
-If Bitcoin Core is on a remote machine, ensure RPC is bound to an accessible address (`rpcbind` in bitcoin.conf) and that the address is in `rpcallowip`.
+With the socat/Tor bridge (see "Deploying the calendar" below), `127.0.0.1:18332` forwards to your Bitcoin node's RPC hidden service. For a directly reachable node, point the URL at its RPC address instead and ensure it is in `rpcbind`/`rpcallowip` in bitcoin.conf.
 
 **Pruned nodes:** A pruned Bitcoin Core node is acceptable for otsd's transaction submission role. otsd does not need to download the full chain — it only submits transactions and reads the current tip.
 
@@ -196,7 +191,9 @@ Under Docker Compose the database lives on the persistent `gateway_data` volume,
 
 ---
 
-## Getting the invoice macaroon
+## Getting the invoice macaroon (LND test payer / alternative backend only)
+
+This section applies only when `PAYMENT_BACKEND_TYPE=lnd` (test payer / alternative). The live default backend is Phoenixd, which needs no macaroon — only `PHOENIXD_URL` and `PHOENIXD_HTTP_PASSWORD`.
 
 The invoice macaroon authorises creating and reading invoices. It cannot spend funds, open channels, or take any other action.
 
@@ -264,7 +261,7 @@ Store the output somewhere safe. To restore, copy the key back into the volume b
 
 ## Inbound liquidity
 
-To receive Lightning payments, the LND backend must have inbound capacity — channels where the remote peer has sats to push toward you.
+To receive Lightning payments, the payment backend (Phoenixd by default) must have inbound capacity — channels where the remote peer has sats to push toward you. Phoenixd opens a channel automatically on first payment, at a fee — see `ops/OPERATOR-NOTES.md`.
 
 **This is a Lightning network problem, not a gateway or OTS problem.** The gateway issues valid invoices regardless; routing failures happen before the invoice is ever paid.
 
@@ -289,12 +286,12 @@ Submarine swap via Terminal to move sats from your local channel balance to the 
 
 ### Tor-only routing difficulty
 
-If your LND node is Tor-only, nodes that have disabled Tor routing cannot route payments to you. This reduces the routing path count significantly.
+If your Lightning node is Tor-only, nodes that have disabled Tor routing cannot route payments to you. This reduces the routing path count significantly.
 
 Options:
 - **Accept lower reliability.** Suitable for low-volume personal or testing use.
 - **Hybrid node.** Advertise both a Tor and a clearnet address. Better routing at the cost of linking your pubkey to a clearnet IP permanently.
-- **VPS LND.** Run LND on a VPS for reliable clearnet routing. Run the gateway anywhere.
+- **VPS payment node.** Run the Lightning payment node on a VPS for reliable clearnet routing. Run the gateway anywhere.
 
 ---
 
@@ -339,7 +336,7 @@ docker compose logs -f tor       # Tor process
 docker compose logs -f otsd      # OTS calendar server
 ```
 
-The gateway logs one line per request (uvicorn access log) and logs warnings/errors for LND and OTS backend failures at `WARNING`/`ERROR` level. It does not log digests or preimages.
+The gateway logs one line per request (uvicorn access log) and logs warnings/errors for payment backend and OTS backend failures at `WARNING`/`ERROR` level. It does not log digests or preimages.
 
 ---
 
@@ -405,11 +402,11 @@ sudo cat /var/lib/tor/timestamp_gateway/hostname
 - [ ] `OBLIGATIONS_DB_PATH` is writable by the service user (bare-metal: `mkdir -p` + `chown` it; Docker: the `gateway_data` volume handles this).
 - [ ] Bitcoin RPC credentials are configured and otsd can reach Bitcoin Core.
 - [ ] A wallet is loaded in Bitcoin Core and has enough BTC to pay anchoring fees.
-- [ ] LND node has inbound Lightning liquidity.
-- [ ] Invoice macaroon is not committed to any public repository.
+- [ ] Phoenixd has inbound Lightning liquidity (first-payment channel-open fee caveat — see OPERATOR-NOTES).
+- [ ] Invoice macaroon is not committed to any public repository (lnd test-payer / alternative backend only).
 - [ ] `.env` is in `.gitignore` and has never been committed.
 - [ ] Tor hidden service private key is backed up.
 - [ ] `docker compose logs -f otsd` shows otsd starting without errors.
 - [ ] A test payment has been completed end-to-end: invoice issued → paid → `.ots` returned.
 - [ ] `ots upgrade` and `ots verify` work on a test proof after ~1 hour.
-- [ ] I understand that Lightning graph exposure (clearnet LND IP) is permanent once published.
+- [ ] I understand that Lightning graph exposure (clearnet Lightning node IP) is permanent once published.

@@ -38,7 +38,8 @@ L402_CAPABILITY = "timestamp"
 def _parse_config():
     """Parse and validate all required env vars. Raises RuntimeError on misconfiguration."""
     # Determine payment backend type early so we know which vars are required.
-    payment_backend_type_early = os.getenv("PAYMENT_BACKEND_TYPE", "lnd").lower()
+    # phoenixd is the live default; lnd is the test payer / alternative backend.
+    payment_backend_type_early = os.getenv("PAYMENT_BACKEND_TYPE", "phoenixd").lower()
 
     required = {
         "GATEWAY_PRICE_SATS": os.getenv("GATEWAY_PRICE_SATS"),
@@ -145,7 +146,7 @@ def _parse_config():
     if ots_backoff < 0:
         raise RuntimeError("OTS_SUBMIT_BACKOFF_SECONDS must be >= 0")
 
-    payment_backend_type = os.getenv("PAYMENT_BACKEND_TYPE", "lnd").lower()
+    payment_backend_type = os.getenv("PAYMENT_BACKEND_TYPE", "phoenixd").lower()
     if payment_backend_type not in ("lnd", "phoenixd"):
         raise RuntimeError("PAYMENT_BACKEND_TYPE must be 'lnd' or 'phoenixd'")
     phoenixd_url = os.getenv("PHOENIXD_URL", "http://127.0.0.1:9740")
@@ -840,7 +841,8 @@ def _make_payment_backend(backend_type: str) -> PaymentBackend:
     raise RuntimeError(f"Unknown PAYMENT_BACKEND_TYPE: {backend_type!r}")
 
 
-# Production/default runs on LND; PAYMENT_BACKEND_TYPE may select phoenixd.
+# Phoenixd is the live default backend; PAYMENT_BACKEND_TYPE=lnd selects the
+# LND test payer / alternative backend.
 PAYMENT_BACKEND: PaymentBackend = _make_payment_backend(PAYMENT_BACKEND_TYPE)
 
 

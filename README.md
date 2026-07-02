@@ -20,7 +20,7 @@ Tor is supported, but not mandatory. VPS is supported, but not mandatory. Tor-on
 
 **Does:**
 - Validates SHA-256 digests.
-- Issues a Lightning invoice via an operator-provided LND backend.
+- Issues a Lightning invoice via the operator's payment backend — Phoenixd (live default), or LND as a test payer / alternative.
 - Verifies payment by preimage: checks that the invoice is settled, the memo matches the digest, and the paid amount meets the configured price.
 - Submits the paid digest to the operator-controlled OTS calendar backend.
 - Returns raw `.ots` bytes.
@@ -47,7 +47,7 @@ The correct architecture is:
 |---|---|
 | Gateway | Paid front door. Validates, charges, verifies, forwards. |
 | otsd | Operator-controlled proof engine. Aggregates digests, anchors to Bitcoin. |
-| LND | Operator-provided Lightning backend. Issues and settles invoices. |
+| Phoenixd | Live Lightning payment backend (default). Issues and settles invoices. LND is supported as a test payer / alternative. |
 | Bitcoin Core | Operator-provided (or shared) Bitcoin backend for otsd. |
 
 Public calendar mode (`OTS_BACKEND_MODE=public`) is retained as a compatibility/testing option only. It is not the real target.
@@ -57,10 +57,10 @@ Public calendar mode (`OTS_BACKEND_MODE=public`) is retained as a compatibility/
 ## What you need
 
 - Docker and Docker Compose
-- An existing LND node with the REST API enabled and an invoice macaroon
+- A running phoenixd instance (the live payment backend) — or an LND node with REST API and invoice macaroon if using the LND test-payer / alternative backend
 - An OpenTimestamps calendar backend (otsd) — bundled in the Compose stack or external
 - A Bitcoin Core node reachable by otsd, with a wallet loaded and funded for anchoring transactions
-- Inbound Lightning liquidity on the LND node (see [Inbound liquidity](#inbound-liquidity))
+- Inbound Lightning liquidity on the payment backend node (see [Inbound liquidity](#inbound-liquidity))
 
 ---
 
@@ -70,8 +70,9 @@ Public calendar mode (`OTS_BACKEND_MODE=public`) is retained as a compatibility/
 git clone https://github.com/ab21tor/timestamp-gateway
 cd timestamp-gateway
 cp .env.example .env
-# Edit .env — fill in LND_HOST, LND_PORT, LND_MACAROON_HEX,
-# and BITCOIN_RPC_* for otsd
+# Edit .env — set PHOENIXD_URL and PHOENIXD_HTTP_PASSWORD (live default
+# backend; LND_* only if using the lnd test payer / alternative backend),
+# and BITCOIN_RPC_SERVICE_URL for otsd
 docker compose --profile calendar up -d
 ```
 
@@ -109,14 +110,17 @@ curl -X POST http://localhost:8000/timestamp \
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `LND_HOST` | Yes | — | Hostname, IP, or `.onion` address of your LND REST API |
-| `LND_PORT` | Yes | — | LND REST port (typically `8080`) |
-| `LND_MACAROON_HEX` | Yes | — | Hex-encoded invoice macaroon |
+| `PAYMENT_BACKEND_TYPE` | No | `phoenixd` | `phoenixd` (live backend) or `lnd` (test payer / alternative only) |
+| `PHOENIXD_URL` | No | `http://127.0.0.1:9740` | phoenixd HTTP API endpoint (live default backend) |
+| `PHOENIXD_HTTP_PASSWORD` | No | — | phoenixd HTTP API password (`http-password` in `phoenix.conf`) |
+| `LND_HOST` | When `lnd` | — | Hostname, IP, or `.onion` address of your LND REST API (test payer / alternative) |
+| `LND_PORT` | When `lnd` | — | LND REST port, typically `8080` (test payer / alternative) |
+| `LND_MACAROON_HEX` | When `lnd` | — | Hex-encoded invoice macaroon (test payer / alternative) |
 | `GATEWAY_PRICE_SATS` | Yes | — | Satoshis charged per timestamp |
 | `OTS_BACKEND_MODE` | Yes | — | `calendar` (real mode) or `public` (compatibility/testing only) |
-| `OTS_CALENDAR_URL` | When `calendar` | — | URL of the operator-controlled otsd instance (e.g. `http://otsd:14788`) |
-| `TOR_PROXY` | No | — | SOCKS5h proxy for LND connections. Required if `LND_HOST` is `.onion`. |
-| `LND_TLS_VERIFY` | No | `false` | Set `true` only for CA-signed LND TLS certs. |
+| `OTS_CALENDAR_URL` | When `calendar` | — | URL of the operator-controlled otsd instance (e.g. `http://127.0.0.1:14788`) |
+| `TOR_PROXY` | No | — | SOCKS5h proxy for LND connections (lnd test payer / alternative only). Required if `LND_HOST` is `.onion`. |
+| `LND_TLS_VERIFY` | No | `false` | Set `true` only for CA-signed LND TLS certs (lnd test payer / alternative only). |
 
 `OTS_BACKEND_MODE` validation:
 - `calendar` requires `OTS_CALENDAR_URL` to be set. Gateway fails to start if missing.
@@ -132,7 +136,7 @@ curl -X POST http://localhost:8000/timestamp \
 
 ```
 OTS_BACKEND_MODE=calendar
-OTS_CALENDAR_URL=http://otsd:14788
+OTS_CALENDAR_URL=http://127.0.0.1:14788
 ```
 
 The gateway forwards paid digests to the operator's own otsd instance. otsd aggregates submissions and anchors the aggregate root in Bitcoin once per block cycle. This is the intended production mode.
@@ -152,15 +156,17 @@ The gateway forwards paid digests to the public OpenTimestamps aggregators. This
 
 ## Deployment modes
 
+With the live default backend (Phoenixd on localhost) no `LND_*` vars or payment Tor proxy are needed; the `LND_HOST`/`TOR_PROXY` lines below apply only to the lnd test payer / alternative backend.
+
 ### Tor-only (maximum privacy)
 
-Gateway exposed as a Tor hidden service. LND reachable at a `.onion` address.
+Gateway exposed as a Tor hidden service. LND (test payer / alternative backend) reachable at a `.onion` address.
 
 ```
 LND_HOST=yourlnd.onion
 TOR_PROXY=tor:9050
 OTS_BACKEND_MODE=calendar
-OTS_CALENDAR_URL=http://otsd:14788
+OTS_CALENDAR_URL=http://127.0.0.1:14788
 ```
 
 ```bash
@@ -172,16 +178,16 @@ docker compose exec tor cat /var/lib/tor/timestamp_gateway/hostname
 
 ### Hybrid (practical self-hosted)
 
-Gateway onion. LND clearnet or hybrid. otsd on the same host.
+Gateway onion. LND (test payer / alternative backend) clearnet or hybrid. otsd on the same host.
 
 ```
 LND_HOST=192.168.1.x
 TOR_PROXY=              # blank — direct LND connection
 OTS_BACKEND_MODE=calendar
-OTS_CALENDAR_URL=http://otsd:14788
+OTS_CALENDAR_URL=http://127.0.0.1:14788
 ```
 
-**Trade-off:** Clearnet LND links node pubkey to IP on the Lightning graph permanently.
+**Trade-off:** A clearnet Lightning node links its pubkey to an IP on the Lightning graph permanently.
 
 ### Clearnet
 
@@ -194,7 +200,9 @@ ports:
 
 ---
 
-## Connecting to LND
+## Connecting to LND (test payer / alternative backend only)
+
+This section applies only when `PAYMENT_BACKEND_TYPE=lnd` (test payer / alternative). The live default backend is Phoenixd, which needs only `PHOENIXD_URL` and `PHOENIXD_HTTP_PASSWORD`.
 
 The gateway needs an invoice macaroon — it authorises creating and reading invoices, nothing else.
 
@@ -235,16 +243,13 @@ ots verify proof.ots
 
 The initial `.ots` file returned by the gateway is a valid pending receipt, not a finalized proof. This is normal and expected behaviour.
 
-**Bitcoin RPC env vars** (pass via `.env` or Compose environment):
+**Bitcoin RPC config** (set in gitignored `.env` only — full URL including credentials):
 
 ```
-BITCOIN_RPC_HOST=
-BITCOIN_RPC_PORT=8332
-BITCOIN_RPC_USER=
-BITCOIN_RPC_PASSWORD=
+BITCOIN_RPC_SERVICE_URL=http://rpcuser:rpcpassword@127.0.0.1:18332/wallet/otsd-hot
 ```
 
-**otsd is not publicly exposed.** It runs on the internal `ts_net` Docker network. The gateway reaches it at `http://otsd:14788`. Clients have no direct access to otsd; they interact only with the gateway.
+**otsd is not publicly exposed.** It runs with host networking and binds loopback only. The gateway reaches it at `http://127.0.0.1:14788`. Clients have no direct access to otsd; they interact only with the gateway.
 
 Verify current otsd installation and configuration at:
 `https://github.com/opentimestamps/opentimestamps-server`
@@ -253,7 +258,7 @@ Verify current otsd installation and configuration at:
 
 ## Inbound liquidity
 
-To receive Lightning payments, the LND backend must have inbound liquidity. Other nodes must be able to route payments to your node.
+To receive Lightning payments, the payment backend (Phoenixd by default) must have inbound liquidity. Other nodes must be able to route payments to your node. Note Phoenixd's first-payment channel-open fee caveat — see `ops/OPERATOR-NOTES.md`.
 
 **This is a Lightning network and operator issue, not a gateway or OTS issue.**
 
@@ -262,7 +267,7 @@ Options:
 - **Receive a channel** — ask a well-connected node (Loop, Bitrefill Thor, ACINQ, Amboss Magma) to open a channel to you.
 - **Lightning Terminal / Pool** — purchase inbound liquidity from the market.
 
-**Tor-only nodes have harder routing.** Many nodes will not route payments to Tor-only endpoints. Options: accept lower reliability, use a hybrid node, or use a VPS for LND.
+**Tor-only nodes have harder routing.** Many nodes will not route payments to Tor-only endpoints. Options: accept lower reliability, use a hybrid node, or run the payment node on a VPS.
 
 ---
 
@@ -270,11 +275,11 @@ Options:
 
 | Scenario | What is publicly visible |
 |---|---|
-| Tor-only gateway + Tor-only LND | No clearnet footprint |
-| Tor gateway + clearnet LND | LND node pubkey and IP on Lightning graph |
-| Clearnet gateway | Gateway IP is public; LND depends on config |
+| Tor-only gateway + Tor-only Lightning node | No clearnet footprint |
+| Tor gateway + clearnet Lightning node | Node pubkey and IP on Lightning graph |
+| Clearnet gateway | Gateway IP is public; Lightning node depends on config |
 
-Lightning graph exposure is permanent. If your LND node advertises a clearnet IP, that association is recorded by Lightning explorers and cannot be undone.
+Lightning graph exposure is permanent. If your Lightning node advertises a clearnet IP, that association is recorded by Lightning explorers and cannot be undone.
 
 The gateway does not log digests, client IPs, or payment preimages beyond normal uvicorn access logs.
 
@@ -286,8 +291,8 @@ The gateway does not log digests, client IPs, or payment preimages beyond normal
 |---|---|
 | Raspberry Pi / ARM64 | Works. All base images are multi-arch. |
 | Home Linux / mini PC | Standard Docker Compose. |
-| Umbrel | Run `docker compose --profile calendar up -d`. Point `LND_HOST` at Umbrel LND REST. |
-| Start9 | Run as a Docker Compose stack. Retrieve the macaroon from the LND app. |
+| Umbrel | Run `docker compose --profile calendar up -d`. If using the lnd test-payer / alternative backend, point `LND_HOST` at Umbrel LND REST. |
+| Start9 | Run as a Docker Compose stack. If using the lnd test-payer / alternative backend, retrieve the macaroon from the LND app. |
 | VPS / data-centre | Standard deployment. Consider the clearnet privacy trade-offs. |
 | NGO / university / journalist | Tor-only mode recommended. No clearnet exposure required. |
 
@@ -298,11 +303,11 @@ The gateway does not log digests, client IPs, or payment preimages beyond normal
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # fill in LND vars and set OTS_BACKEND_MODE
+cp .env.example .env   # fill in payment backend vars and set OTS_BACKEND_MODE
 uvicorn main:app --reload
 ```
 
-Run the test suite (no LND, Tor, or otsd required — all network calls are mocked):
+Run the test suite (no payment backend, Tor, or otsd required — all network calls are mocked):
 
 ```bash
 pytest -q

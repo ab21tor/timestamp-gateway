@@ -25,7 +25,7 @@ os.environ["LND_MACAROON_HEX"] = "deadbeef" * 8
 os.environ["TOR_PROXY"] = "127.0.0.1:9050"
 os.environ["GATEWAY_PRICE_SATS"] = "21"
 os.environ["MIN_GATEWAY_PRICE_SATS"] = "1"
-os.environ["PAYMENT_BACKEND_TYPE"] = "lnd"
+os.environ["PAYMENT_BACKEND_TYPE"] = "lnd"  # explicit: suite mocks LND REST (the test payer)
 os.environ["OTS_BACKEND_MODE"] = "calendar"
 os.environ["OTS_CALENDAR_URL"] = "http://test-calendar:14788"
 os.environ["L402_SECRET_HEX"] = "ab" * 32          # stable, known signing key
@@ -1038,7 +1038,23 @@ def test_upgrade_override_allowlist_contacts_only_operator_calendar():
 
 # PAYMENT BACKEND TESTS
 
-def test_payment_backend_default_is_lnd():
+def test_payment_backend_default_is_phoenixd():
+    """With PAYMENT_BACKEND_TYPE unset, the default is phoenixd (the live
+    backend) — and a bare config must parse without any LND vars."""
+    env = {
+        "GATEWAY_PRICE_SATS": "500",
+        "OTS_BACKEND_MODE": "calendar",
+        "OTS_CALENDAR_URL": "http://127.0.0.1:14788",
+        "L402_SECRET_HEX": "ab" * 16,
+    }
+    with patch.dict(os.environ, env, clear=True):
+        result = main._parse_config()
+    assert result[15] == "phoenixd"  # payment_backend_type slot
+
+
+def test_payment_backend_env_var_selects_lnd():
+    """The suite runs with PAYMENT_BACKEND_TYPE=lnd set explicitly (LND is the
+    test payer; all payment mocks are LND REST). Explicit selection must win."""
     assert main.PAYMENT_BACKEND_TYPE == "lnd"
     assert isinstance(main.PAYMENT_BACKEND, main.LndPaymentBackend)
 
