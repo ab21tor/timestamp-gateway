@@ -325,3 +325,17 @@ ots verify proof.ots    # verifies against Bitcoin
 ```
 
 Or use the [OpenTimestamps web verifier](https://opentimestamps.org). The proof is independently verifiable against Bitcoin without trusting the gateway or the calendar after the fact.
+
+### `/verify` and `/upgrade` status vocabulary
+
+Both endpoints return HTTP 200 with a JSON body whose `status` field is one of:
+
+| Status | Meaning |
+|---|---|
+| `anchored` | Digest matches and the proof carries a Bitcoin attestation. Independently verifiable against the Bitcoin block. |
+| `pending` | Digest matches; the proof carries a calendar attestation awaiting Bitcoin anchoring. `/upgrade` returns the anchored proof once available. |
+| `mismatch` | Well-formed proof, but it attests a different digest than the one supplied. |
+| `no_attestations` | Well-formed proof, digest matches, but no recognized (bitcoin/pending) attestations — nothing to verify or upgrade. |
+| `invalid` | The `ots` field is not decodable as an OTS proof (bad base64 or malformed bytes). |
+
+`verified` is `true` only for `anchored`.
