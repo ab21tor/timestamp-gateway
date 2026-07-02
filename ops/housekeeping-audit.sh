@@ -54,7 +54,8 @@ echo "=== tests ==="
 
 echo
 echo "=== live health ==="
-GATEWAY_URL="${GATEWAY_URL:-http://100.98.161.106:8000}"
+# set GATEWAY_URL in .env (e.g. your Tailscale IP)
+GATEWAY_URL="${GATEWAY_URL:-http://127.0.0.1:8000}"
 curl -sS "$GATEWAY_URL/health"
 echo
 

@@ -40,24 +40,25 @@ services:
   # otsd requires access to a Bitcoin Core node (RPC) and a wallet with funds
   # to pay for on-chain anchoring transactions. See docs/operator-guide.md.
   #
-  # otsd is NOT publicly exposed. Clients submit digests to the gateway, which
-  # forwards paid digests to otsd over the internal ts_net network.
+  # otsd is NOT publicly exposed. On the calendar profile it runs with host
+  # networking and binds loopback only; the gateway reaches it on
+  # 127.0.0.1:14788.
   otsd:
     build: ./otsd
     profiles: ["calendar"]
     restart: unless-stopped
+    # Host networking: otsd reaches Bitcoin RPC via the socat/Tor bridge
+    # on 127.0.0.1:18332; the gateway reaches otsd on 127.0.0.1:14788
+    # (set OTS_CALENDAR_URL=http://127.0.0.1:14788 when using this profile).
+    network_mode: host
     volumes:
-      - otsd_data:/data
-    networks:
-      - ts_net
-    # Bitcoin Core RPC connection for otsd — supply via environment or .env
+      - /var/lib/otsd/calendar:/calendar
+      # Calendar code: your opentimestamps-server fork checkout.
+      - ${OTSD_FORK_PATH:-./opentimestamps-server}:/app
     environment:
-      - BITCOIN_RPC_HOST=${BITCOIN_RPC_HOST:-}
-      - BITCOIN_RPC_PORT=${BITCOIN_RPC_PORT:-8332}
-      - BITCOIN_RPC_USER=${BITCOIN_RPC_USER:-}
-      - BITCOIN_RPC_PASSWORD=${BITCOIN_RPC_PASSWORD:-}
-    # Internal only — not exposed to host or public network.
-    # The gateway reaches otsd at http://otsd:14788 within ts_net.
+      # Full RPC URL including credentials. Set in gitignored .env ONLY.
+      # Compose fails loud if unset.
+      - BITCOIN_RPC_SERVICE_URL=${BITCOIN_RPC_SERVICE_URL:?set in .env}
 
 networks:
   ts_net:
@@ -65,5 +66,4 @@ networks:
 
 volumes:
   tor_keys:
-  otsd_data:
   gateway_data:

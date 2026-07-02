@@ -112,7 +112,33 @@ If Bitcoin Core is on a remote machine, ensure RPC is bound to an accessible add
 docker compose --profile calendar up -d
 ```
 
-This starts `gateway`, `tor`, and `otsd`. otsd is not publicly exposed — it runs on the internal `ts_net` network only. The gateway reaches it at `http://otsd:14788`.
+This starts `gateway`, `tor`, and `otsd`. otsd is not publicly exposed — it runs with host networking and binds loopback only. The gateway reaches it at `http://127.0.0.1:14788` (set `OTS_CALENDAR_URL=http://127.0.0.1:14788`).
+
+### Deploying the calendar (otsd)
+
+The otsd image ships Python + dependencies only. The calendar **code** is your fork of `opentimestamps-server`, mounted at `/app` at runtime — so the build context is the fork checkout, not this repo.
+
+```bash
+# 1. Clone your opentimestamps-server fork (the calendar code).
+git clone <your-fork-url> /home/gateway/opentimestamps-server
+
+# 2. Build the otsd image with the fork checkout as the build context.
+docker build -t otsd-local -f otsd/Dockerfile /home/gateway/opentimestamps-server
+
+# 3. Install the socat -> Bitcoin RPC bridge (provides 127.0.0.1:18332).
+sudo cp deploy/socat-bitcoin-rpc.service.example /etc/systemd/system/socat-bitcoin-rpc.service
+sudo sed -i 's/YOUR_NODE_ONION/<your-node-onion>/' /etc/systemd/system/socat-bitcoin-rpc.service
+sudo systemctl daemon-reload && sudo systemctl enable --now socat-bitcoin-rpc
+
+# 4. Set BITCOIN_RPC_SERVICE_URL and OTSD_FORK_PATH in .env (gitignored).
+#    See .env.example.
+
+# 5. Start it.
+docker compose --profile calendar up -d
+
+# 6. Verify: expect a Bitcoin RPC connection and no auth errors.
+docker logs otsd
+```
 
 ### Pointing to an external otsd
 

@@ -3,7 +3,8 @@ set -u
 
 REPO="/home/gateway/timestamp-gateway"
 ARTIFACTS="/home/gateway/timestamp-gateway-live-artifacts"
-GATEWAY_URL="${GATEWAY_URL:-$(grep "^GATEWAY_URL=" "$REPO/.env" 2>/dev/null | cut -d= -f2- || echo "http://100.98.161.106:8000")}"
+# set GATEWAY_URL in .env (e.g. your Tailscale IP)
+GATEWAY_URL="${GATEWAY_URL:-$(grep "^GATEWAY_URL=" "$REPO/.env" 2>/dev/null | cut -d= -f2- || echo "http://127.0.0.1:8000")}"
 
 echo "=== timestamp-gateway operator status ==="
 echo "time_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"

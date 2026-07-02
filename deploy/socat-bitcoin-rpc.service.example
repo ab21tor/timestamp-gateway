@@ -1,0 +1,20 @@
+# Socat bridge: localhost:18332 -> your Bitcoin node's RPC over Tor.
+# Copy to /etc/systemd/system/socat-bitcoin-rpc.service, replace the
+# placeholder, then: systemctl daemon-reload && systemctl enable --now socat-bitcoin-rpc
+#
+# YOUR_NODE_ONION: your Bitcoin node's RPC hidden service address
+# (Start9: Services > Bitcoin Core > Interfaces). Keep the real
+# address out of git.
+
+[Unit]
+Description=Socat bridge: localhost:18332 -> Bitcoin RPC over Tor
+After=network.target tor.service
+
+[Service]
+User=gateway
+ExecStart=/usr/bin/socat TCP-LISTEN:18332,bind=127.0.0.1,fork,reuseaddr SOCKS4A:127.0.0.1:YOUR_NODE_ONION:8332,socksport=9050
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
