@@ -40,7 +40,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from pydantic import ValidationError  # noqa: E402
 from pymacaroons import Macaroon  # noqa: E402
 from opentimestamps.calendar import DEFAULT_AGGREGATORS  # noqa: E402
-from opentimestamps.core.notary import PendingAttestation  # noqa: E402
+from opentimestamps.core.notary import PendingAttestation, UnknownAttestation  # noqa: E402
 from opentimestamps.core.timestamp import Timestamp  # noqa: E402
 
 client = TestClient(app=main.app, raise_server_exceptions=False)
@@ -905,6 +905,21 @@ def test_verify_invalid_ots_bytes_returns_invalid_status():
     assert body["verified"] is False
 
 
+def test_verify_no_recognized_attestations_returns_no_attestations():
+    """Case split from "invalid": a well-formed proof whose attestations are
+    all unrecognized (an empty timestamp can't serialize) is "no_attestations",
+    not "invalid" — the bytes decoded fine and the digest matches."""
+    ots = make_detached_ots_bytes(attestation=UnknownAttestation(b"\x99" * 8, b"payload"))
+    resp = client.post("/verify", json={"digest": DIGEST, "ots": base64.b64encode(ots).decode()})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "no_attestations"
+    assert body["valid_ots"] is True
+    assert body["digest_match"] is True
+    assert body["bitcoin_anchored"] is False
+    assert body["verified"] is False
+
+
 def test_verify_rejects_invalid_digest_with_422():
     ots_b64 = base64.b64encode(make_detached_ots_bytes()).decode()
     resp = client.post("/verify", json={"digest": "g" * 64, "ots": ots_b64})
@@ -942,6 +957,22 @@ def test_upgrade_invalid_ots_bytes_returns_invalid():
     assert body["bitcoin_anchored"] is False
     assert body["verified"] is False
     assert body["ots"] is None
+
+
+def test_upgrade_no_recognized_attestations_returns_no_attestations():
+    """Same split on the upgrade path: nothing to upgrade, but the proof is
+    well-formed — "no_attestations", with the original proof echoed back."""
+    ots = make_detached_ots_bytes(attestation=UnknownAttestation(b"\x99" * 8, b"payload"))
+    ots_b64 = base64.b64encode(ots).decode()
+    resp = client.post("/upgrade", json={"digest": DIGEST, "ots": ots_b64})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "no_attestations"
+    assert body["valid_ots"] is True
+    assert body["digest_match"] is True
+    assert body["bitcoin_anchored"] is False
+    assert body["verified"] is False
+    assert body["ots"] == ots_b64  # original proof returned unchanged
 
 
 def test_upgrade_oversized_ots_returns_413():

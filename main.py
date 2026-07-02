@@ -526,7 +526,11 @@ def _verify_ots_bytes(digest: str, ots_bytes: bytes) -> dict:
     elif has_pending:
         status = "pending"
     else:
-        status = "invalid"
+        # Well-formed OTS proof, digest matches, but no recognized
+        # (bitcoin/pending) attestations — distinct from "invalid"
+        # (undecodable bytes). An empty timestamp can't serialize, so in
+        # practice this means only unknown attestation types are present.
+        status = "no_attestations"
 
     return {
         "digest": digest,
@@ -602,7 +606,10 @@ def _upgrade_ots_bytes(digest: str, ots_bytes: bytes) -> dict:
     if bitcoin_anchored:
         return result("anchored", original_b64)
     if not has_pending:
-        return result("invalid", original_b64)
+        # Well-formed proof, digest matches, but no recognized (bitcoin/
+        # pending) attestations to upgrade — distinct from "invalid"
+        # (undecodable bytes).
+        return result("no_attestations", original_b64)
     if OTS_CALENDAR_URL:
         _upgrade_pending_against_operator(detached.timestamp, timeout=10)
     now_anchored = any(
