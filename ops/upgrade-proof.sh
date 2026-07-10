@@ -40,7 +40,14 @@ if echo "$INFO" | grep -q "BitcoinBlockHeaderAttestation"; then
   exit 0
 fi
 
-cp "$PROOF" "$PROOF.bak"
+# ots upgrade makes its own backup: it renames the proof to proof.ots.bak
+# before writing, and refuses to touch anything if that name is taken. A .bak
+# byte-identical to the artifact carries no information the artifact lacks
+# (the pre-fix sweeper planted one on every run) — clear exactly that case.
+if [ -f "$PROOF.bak" ] && cmp -s "$PROOF" "$PROOF.bak"; then
+  rm -f "$PROOF.bak"
+fi
+
 UPGRADE="$("$OTS" upgrade -c "$CALENDAR_URL" "$PROOF" 2>&1)"
 UPGRADE_EXIT=$?
 
@@ -48,7 +55,6 @@ if [ "$UPGRADE_EXIT" -eq 0 ] && echo "$UPGRADE" | grep -qi "Success! Timestamp c
   INFO2="$("$OTS" info "$PROOF" 2>&1)"
   BLOCK="$(echo "$INFO2" | sed -n 's/.*BitcoinBlockHeaderAttestation(\([0-9][0-9]*\)).*/\1/p' | tail -1)"
   TXID="$(echo "$INFO2" | sed -n 's/^# Transaction id //p' | tail -1)"
-  rm -f "$PROOF.bak"
   echo "state: bitcoin_backed"
   echo "message: proof upgraded"
   echo "proof: $PROOF"
@@ -57,17 +63,23 @@ if [ "$UPGRADE_EXIT" -eq 0 ] && echo "$UPGRADE" | grep -qi "Success! Timestamp c
   exit 0
 fi
 
+# The client fetched an attestation but could not write the artifact
+# (cmds.py "Could not backup/upgrade timestamp"): the calendar holds an
+# attestation the artifact lacks. Checked before the pending match so a
+# blocked write is never misread as still-waiting.
+if echo "$UPGRADE" | grep -qiE "Could not (backup|upgrade) timestamp"; then
+  echo "state: attestation_mismatch"
+  echo "proof: $PROOF"
+  echo "message: calendar holds an attestation the artifact lacks; artifact not updated"
+  echo
+  echo "$UPGRADE"
+  exit 2
+fi
+
 if echo "$UPGRADE" | grep -qi "Pending confirmation"; then
   echo "state: waiting_for_bitcoin"
   echo "proof: $PROOF"
   echo "message: local calendar has not finished Bitcoin anchoring yet"
-  exit 0
-fi
-
-if echo "$INFO" | grep -q "PendingAttestation"; then
-  echo "state: waiting_for_bitcoin"
-  echo "proof: $PROOF"
-  echo "message: receipt issued, Bitcoin proof not ready yet"
   exit 0
 fi
 

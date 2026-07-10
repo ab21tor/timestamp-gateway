@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
+# Read-only: classifies from `ots info` alone and never touches the artifacts.
+# BACKUP-RECOVERY.md and backup-live-state.sh call this during backup/restore
+# checks — a check must not mutate what it is checking.
 set -u
 
 REPO="/home/gateway/timestamp-gateway"
 ARTIFACTS="/home/gateway/timestamp-gateway-live-artifacts"
-UPGRADE="$REPO/ops/upgrade-proof.sh"
+OTS="$REPO/.venv/bin/ots"
 
-if [ ! -x "$UPGRADE" ]; then
+if [ ! -x "$OTS" ]; then
   echo "state: needs_attention"
-  echo "message: upgrade-proof.sh not found or not executable"
+  echo "message: ots CLI not found or not executable: $OTS"
   exit 1
 fi
 
@@ -21,15 +24,14 @@ find "$ARTIFACTS" -maxdepth 2 -name proof.ots -printf '%T@ %p\n' 2>/dev/null \
       dir="$(dirname "$proof")"
       name="$(basename "$dir")"
 
-      out="$("$UPGRADE" "$proof" 2>&1)"
-      state="$(echo "$out" | awk -F': ' '/^state: / {print $2; exit}')"
-      block="$(echo "$out" | awk -F': ' '/^bitcoin_block: / {print $2; exit}')"
-
-      [ -z "$state" ] && state="needs_attention"
+      info="$("$OTS" info "$proof" 2>&1)"
+      block="$(echo "$info" | sed -n 's/.*BitcoinBlockHeaderAttestation(\([0-9][0-9]*\)).*/\1/p' | tail -1)"
 
       if [ -n "$block" ]; then
-        echo "$state  block=$block  $name"
+        echo "bitcoin_backed  block=$block  $name"
+      elif echo "$info" | grep -q "PendingAttestation"; then
+        echo "waiting_for_bitcoin  $name"
       else
-        echo "$state  $name"
+        echo "needs_attention  $name"
       fi
     done
