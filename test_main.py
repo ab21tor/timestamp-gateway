@@ -1359,6 +1359,28 @@ def test_token_representation_stays_instant_via_proof_cache():
     assert _obligation_count() == 1
 
 
+def test_proof_cache_bounded_fifo(monkeypatch):
+    """_proof_cache never exceeds _PROOF_CACHE_MAX: the oldest insertion is
+    evicted first (FIFO), and overwriting an existing key neither grows the
+    cache nor evicts."""
+    monkeypatch.setattr(main, "_PROOF_CACHE_MAX", 3)
+    for i in range(3):
+        main._proof_cache_put(f"hash{i}", b"proof")
+    assert len(main._proof_cache) == 3
+
+    main._proof_cache_put("hash0", b"proof0")  # overwrite: no growth, no eviction
+    assert len(main._proof_cache) == 3
+    assert main._proof_cache["hash0"] == b"proof0"
+
+    main._proof_cache_put("hash3", b"proof")  # one past the bound
+    assert len(main._proof_cache) == 3
+    assert "hash0" not in main._proof_cache  # oldest insertion evicted
+    assert set(main._proof_cache) == {"hash1", "hash2", "hash3"}
+
+    main._proof_cache_put("hash4", b"proof")
+    assert set(main._proof_cache) == {"hash2", "hash3", "hash4"}
+
+
 def test_duplicate_payment_hash_single_row_no_new_invoice():
     """Two paid calls with the same token yield exactly one obligation row and
     mint no new invoice (INSERT OR IGNORE is idempotent on payment_hash)."""

@@ -275,7 +275,20 @@ L402_AUTH_RE = re.compile(r"^L402\s+([A-Za-z0-9+/=_-]+):([0-9a-fA-F]{64})$")
 # Prevents the same paid token from submitting the same digest to otsd multiple times
 # within the token expiry window. Resets on process restart (acceptable: the invoice
 # is still settled in Phoenixd so the client can re-present the token after restart).
+# Bounded at _PROOF_CACHE_MAX entries with FIFO eviction so a long-lived process
+# cannot grow it without limit. Eviction never loses a paid obligation: a
+# re-presented token that misses the cache just re-stamps (the obligation log is
+# the durable record), at the cost of one redundant otsd submission.
+_PROOF_CACHE_MAX = 10_000
 _proof_cache: dict[str, bytes] = {}
+
+
+def _proof_cache_put(payment_hash: str, ots_bytes: bytes) -> None:
+    """Insert into _proof_cache, evicting the oldest entry once the cache is full
+    (dicts iterate in insertion order). Overwriting an existing key never evicts."""
+    if payment_hash not in _proof_cache and len(_proof_cache) >= _PROOF_CACHE_MAX:
+        del _proof_cache[next(iter(_proof_cache))]
+    _proof_cache[payment_hash] = ots_bytes
 
 
 # ── Durable obligation log ────────────────────────────────────────────────────
@@ -396,7 +409,7 @@ def _sweep_obligations_once() -> None:
             )
             continue
 
-        _proof_cache[payment_hash] = ots_bytes
+        _proof_cache_put(payment_hash, ots_bytes)
         mark_obligation_stamped(payment_hash)
         logging.info("Sweeper: recovered obligation %s", payment_hash)
 
@@ -1163,7 +1176,7 @@ def timestamp(body: TimestampRequest, request: Request):
             raise HTTPException(status_code=502, detail="OTS error: stamping failed")
 
         # 6. Stamped: populate the instant re-serve cache AND close the obligation.
-        _proof_cache[payment_hash] = ots_bytes
+        _proof_cache_put(payment_hash, ots_bytes)
         mark_obligation_stamped(payment_hash)
         return Response(
             content=ots_bytes,
