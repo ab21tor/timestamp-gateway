@@ -153,6 +153,15 @@ def wallet_status_file(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def proofs_status_file(tmp_path, monkeypatch):
+    """Point PROOFS_STATUS_PATH at a per-test path (no file by default, so
+    /health reports proofs 'absent') — deterministic regardless of the host."""
+    path = tmp_path / "proofs-status"
+    monkeypatch.setattr(main, "PROOFS_STATUS_PATH", str(path))
+    return path
+
+
+@pytest.fixture(autouse=True)
 def obligations_db(tmp_path, monkeypatch):
     """Point the obligation store at a fresh, writable per-test SQLite DB and
     initialize its schema. Keeps the durable-log integration in /timestamp from
@@ -731,6 +740,7 @@ def test_health_both_ok_returns_200():
         "payment_backend": main.PAYMENT_BACKEND_TYPE,
         "otsd": "ok",
         "wallet": "absent",
+        "proofs": "absent",
     }
 
 
@@ -762,6 +772,7 @@ def test_health_otsd_na_in_public_mode():
         "payment_backend": main.PAYMENT_BACKEND_TYPE,
         "otsd": "n/a",
         "wallet": "absent",
+        "proofs": "absent",
     }
 
 
@@ -1468,3 +1479,82 @@ def test_health_wallet_malformed_returns_503_unknown(wallet_status_file):
     assert resp.status_code == 503
     body = resp.json()
     assert body["status"] == "degraded" and body["wallet"] == "unknown"
+
+
+# ══ 14. Proof sweep status (/health proofs field) ════════════════════════════════
+# /health reads the status file written by ops/upgrade-all-proofs.sh — no
+# artifact scanning from the gateway. "absent" (sweep not installed) does not
+# degrade; "mismatch"/"attention"/"stale"/"unknown" degrade to 503.
+
+def _write_proofs_status(path, status="ok", checked_at=None):
+    if checked_at is None:
+        checked_at = int(time.time())
+    path.write_text(json.dumps({
+        "total": 4,
+        "bitcoin_backed": 4,
+        "waiting_for_bitcoin": 0,
+        "attestation_mismatch": 0,
+        "needs_attention": 0,
+        "status": status,
+        "checked_at": checked_at,
+    }))
+
+
+def test_health_proofs_ok_returns_200(proofs_status_file):
+    _write_proofs_status(proofs_status_file, status="ok")
+    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+        resp = client.get("/health")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok" and body["proofs"] == "ok"
+
+
+def test_health_proofs_mismatch_returns_503(proofs_status_file):
+    """attestation_mismatch is the signal the sweeper repair exists for — the
+    calendar holds an attestation an artifact lacks. It must degrade health."""
+    _write_proofs_status(proofs_status_file, status="mismatch")
+    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+        resp = client.get("/health")
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["status"] == "degraded" and body["proofs"] == "mismatch"
+
+
+def test_health_proofs_attention_returns_503(proofs_status_file):
+    _write_proofs_status(proofs_status_file, status="attention")
+    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+        resp = client.get("/health")
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["status"] == "degraded" and body["proofs"] == "attention"
+
+
+def test_health_proofs_stale_returns_503(proofs_status_file):
+    """An 'ok' file older than PROOFS_STATUS_MAX_AGE_SECONDS means the sweep
+    timer itself died — that must degrade health, not pass as ok."""
+    old = int(time.time()) - main.PROOFS_STATUS_MAX_AGE_SECONDS - 60
+    _write_proofs_status(proofs_status_file, status="ok", checked_at=old)
+    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+        resp = client.get("/health")
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["status"] == "degraded" and body["proofs"] == "stale"
+
+
+def test_health_proofs_absent_reports_but_stays_healthy(proofs_status_file):
+    """No status file = sweep not installed. Reported, but operators without
+    the calendar profile must not fail health."""
+    assert not proofs_status_file.exists()
+    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+        resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json()["proofs"] == "absent"
+
+
+def test_health_proofs_malformed_returns_503_unknown(proofs_status_file):
+    proofs_status_file.write_text("not json{{{")
+    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+        resp = client.get("/health")
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["status"] == "degraded" and body["proofs"] == "unknown"

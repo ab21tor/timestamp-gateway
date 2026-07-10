@@ -62,6 +62,8 @@ class GatewayConfig:
     obligation_sweep_interval: int
     wallet_status_path: str
     wallet_status_max_age_seconds: int
+    proofs_status_path: str
+    proofs_status_max_age_seconds: int
 
 
 def _parse_config() -> GatewayConfig:
@@ -208,6 +210,18 @@ def _parse_config() -> GatewayConfig:
     if wallet_status_max_age <= 0:
         raise RuntimeError("WALLET_STATUS_MAX_AGE_SECONDS must be a positive integer")
 
+    # /health reads the status file written by ops/upgrade-all-proofs.sh (the
+    # proof sweep). Same file-mediated pattern as the wallet alarm.
+    proofs_status_path = os.getenv(
+        "PROOFS_STATUS_PATH", "/var/lib/timestamp-gateway/proofs-status"
+    )
+    try:
+        proofs_status_max_age = int(os.getenv("PROOFS_STATUS_MAX_AGE_SECONDS", "3600"))
+    except ValueError:
+        raise RuntimeError("PROOFS_STATUS_MAX_AGE_SECONDS must be an integer")
+    if proofs_status_max_age <= 0:
+        raise RuntimeError("PROOFS_STATUS_MAX_AGE_SECONDS must be a positive integer")
+
     return GatewayConfig(
         lnd_host=os.getenv("LND_HOST"),
         lnd_port=os.getenv("LND_PORT"),
@@ -232,6 +246,8 @@ def _parse_config() -> GatewayConfig:
         obligation_sweep_interval=obligation_sweep_interval,
         wallet_status_path=wallet_status_path,
         wallet_status_max_age_seconds=wallet_status_max_age,
+        proofs_status_path=proofs_status_path,
+        proofs_status_max_age_seconds=proofs_status_max_age,
     )
 
 
@@ -263,6 +279,8 @@ OBLIGATIONS_DB_PATH = _CONFIG.obligations_db_path
 OBLIGATION_SWEEP_INTERVAL = _CONFIG.obligation_sweep_interval
 WALLET_STATUS_PATH = _CONFIG.wallet_status_path
 WALLET_STATUS_MAX_AGE_SECONDS = _CONFIG.wallet_status_max_age_seconds
+PROOFS_STATUS_PATH = _CONFIG.proofs_status_path
+PROOFS_STATUS_MAX_AGE_SECONDS = _CONFIG.proofs_status_max_age_seconds
 
 if not LND_TLS_VERIFY:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -479,6 +497,38 @@ def _wallet_status() -> str:
     if status not in ("ok", "low", "unknown"):
         return "unknown"
     if time.time() - checked_at > WALLET_STATUS_MAX_AGE_SECONDS:
+        return "stale"
+    return status
+
+
+def _proofs_status() -> str:
+    """Classify the proofs-status file written by ops/upgrade-all-proofs.sh.
+
+    File-mediated like the wallet alarm: the sweep timer scans and upgrades the
+    proof artifacts; /health only reads the file it leaves behind. Returns one of:
+      ok        — every proof is anchored or honestly waiting for Bitcoin
+      mismatch  — the calendar holds an attestation some artifact lacks
+      attention — a proof is in a state the sweep cannot classify
+      unknown   — the file is unreadable or malformed
+      stale     — the file is older than PROOFS_STATUS_MAX_AGE_SECONDS (the
+                  sweep timer itself died)
+      absent    — no file (sweep not installed)
+    Never raises — /health must never crash."""
+    try:
+        raw = Path(PROOFS_STATUS_PATH).read_text()
+    except FileNotFoundError:
+        return "absent"
+    except Exception:
+        return "unknown"
+    try:
+        data = json.loads(raw)
+        status = data["status"]
+        checked_at = int(data["checked_at"])
+    except Exception:
+        return "unknown"
+    if status not in ("ok", "mismatch", "attention"):
+        return "unknown"
+    if time.time() - checked_at > PROOFS_STATUS_MAX_AGE_SECONDS:
         return "stale"
     return status
 
@@ -1050,6 +1100,11 @@ def health():
     # "low"/"unknown"/"stale" degrade like a backend failure.
     wallet_status = _wallet_status()
 
+    # Proof sweep status: same file-mediated pattern. "absent" (sweep not
+    # installed) reports but does not degrade; mismatch/attention/unknown/stale
+    # degrade like a backend failure.
+    proofs_status = _proofs_status()
+
     if paused:
         overall = "paused"
     else:
@@ -1058,6 +1113,7 @@ def health():
             if payment_status == "ok"
             and otsd_status in ("ok", "n/a")
             and wallet_status in ("ok", "absent")
+            and proofs_status in ("ok", "absent")
             else "degraded"
         )
 
@@ -1070,6 +1126,7 @@ def health():
             "payment_backend": PAYMENT_BACKEND_TYPE,
             "otsd": otsd_status,
             "wallet": wallet_status,
+            "proofs": proofs_status,
         },
     )
 
