@@ -1,0 +1,12 @@
+# Install: see health-monitor.service
+[Unit]
+Description=Run timestamp-gateway health monitor periodically
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=health-monitor.service
+
+[Install]
+WantedBy=timers.target

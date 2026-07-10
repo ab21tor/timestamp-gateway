@@ -1,0 +1,10 @@
+# Install: sudo cp ops/systemd/health-monitor.{service,timer} /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now health-monitor.timer
+[Unit]
+Description=timestamp-gateway health monitor (alarm push)
+After=network.target
+
+[Service]
+Type=oneshot
+User=gateway
+WorkingDirectory=/home/gateway/timestamp-gateway
+ExecStart=/home/gateway/timestamp-gateway/ops/health-monitor.sh
