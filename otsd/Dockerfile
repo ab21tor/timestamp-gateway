@@ -1,5 +1,5 @@
 # otsd runtime image — Python + dependencies ONLY.
-# The calendar CODE is a fork of opentimestamps-server, mounted at /app
+# The calendar CODE is the opentimestamps-server fork — https://github.com/ab21tor/opentimestamps-server, branch calendar-ops — mounted at /app
 # at runtime (see docker-compose and the operator guide). Build context
 # must be the fork checkout so its requirements.txt is available:
 #   docker build -t otsd-local -f otsd/Dockerfile /path/to/opentimestamps-server

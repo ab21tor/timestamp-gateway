@@ -53,7 +53,7 @@ services:
     network_mode: host
     volumes:
       - /var/lib/otsd/calendar:/calendar
-      # Calendar code: your opentimestamps-server fork checkout.
+      # Calendar code: the opentimestamps-server fork checkout (ab21tor/opentimestamps-server, branch calendar-ops).
       - ${OTSD_FORK_PATH:-./opentimestamps-server}:/app
     environment:
       # Full RPC URL including credentials. Set in gitignored .env ONLY.

@@ -111,11 +111,11 @@ This starts `gateway`, `tor`, and `otsd`. otsd is not publicly exposed — it ru
 
 ### Deploying the calendar (otsd)
 
-The otsd image ships Python + dependencies only. The calendar **code** is your fork of `opentimestamps-server`, mounted at `/app` at runtime — so the build context is the fork checkout, not this repo.
+The otsd image ships Python + dependencies only. The calendar **code** is the `opentimestamps-server` fork — `https://github.com/ab21tor/opentimestamps-server`, branch `calendar-ops` — mounted at `/app` at runtime, so the build context is the fork checkout, not this repo.
 
 ```bash
-# 1. Clone your opentimestamps-server fork (the calendar code).
-git clone <your-fork-url> /home/gateway/opentimestamps-server
+# 1. Clone the opentimestamps-server fork (the calendar code).
+git clone -b calendar-ops https://github.com/ab21tor/opentimestamps-server /home/gateway/opentimestamps-server
 
 # 2. Build the otsd image with the fork checkout as the build context.
 docker build -t otsd-local -f otsd/Dockerfile /home/gateway/opentimestamps-server
@@ -408,8 +408,9 @@ Substitute your service user for `gateway`. If you point `OBLIGATIONS_DB_PATH` e
 For a bare-metal otsd:
 
 ```bash
-pip install opentimestamps-server
-otsd --path /path/to/calendar-data
+git clone -b calendar-ops https://github.com/ab21tor/opentimestamps-server
+cd opentimestamps-server && pip install -r requirements.txt
+./otsd --calendar /path/to/calendar-data
 ```
 
 For Tor exposure without Docker, add to `/etc/tor/torrc`:

@@ -144,7 +144,7 @@ On a replacement box:
 5. Restore Phoenixd home/state directory.
 6. Restore `phoenixd.service`.
 7. Restore `/var/lib/otsd/calendar`.
-8. Restore or rebuild `/home/gateway/opentimestamps-server`.
+8. Re-clone `/home/gateway/opentimestamps-server`: `git clone -b calendar-ops https://github.com/ab21tor/opentimestamps-server /home/gateway/opentimestamps-server`.
 9. Recreate the `otsd` Docker container with the same mounts and command.
 10. Restore proof artifacts if needed.
 11. Run `systemctl daemon-reload`.

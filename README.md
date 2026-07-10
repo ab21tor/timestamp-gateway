@@ -251,8 +251,8 @@ BITCOIN_RPC_SERVICE_URL=http://rpcuser:rpcpassword@127.0.0.1:18332/wallet/otsd-h
 
 **otsd is not publicly exposed.** It runs with host networking and binds loopback only. The gateway reaches it at `http://127.0.0.1:14788`. Clients have no direct access to otsd; they interact only with the gateway.
 
-Verify current otsd installation and configuration at:
-`https://github.com/opentimestamps/opentimestamps-server`
+The calendar code is the `opentimestamps-server` fork:
+`https://github.com/ab21tor/opentimestamps-server` (branch `calendar-ops`, fork of `opentimestamps/opentimestamps-server`).
 
 ---
 
