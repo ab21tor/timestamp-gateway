@@ -1,0 +1,14 @@
+# Install: sudo cp ops/systemd/backup-live-state.{service,timer} /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now backup-live-state.timer
+[Unit]
+Description=timestamp-gateway live-state backup
+After=network.target
+
+[Service]
+Type=oneshot
+# root on purpose: the backup set includes root-readable-only paths
+# (phoenixd seed.dat, /var/lib/otsd, /var/lib/timestamp-gateway, installed
+# units under /etc/systemd/system). Do not "fix" this to User=gateway.
+# No EnvironmentFile= needed: the script sources REPO_DIR/.env itself.
+User=root
+WorkingDirectory=/home/gateway/timestamp-gateway
+ExecStart=/home/gateway/timestamp-gateway/ops/backup-live-state.sh

@@ -44,7 +44,7 @@ Also present:
 
 - `PAUSED` (only when the operator has paused the gateway)
 
-For a consistent copy, back it up while the gateway is stopped, or use `sqlite3 obligations.db ".backup <dest>"`. `ops/backup-live-state.sh` archives the whole `/var/lib/timestamp-gateway` directory, which captures the database and both sidecars together.
+For a consistent copy, back it up while the gateway is stopped, or use a `sqlite3 .backup` snapshot. `ops/backup-live-state.sh` does both protections automatically: it snapshots the database with `sqlite3 .backup` before archiving, and archives the whole `/var/lib/timestamp-gateway` directory, which captures the database and both sidecars together.
 
 ### Phoenixd
 
@@ -120,6 +120,14 @@ Current plain anchoring policy:
 - when anchoring, target about 2-block Bitcoin confirmation
 - save Bitcoin proof after 6 confirmations by default
 
+### Bitcoin RPC bridge
+
+Installed systemd unit:
+
+`/etc/systemd/system/socat-bitcoin-rpc.service`
+
+The repo ships only the template (`deploy/socat-bitcoin-rpc.service.example`); the installed unit carries the substituted node onion address. A restored box has no Bitcoin path without it.
+
 ### Proof artifacts
 
 Proof artifacts live at:
@@ -132,6 +140,26 @@ Some artifact files may contain sensitive payment/auth material.
 
 Keep artifact directories private.
 
+## Automated backups
+
+`ops/backup-live-state.sh` runs daily under `backup-live-state.timer` (templates in `ops/systemd/`, install command in the unit's header comment). It runs as root — parts of the backup set are readable by root only.
+
+Each run snapshots the obligation log with `sqlite3 .backup`, archives the critical set above (including the opentimestamps-server checkout and the installed socat unit), encrypts the archive to `BACKUP_AGE_RECIPIENT`, pushes it to `BACKUP_REMOTE`, prunes to the `BACKUP_KEEP` newest archives — matched by archive-name pattern only, nothing else in `BACKUP_ROOT` is ever deleted — and writes `backup-status` to the state directory.
+
+Prerequisites on the box (the script degrades loudly to `attention` when one is missing; it never silently skips a step):
+
+- `sqlite3` — consistent obligation-log snapshot
+- `age` — archive encryption
+- `rsync` — off-box push
+
+Configuration lives in the gitignored `.env` (entries in `.env.example`):
+
+- `BACKUP_AGE_RECIPIENT` — age public key the archive is encrypted to. The matching private key must live off this box: it is the only way to read pushed backups, and losing it makes every one of them unrecoverable. Empty: the archive stays plaintext and is never pushed.
+- `BACKUP_REMOTE` — rsync destination (`user@host:path`) for the encrypted archive. Plaintext archives are never pushed. Empty: backups stay on this box. A local-only backup shares fate with the box — the disk that fails, the attacker that wipes it, or the provider that closes the account takes the service and every backup of it at once.
+- `BACKUP_KEEP` — newest archives kept locally (default 7).
+
+Status file: `backup-status` in the state directory, one JSON line written atomically (same pattern as `wallet-status`). `status` is `ok` (encrypted and pushed), `local_only` (archive created, nothing pushed — `detail` says whether it is plaintext), `attention` (a backup exists but degraded — `detail` says why), or `failed` (no usable archive).
+
 ## Minimum restore checklist
 
 On a replacement box:
@@ -139,19 +167,21 @@ On a replacement box:
 1. Restore the repository.
 2. Restore `.env`.
 3. Restore `timestamp-gateway.service`.
-   - Also restore `/var/lib/timestamp-gateway` (obligation log + `PAUSED`). On a fresh box the gateway recreates this directory and an empty obligation log at startup; restore it only if you are recovering pending obligations from the old box.
+   - Also restore `/var/lib/timestamp-gateway` (obligation log + `PAUSED`). The gateway initialises an empty obligation log at startup only if the directory exists and is writable by the service user — it refuses to start otherwise — so on a fresh box create the directory (owned by the service user) even when not restoring old contents. Restore the contents when recovering pending obligations from the old box.
 4. Restore Phoenixd binary directory.
 5. Restore Phoenixd home/state directory.
 6. Restore `phoenixd.service`.
 7. Restore `/var/lib/otsd/calendar`.
 8. Re-clone `/home/gateway/opentimestamps-server`: `git clone -b calendar-ops https://github.com/ab21tor/opentimestamps-server /home/gateway/opentimestamps-server`.
 9. Recreate the `otsd` Docker container with the same mounts and command.
-10. Restore proof artifacts if needed.
-11. Run `systemctl daemon-reload`.
-12. Start Phoenixd.
-13. Start otsd.
-14. Start timestamp-gateway.
-15. Run the operator checks.
+10. Restore `socat-bitcoin-rpc.service` from the backup archive (the installed unit carries the substituted node onion; the repo ships only the template) and enable it — without it otsd has no Bitcoin path.
+11. Restore proof artifacts if needed.
+12. Reinstall the timers and their services from `ops/systemd/` (install commands in each unit's header): `wallet-balance-check`, `health-monitor`, `timestamp-gateway-upgrade-proofs`, `backup-live-state`. Without them the restored box has no wallet alarm, no health alarms, no proof sweeper, and no backups.
+13. Run `systemctl daemon-reload`.
+14. Start Phoenixd.
+15. Start otsd.
+16. Start timestamp-gateway.
+17. Run the operator checks.
 
 ## Post-restore checks
 

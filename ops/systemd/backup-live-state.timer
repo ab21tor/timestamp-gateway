@@ -1,0 +1,11 @@
+# Install: see backup-live-state.service
+[Unit]
+Description=Run timestamp-gateway live-state backup daily
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+Unit=backup-live-state.service
+
+[Install]
+WantedBy=timers.target
