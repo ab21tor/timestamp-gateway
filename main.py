@@ -64,6 +64,8 @@ class GatewayConfig:
     wallet_status_max_age_seconds: int
     proofs_status_path: str
     proofs_status_max_age_seconds: int
+    backup_status_path: str
+    backup_status_max_age_seconds: int
 
 
 def _parse_config() -> GatewayConfig:
@@ -222,6 +224,19 @@ def _parse_config() -> GatewayConfig:
     if proofs_status_max_age <= 0:
         raise RuntimeError("PROOFS_STATUS_MAX_AGE_SECONDS must be a positive integer")
 
+    # /health reads the status file written by ops/backup-live-state.sh (the
+    # backup timer). Same file-mediated pattern as the wallet alarm. Max age
+    # defaults to 2x the daily timer, the established convention.
+    backup_status_path = os.getenv(
+        "BACKUP_STATUS_PATH", "/var/lib/timestamp-gateway/backup-status"
+    )
+    try:
+        backup_status_max_age = int(os.getenv("BACKUP_STATUS_MAX_AGE_SECONDS", "172800"))
+    except ValueError:
+        raise RuntimeError("BACKUP_STATUS_MAX_AGE_SECONDS must be an integer")
+    if backup_status_max_age <= 0:
+        raise RuntimeError("BACKUP_STATUS_MAX_AGE_SECONDS must be a positive integer")
+
     return GatewayConfig(
         lnd_host=os.getenv("LND_HOST"),
         lnd_port=os.getenv("LND_PORT"),
@@ -248,6 +263,8 @@ def _parse_config() -> GatewayConfig:
         wallet_status_max_age_seconds=wallet_status_max_age,
         proofs_status_path=proofs_status_path,
         proofs_status_max_age_seconds=proofs_status_max_age,
+        backup_status_path=backup_status_path,
+        backup_status_max_age_seconds=backup_status_max_age,
     )
 
 
@@ -281,6 +298,8 @@ WALLET_STATUS_PATH = _CONFIG.wallet_status_path
 WALLET_STATUS_MAX_AGE_SECONDS = _CONFIG.wallet_status_max_age_seconds
 PROOFS_STATUS_PATH = _CONFIG.proofs_status_path
 PROOFS_STATUS_MAX_AGE_SECONDS = _CONFIG.proofs_status_max_age_seconds
+BACKUP_STATUS_PATH = _CONFIG.backup_status_path
+BACKUP_STATUS_MAX_AGE_SECONDS = _CONFIG.backup_status_max_age_seconds
 
 if not LND_TLS_VERIFY:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -529,6 +548,40 @@ def _proofs_status() -> str:
     if status not in ("ok", "mismatch", "attention"):
         return "unknown"
     if time.time() - checked_at > PROOFS_STATUS_MAX_AGE_SECONDS:
+        return "stale"
+    return status
+
+
+def _backup_status() -> str:
+    """Classify the backup-status file written by ops/backup-live-state.sh.
+
+    File-mediated like the wallet alarm: the backup timer archives, encrypts
+    and pushes; /health only reads the file it leaves behind. Returns one of:
+      ok         — archive created, encrypted, pushed off-box
+      local_only — archive created but kept on this box (a configuration
+                   choice, honestly reported; does not degrade health)
+      attention  — a backup exists but degraded (its detail field says why)
+      failed     — the run produced no usable archive
+      unknown    — the file is unreadable or malformed
+      stale      — the file is older than BACKUP_STATUS_MAX_AGE_SECONDS (the
+                   backup timer itself died)
+      absent     — no file (backups not installed)
+    Never raises — /health must never crash."""
+    try:
+        raw = Path(BACKUP_STATUS_PATH).read_text()
+    except FileNotFoundError:
+        return "absent"
+    except Exception:
+        return "unknown"
+    try:
+        data = json.loads(raw)
+        status = data["status"]
+        checked_at = int(data["checked_at"])
+    except Exception:
+        return "unknown"
+    if status not in ("ok", "local_only", "attention", "failed"):
+        return "unknown"
+    if time.time() - checked_at > BACKUP_STATUS_MAX_AGE_SECONDS:
         return "stale"
     return status
 
@@ -1105,6 +1158,12 @@ def health():
     # degrade like a backend failure.
     proofs_status = _proofs_status()
 
+    # Backup status: same file-mediated pattern. "absent" (backups not
+    # installed) and "local_only" (a configuration choice, honestly reported)
+    # do not degrade; attention/failed/unknown/stale degrade like a backend
+    # failure.
+    backup_status = _backup_status()
+
     if paused:
         overall = "paused"
     else:
@@ -1114,6 +1173,7 @@ def health():
             and otsd_status in ("ok", "n/a")
             and wallet_status in ("ok", "absent")
             and proofs_status in ("ok", "absent")
+            and backup_status in ("ok", "local_only", "absent")
             else "degraded"
         )
 
@@ -1127,6 +1187,7 @@ def health():
             "otsd": otsd_status,
             "wallet": wallet_status,
             "proofs": proofs_status,
+            "backup": backup_status,
         },
     )
 

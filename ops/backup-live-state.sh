@@ -35,6 +35,11 @@ write_status() {
       "$1" "$2" "$(date +%s)" > "$tmp"
   fi
   mv "$tmp" "$STATUS_FILE"
+  # The gateway process (user gateway) reads this file for /health; the
+  # script runs as root, so hand the file over like the archive.
+  if [ "$(id -u)" -eq 0 ]; then
+    chown gateway:gateway "$STATUS_FILE"
+  fi
 }
 
 degrade() {

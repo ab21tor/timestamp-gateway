@@ -162,6 +162,15 @@ def proofs_status_file(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def backup_status_file(tmp_path, monkeypatch):
+    """Point BACKUP_STATUS_PATH at a per-test path (no file by default, so
+    /health reports backup 'absent') — deterministic regardless of the host."""
+    path = tmp_path / "backup-status"
+    monkeypatch.setattr(main, "BACKUP_STATUS_PATH", str(path))
+    return path
+
+
+@pytest.fixture(autouse=True)
 def obligations_db(tmp_path, monkeypatch):
     """Point the obligation store at a fresh, writable per-test SQLite DB and
     initialize its schema. Keeps the durable-log integration in /timestamp from
@@ -741,6 +750,7 @@ def test_health_both_ok_returns_200():
         "otsd": "ok",
         "wallet": "absent",
         "proofs": "absent",
+        "backup": "absent",
     }
 
 
@@ -773,6 +783,7 @@ def test_health_otsd_na_in_public_mode():
         "otsd": "n/a",
         "wallet": "absent",
         "proofs": "absent",
+        "backup": "absent",
     }
 
 
@@ -1558,3 +1569,83 @@ def test_health_proofs_malformed_returns_503_unknown(proofs_status_file):
     assert resp.status_code == 503
     body = resp.json()
     assert body["status"] == "degraded" and body["proofs"] == "unknown"
+
+
+def _write_backup_status(path, status="ok", checked_at=None,
+                         archive="20260711T000000Z-live-state.tar.gz.age"):
+    if checked_at is None:
+        checked_at = int(time.time())
+    path.write_text(json.dumps({
+        "status": status,
+        "archive": archive,
+        "checked_at": checked_at,
+    }))
+
+
+def test_health_backup_ok_returns_200(backup_status_file):
+    _write_backup_status(backup_status_file, status="ok")
+    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+        resp = client.get("/health")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok" and body["backup"] == "ok"
+
+
+def test_health_backup_local_only_reports_but_stays_healthy(backup_status_file):
+    """local_only is a configuration choice (no BACKUP_REMOTE/recipient set),
+    honestly reported — it must not degrade health."""
+    _write_backup_status(backup_status_file, status="local_only")
+    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+        resp = client.get("/health")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok" and body["backup"] == "local_only"
+
+
+def test_health_backup_attention_returns_503(backup_status_file):
+    _write_backup_status(backup_status_file, status="attention")
+    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+        resp = client.get("/health")
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["status"] == "degraded" and body["backup"] == "attention"
+
+
+def test_health_backup_failed_returns_503(backup_status_file):
+    _write_backup_status(backup_status_file, status="failed")
+    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+        resp = client.get("/health")
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["status"] == "degraded" and body["backup"] == "failed"
+
+
+def test_health_backup_stale_returns_503(backup_status_file):
+    """An 'ok' file older than BACKUP_STATUS_MAX_AGE_SECONDS means the backup
+    timer itself died — that must degrade health, not pass as ok."""
+    old = int(time.time()) - main.BACKUP_STATUS_MAX_AGE_SECONDS - 60
+    _write_backup_status(backup_status_file, status="ok", checked_at=old)
+    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+        resp = client.get("/health")
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["status"] == "degraded" and body["backup"] == "stale"
+
+
+def test_health_backup_absent_reports_but_stays_healthy(backup_status_file):
+    """No status file = backups not installed. Reported, but boxes without the
+    backup timer must not fail health."""
+    assert not backup_status_file.exists()
+    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+        resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json()["backup"] == "absent"
+
+
+def test_health_backup_malformed_returns_503_unknown(backup_status_file):
+    backup_status_file.write_text("not json{{{")
+    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+        resp = client.get("/health")
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["status"] == "degraded" and body["backup"] == "unknown"
