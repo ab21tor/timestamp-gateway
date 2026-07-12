@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -66,6 +67,11 @@ class GatewayConfig:
     proofs_status_max_age_seconds: int
     backup_status_path: str
     backup_status_max_age_seconds: int
+    price_rpc_url: str | None
+    price_tx_vsize_estimate: int
+    price_bump_reserve: float
+    price_margin: float
+    price_conf_target: int
 
 
 def _parse_config() -> GatewayConfig:
@@ -202,6 +208,8 @@ def _parse_config() -> GatewayConfig:
     # ── Wallet liquidity alarm (file-mediated; NO Bitcoin RPC from the gateway)
     # /health reads the status file written by ops/wallet-balance-check.sh.
     # The gateway never holds wallet credentials — the rails stay separate.
+    # One carve-out (the pricing floor): the gateway may hold a fee-estimation
+    # credential (PRICE_RPC_URL, node-level), never a spending one.
     wallet_status_path = os.getenv(
         "WALLET_STATUS_PATH", "/var/lib/timestamp-gateway/wallet-status"
     )
@@ -237,6 +245,56 @@ def _parse_config() -> GatewayConfig:
     if backup_status_max_age <= 0:
         raise RuntimeError("BACKUP_STATUS_MAX_AGE_SECONDS must be a positive integer")
 
+    # ── Pricing solvency floor (fee-estimation RPC — see the wallet note above)
+    # The 402 quote is max(GATEWAY_PRICE_SATS, floor); the floor prices one
+    # anchoring transaction at the live fee market. PRICE_RPC_URL should carry
+    # a node-level (wallet-less) credential; it falls back to
+    # BITCOIN_RPC_SERVICE_URL so a single-credential deployment floats prices
+    # without new setup. Unset entirely: the gateway quotes the static price
+    # and warns — degraded pricing must never take payments down.
+    price_rpc_url = (
+        os.getenv("PRICE_RPC_URL") or os.getenv("BITCOIN_RPC_SERVICE_URL") or None
+    )
+
+    try:
+        price_tx_vsize = int(os.getenv("PRICE_TX_VSIZE_ESTIMATE", "150"))
+    except ValueError:
+        raise RuntimeError("PRICE_TX_VSIZE_ESTIMATE must be an integer")
+    if price_tx_vsize <= 0:
+        raise RuntimeError(
+            f"PRICE_TX_VSIZE_ESTIMATE must be a positive integer, got {price_tx_vsize}"
+        )
+
+    try:
+        price_bump_reserve = float(os.getenv("PRICE_BUMP_RESERVE", "1.5"))
+    except ValueError:
+        raise RuntimeError("PRICE_BUMP_RESERVE must be a number")
+    if price_bump_reserve < 1:
+        raise RuntimeError(
+            f"PRICE_BUMP_RESERVE must be >= 1 (a reserve below the unbumped fee "
+            f"underprices anchoring), got {price_bump_reserve}"
+        )
+
+    try:
+        price_margin = float(os.getenv("PRICE_MARGIN", "5"))
+    except ValueError:
+        raise RuntimeError("PRICE_MARGIN must be a number")
+    if price_margin < 1:
+        raise RuntimeError(
+            f"PRICE_MARGIN must be >= 1 (below 1 quotes anchoring at a loss), "
+            f"got {price_margin}"
+        )
+
+    try:
+        price_conf_target = int(os.getenv("PRICE_CONF_TARGET", "6"))
+    except ValueError:
+        raise RuntimeError("PRICE_CONF_TARGET must be an integer")
+    if not 1 <= price_conf_target <= 1008:
+        raise RuntimeError(
+            f"PRICE_CONF_TARGET must be within estimatesmartfee's accepted range "
+            f"1-1008, got {price_conf_target}"
+        )
+
     return GatewayConfig(
         lnd_host=os.getenv("LND_HOST"),
         lnd_port=os.getenv("LND_PORT"),
@@ -265,6 +323,11 @@ def _parse_config() -> GatewayConfig:
         proofs_status_max_age_seconds=proofs_status_max_age,
         backup_status_path=backup_status_path,
         backup_status_max_age_seconds=backup_status_max_age,
+        price_rpc_url=price_rpc_url,
+        price_tx_vsize_estimate=price_tx_vsize,
+        price_bump_reserve=price_bump_reserve,
+        price_margin=price_margin,
+        price_conf_target=price_conf_target,
     )
 
 
@@ -300,6 +363,11 @@ PROOFS_STATUS_PATH = _CONFIG.proofs_status_path
 PROOFS_STATUS_MAX_AGE_SECONDS = _CONFIG.proofs_status_max_age_seconds
 BACKUP_STATUS_PATH = _CONFIG.backup_status_path
 BACKUP_STATUS_MAX_AGE_SECONDS = _CONFIG.backup_status_max_age_seconds
+PRICE_RPC_URL = _CONFIG.price_rpc_url
+PRICE_TX_VSIZE_ESTIMATE = _CONFIG.price_tx_vsize_estimate
+PRICE_BUMP_RESERVE = _CONFIG.price_bump_reserve
+PRICE_MARGIN = _CONFIG.price_margin
+PRICE_CONF_TARGET = _CONFIG.price_conf_target
 
 if not LND_TLS_VERIFY:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -871,6 +939,99 @@ def parse_l402_auth(auth: str) -> tuple[str, str] | None:
     if not m:
         return None
     return m.group(1), m.group(2).lower()
+
+
+# ── Pricing solvency floor ───────────────────────────────────────────────────
+# The 402 challenge quotes max(GATEWAY_PRICE_SATS, floor): the floor prices one
+# anchoring transaction at the live fee market times the bump reserve and the
+# margin, so the gateway is structurally unable to quote below anchoring cost.
+# Any missing feerate (no RPC URL, timeout, RPC error, fresh node with no
+# estimate yet) falls back to the static price with a warning — degraded
+# pricing must never take payments down, and must never be silent. The RPC
+# round-trip crosses socat→Tor→a remote node and can take seconds, so results
+# (including failures) are cached and the hard timeout keeps a dead node from
+# stalling the challenge path.
+
+_PRICE_RPC_TIMEOUT_SECONDS = 5
+_FEERATE_CACHE_TTL_SECONDS = 60
+
+# Single-entry module-level cache, same simplicity as _proof_cache:
+# (feerate in sat/vB, or None if the last fetch failed; monotonic fetch time).
+_feerate_cache: tuple[float | None, float] | None = None
+
+
+def _btc_per_kvb_to_sat_per_vb(btc_per_kvb: float) -> float:
+    """estimatesmartfee quotes BTC/kvB; sat/vB = BTC/kvB × 1e8 sat/BTC ÷ 1000 vB/kvB.
+    bitcoind serializes BTC to 8 decimals, so sat/vB has exactly 3 meaningful
+    decimals; rounding there is lossless and stops binary-float noise
+    (0.00001 × 1e8 ÷ 1000 = 1.0000000000000002) from inflating ceil() by a sat."""
+    return round(btc_per_kvb * 1e8 / 1000, 3)
+
+
+def _fetch_feerate_sat_per_vb() -> float | None:
+    """estimatesmartfee(PRICE_CONF_TARGET) against PRICE_RPC_URL, in sat/vB.
+    Returns None — always with a warning — when no URL is configured, the call
+    fails or exceeds the timeout, or the node has no estimate. Exceptions are
+    reduced to their class name: requests errors can echo the URL, which
+    carries credentials."""
+    if not PRICE_RPC_URL:
+        logging.warning(
+            "Pricing floor: neither PRICE_RPC_URL nor BITCOIN_RPC_SERVICE_URL "
+            "is set; quoting the static price"
+        )
+        return None
+    try:
+        resp = requests.post(
+            PRICE_RPC_URL,
+            json={
+                "jsonrpc": "1.0",
+                "id": "gateway-price-floor",
+                "method": "estimatesmartfee",
+                "params": [PRICE_CONF_TARGET],
+            },
+            timeout=_PRICE_RPC_TIMEOUT_SECONDS,
+        )
+        resp.raise_for_status()
+        result = resp.json().get("result") or {}
+        feerate_btc_kvb = result.get("feerate")
+    except Exception as exc:
+        logging.warning(
+            "Pricing floor: estimatesmartfee failed (%s); quoting the static price",
+            type(exc).__name__,
+        )
+        return None
+    if not isinstance(feerate_btc_kvb, (int, float)) or feerate_btc_kvb <= 0:
+        logging.warning(
+            "Pricing floor: node has no feerate estimate for conf target %d; "
+            "quoting the static price",
+            PRICE_CONF_TARGET,
+        )
+        return None
+    return _btc_per_kvb_to_sat_per_vb(feerate_btc_kvb)
+
+
+def _cached_feerate_sat_per_vb() -> float | None:
+    """The fetched feerate, refreshed at most once per TTL. Failures are cached
+    too: a dead node costs one timed-out call per TTL, not one per request."""
+    global _feerate_cache
+    now = time.monotonic()
+    if _feerate_cache is not None and now - _feerate_cache[1] < _FEERATE_CACHE_TTL_SECONDS:
+        return _feerate_cache[0]
+    feerate = _fetch_feerate_sat_per_vb()
+    _feerate_cache = (feerate, now)
+    return feerate
+
+
+def quoted_price_sats() -> int:
+    """The price the 402 challenge quotes: the static price or the solvency
+    floor, whichever is higher. Floats with the fee market; never refuses."""
+    feerate = _cached_feerate_sat_per_vb()
+    if feerate is None:
+        return GATEWAY_PRICE_SATS
+    floor = math.ceil(
+        PRICE_TX_VSIZE_ESTIMATE * feerate * PRICE_BUMP_RESERVE * PRICE_MARGIN
+    )
+    return max(GATEWAY_PRICE_SATS, floor)
 
 
 # ── Payment backend abstraction ──────────────────────────────────────────────

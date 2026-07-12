@@ -1693,3 +1693,216 @@ def test_health_backup_malformed_returns_503_unknown(backup_status_file):
     assert resp.status_code == 503
     body = resp.json()
     assert body["status"] == "degraded" and body["backup"] == "unknown"
+
+
+# ══ 15. Pricing solvency floor ═══════════════════════════════════════════════════
+
+PRICE_TEST_URL = "http://feeuser:feepass@127.0.0.1:18332/"
+
+
+def _feerate_post_mock(result):
+    """Mock Bitcoin JSON-RPC estimatesmartfee response."""
+    m = MagicMock()
+    m.raise_for_status.return_value = None
+    m.json.return_value = {"result": result, "error": None, "id": "gateway-price-floor"}
+    return m
+
+
+@pytest.fixture
+def fresh_feerate_cache():
+    main._feerate_cache = None
+    yield
+    main._feerate_cache = None
+
+
+# ── Config validation ──
+
+
+def test_price_rpc_url_falls_back_to_bitcoin_rpc_service_url():
+    env = {"PRICE_RPC_URL": "", "BITCOIN_RPC_SERVICE_URL": PRICE_TEST_URL}
+    with patch.dict(os.environ, env):
+        assert main._parse_config().price_rpc_url == PRICE_TEST_URL
+
+
+def test_price_rpc_url_wins_over_fallback():
+    env = {"PRICE_RPC_URL": PRICE_TEST_URL, "BITCOIN_RPC_SERVICE_URL": "http://other:18332/"}
+    with patch.dict(os.environ, env):
+        assert main._parse_config().price_rpc_url == PRICE_TEST_URL
+
+
+def test_price_rpc_url_unset_is_none_and_boots():
+    with patch.dict(os.environ, {"PRICE_RPC_URL": "", "BITCOIN_RPC_SERVICE_URL": ""}):
+        assert main._parse_config().price_rpc_url is None
+
+
+def test_price_floor_defaults():
+    cfg = main._parse_config()
+    assert cfg.price_tx_vsize_estimate == 150
+    assert cfg.price_bump_reserve == 1.5
+    assert cfg.price_margin == 5.0
+    assert cfg.price_conf_target == 6
+
+
+def test_non_integer_price_tx_vsize_fails():
+    with patch.dict(os.environ, {"PRICE_TX_VSIZE_ESTIMATE": "abc"}):
+        with pytest.raises(RuntimeError, match="PRICE_TX_VSIZE_ESTIMATE must be an integer"):
+            main._parse_config()
+
+
+def test_zero_price_tx_vsize_fails():
+    with patch.dict(os.environ, {"PRICE_TX_VSIZE_ESTIMATE": "0"}):
+        with pytest.raises(RuntimeError, match="PRICE_TX_VSIZE_ESTIMATE must be a positive"):
+            main._parse_config()
+
+
+def test_non_numeric_price_bump_reserve_fails():
+    with patch.dict(os.environ, {"PRICE_BUMP_RESERVE": "abc"}):
+        with pytest.raises(RuntimeError, match="PRICE_BUMP_RESERVE must be a number"):
+            main._parse_config()
+
+
+def test_sub_one_price_bump_reserve_fails():
+    with patch.dict(os.environ, {"PRICE_BUMP_RESERVE": "0.9"}):
+        with pytest.raises(RuntimeError, match="PRICE_BUMP_RESERVE must be >= 1"):
+            main._parse_config()
+
+
+def test_non_numeric_price_margin_fails():
+    with patch.dict(os.environ, {"PRICE_MARGIN": "abc"}):
+        with pytest.raises(RuntimeError, match="PRICE_MARGIN must be a number"):
+            main._parse_config()
+
+
+def test_sub_one_price_margin_fails():
+    with patch.dict(os.environ, {"PRICE_MARGIN": "0.5"}):
+        with pytest.raises(RuntimeError, match="PRICE_MARGIN must be >= 1"):
+            main._parse_config()
+
+
+def test_non_integer_price_conf_target_fails():
+    with patch.dict(os.environ, {"PRICE_CONF_TARGET": "abc"}):
+        with pytest.raises(RuntimeError, match="PRICE_CONF_TARGET must be an integer"):
+            main._parse_config()
+
+
+def test_out_of_range_price_conf_target_fails():
+    for bad in ("0", "1009"):
+        with patch.dict(os.environ, {"PRICE_CONF_TARGET": bad}):
+            with pytest.raises(RuntimeError, match="1-1008"):
+                main._parse_config()
+
+
+# ── BTC/kvB → sat/vB conversion (explicit, per spec) ──
+
+
+def test_btc_per_kvb_to_sat_per_vb_conversion():
+    # 0.00001 BTC/kvB = 1000 sat / 1000 vB = exactly 1 sat/vB. Exact equality
+    # is deliberate: binary-float noise here would leak through ceil() and
+    # inflate the quoted floor by a sat.
+    assert main._btc_per_kvb_to_sat_per_vb(0.00001) == 1.0
+    assert main._btc_per_kvb_to_sat_per_vb(0.0001) == 10.0
+    assert main._btc_per_kvb_to_sat_per_vb(0.00012345) == 12.345
+
+
+def test_conversion_noise_does_not_inflate_floor(fresh_feerate_cache):
+    # A 1 sat/vB estimate must price ceil(150 x 1.0 x 1.5 x 5) = 1125, not the
+    # 1126 that raw float conversion (1.0000000000000002 sat/vB) would give.
+    main._feerate_cache = (main._btc_per_kvb_to_sat_per_vb(0.00001), time.monotonic())
+    assert main.quoted_price_sats() == 1125
+
+
+# ── Feerate fetch: success and every fallback path ──
+
+
+def test_fetch_feerate_success_calls_rpc_and_converts(fresh_feerate_cache):
+    mock_post = MagicMock(return_value=_feerate_post_mock({"feerate": 0.0001, "blocks": 6}))
+    with patch("main.PRICE_RPC_URL", PRICE_TEST_URL):
+        with patch("main.requests.post", mock_post):
+            assert main._fetch_feerate_sat_per_vb() == 10.0
+    args, kwargs = mock_post.call_args
+    assert args[0] == PRICE_TEST_URL
+    assert kwargs["json"]["method"] == "estimatesmartfee"
+    assert kwargs["json"]["params"] == [main.PRICE_CONF_TARGET]
+    assert kwargs["timeout"] == 5  # hard timeout: Tor path can hang for seconds
+
+
+def test_fetch_feerate_none_without_url_warns(caplog):
+    with patch("main.PRICE_RPC_URL", None):
+        with caplog.at_level(logging.WARNING):
+            assert main._fetch_feerate_sat_per_vb() is None
+    assert any("quoting the static price" in r.message for r in caplog.records)
+
+
+def test_fetch_feerate_timeout_falls_back_and_never_logs_credentials(caplog):
+    # The exception message deliberately echoes the URL — the log must not.
+    boom = main.requests.exceptions.ConnectionError(f"{PRICE_TEST_URL} refused")
+    with patch("main.PRICE_RPC_URL", PRICE_TEST_URL):
+        with patch("main.requests.post", side_effect=boom):
+            with caplog.at_level(logging.WARNING):
+                assert main._fetch_feerate_sat_per_vb() is None
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("estimatesmartfee failed (ConnectionError)" in m for m in messages)
+    assert all("feepass" not in m for m in messages)
+
+
+def test_fetch_feerate_no_estimate_falls_back(caplog):
+    # Fresh node: estimatesmartfee returns errors and no feerate key.
+    mock_post = MagicMock(
+        return_value=_feerate_post_mock({"errors": ["Insufficient data"], "blocks": 0})
+    )
+    with patch("main.PRICE_RPC_URL", PRICE_TEST_URL):
+        with patch("main.requests.post", mock_post):
+            with caplog.at_level(logging.WARNING):
+                assert main._fetch_feerate_sat_per_vb() is None
+    assert any("no feerate estimate" in r.message for r in caplog.records)
+
+
+# ── Cache: one fetch per TTL, failures cached too ──
+
+
+def test_feerate_cache_serves_within_ttl_and_refetches_after(fresh_feerate_cache):
+    mock_post = MagicMock(return_value=_feerate_post_mock({"feerate": 0.0001, "blocks": 6}))
+    with patch("main.PRICE_RPC_URL", PRICE_TEST_URL):
+        with patch("main.requests.post", mock_post):
+            assert main._cached_feerate_sat_per_vb() == 10.0
+            assert main._cached_feerate_sat_per_vb() == 10.0
+            assert mock_post.call_count == 1
+            # Age the entry past the TTL; the next call must refetch.
+            main._feerate_cache = (10.0, time.monotonic() - 61)
+            assert main._cached_feerate_sat_per_vb() == 10.0
+            assert mock_post.call_count == 2
+
+
+def test_feerate_cache_caches_failures_too(fresh_feerate_cache):
+    mock_post = MagicMock(side_effect=main.requests.exceptions.Timeout())
+    with patch("main.PRICE_RPC_URL", PRICE_TEST_URL):
+        with patch("main.requests.post", mock_post):
+            assert main._cached_feerate_sat_per_vb() is None
+            assert main._cached_feerate_sat_per_vb() is None
+    assert mock_post.call_count == 1  # a dead node is hit once per TTL, not per request
+
+
+# ── Quote: max(static, floor), ceil, fallback ──
+
+
+def test_quoted_price_uses_floor_when_above_static(fresh_feerate_cache):
+    # ceil(150 vB x 10 sat/vB x 1.5 x 5) = 11250 > static 21.
+    main._feerate_cache = (10.0, time.monotonic())
+    assert main.quoted_price_sats() == 11250
+
+
+def test_quoted_price_stays_static_when_floor_below(fresh_feerate_cache):
+    # ceil(150 x 0.001 x 1.5 x 5) = 2 < static 21.
+    main._feerate_cache = (0.001, time.monotonic())
+    assert main.quoted_price_sats() == 21
+
+
+def test_quoted_price_floor_rounds_up(fresh_feerate_cache):
+    # 150 x 1.234 x 1.5 x 5 = 1388.25 → ceil → 1389, never rounded down.
+    main._feerate_cache = (1.234, time.monotonic())
+    assert main.quoted_price_sats() == 1389
+
+
+def test_quoted_price_static_on_feerate_fallback(fresh_feerate_cache):
+    main._feerate_cache = (None, time.monotonic())
+    assert main.quoted_price_sats() == 21
