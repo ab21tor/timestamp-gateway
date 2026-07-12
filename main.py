@@ -1479,15 +1479,19 @@ def timestamp(body: TimestampRequest, request: Request):
             headers={"Content-Disposition": f"attachment; filename={body.digest}.ots"},
         )
 
-    # No authorization — mint an invoice and an L402 token bound to it.
-    payment_request, payment_hash = create_invoice(body.digest, GATEWAY_PRICE_SATS)
+    # No authorization — mint an invoice and an L402 token bound to it. The
+    # quote floats with the solvency floor; invoice, macaroon, and body all
+    # carry the same mint-time amount, which is what redemption later enforces.
+    quoted = quoted_price_sats()
+    payment_request, payment_hash = create_invoice(body.digest, quoted)
     expiry_ts = int(time.time()) + L402_TOKEN_EXPIRY_SECONDS
-    token = mint_l402_token(body.digest, payment_hash, GATEWAY_PRICE_SATS, expiry_ts)
+    token = mint_l402_token(body.digest, payment_hash, quoted, expiry_ts)
     raise HTTPException(
         status_code=402,
         headers={"WWW-Authenticate": f'L402 macaroon="{token}", invoice="{payment_request}"'},
         detail={
             "status": "payment_required",
+            "price_sats": quoted,
             "invoice": payment_request,
             "macaroon": token,
             "expiry": expiry_ts,

@@ -399,11 +399,12 @@ def test_402_www_authenticate_header_exact_format():
     assert body["invoice"] == FAKE_INVOICE
 
 
-def test_402_json_body_has_status_invoice_macaroon_expiry():
+def test_402_json_body_has_status_price_invoice_macaroon_expiry():
     with patch("main.requests.post", return_value=_post_mock()):
         resp = client.post("/timestamp", json={"digest": DIGEST})
     body = resp.json()["detail"]
     assert body["status"] == "payment_required"
+    assert body["price_sats"] == 21          # no feerate in test env: static quote
     assert body["invoice"] == FAKE_INVOICE
     assert isinstance(body["macaroon"], str) and body["macaroon"]
     assert isinstance(body["expiry"], int) and body["expiry"] > int(time.time())
@@ -417,6 +418,65 @@ def test_402_creates_invoice_with_digest_memo_and_configured_price():
     assert sent["memo"] == DIGEST
     assert sent["value"] == 21               # configured GATEWAY_PRICE_SATS
     assert sent["private"] is True
+
+
+def test_402_quotes_solvency_floor_when_above_static():
+    # Fee market at 10 sat/vB: floor = ceil(150 x 10 x 1.5 x 5) = 11250 > 21.
+    # Body, invoice amount, and macaroon caveat must all carry the same quote.
+    main._feerate_cache = (10.0, time.monotonic())
+    try:
+        with patch("main.requests.post", return_value=_post_mock()) as p:
+            resp = client.post("/timestamp", json={"digest": DIGEST})
+        assert resp.status_code == 402
+        body = resp.json()["detail"]
+        assert body["price_sats"] == 11250
+        assert p.call_args.kwargs["json"]["value"] == 11250
+        token = body["macaroon"]
+        assert main.verify_l402_token(token, DIGEST) == (PAYMENT_HASH, 11250)
+    finally:
+        main._feerate_cache = None
+
+
+def test_402_challenge_never_refuses_on_feerate_failure():
+    # A dead fee-estimation RPC degrades the quote to static; the challenge
+    # path itself must stay up.
+    main._feerate_cache = None
+    try:
+        with patch("main.PRICE_RPC_URL", PRICE_TEST_URL):
+            with patch(
+                "main.requests.post",
+                side_effect=[main.requests.exceptions.Timeout(), _post_mock()],
+            ):
+                resp = client.post("/timestamp", json={"digest": DIGEST})
+        assert resp.status_code == 402
+        assert resp.json()["detail"]["price_sats"] == 21
+    finally:
+        main._feerate_cache = None
+
+
+def test_floated_challenge_redeems_after_repricing_down():
+    # Full circle: challenge quoted at the 11250 floor, fee market then falls
+    # (cache now empty → static 21). The 11250 invoice paid in full must
+    # still redeem — mint-time binding end to end through the real challenge.
+    main._feerate_cache = (10.0, time.monotonic())
+    try:
+        with patch("main.requests.post", return_value=_post_mock()):
+            challenge = client.post("/timestamp", json={"digest": DIGEST})
+        token = challenge.json()["detail"]["macaroon"]
+        main._feerate_cache = (None, time.monotonic())  # repriced: static again
+        with patch("main.requests.get", return_value=_get_mock(True, DIGEST, 11250)):
+            with patch("main.stamp_digest", return_value=FAKE_OTS):
+                resp = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+        assert resp.status_code == 200
+        assert resp.content == FAKE_OTS
+        # And the same token paid only 21 (the static price) must not redeem:
+        # payment verification runs before the proof cache, so underpayment
+        # against the mint-time amount still fails even after a redemption.
+        with patch("main.requests.get", return_value=_get_mock(True, DIGEST, 21)):
+            resp = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+        assert resp.status_code == 402
+    finally:
+        main._feerate_cache = None
 
 
 def test_minted_token_verifies_and_carries_mint_time_price():
