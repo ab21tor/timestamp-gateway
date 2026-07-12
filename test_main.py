@@ -74,7 +74,8 @@ def build_macaroon(digest=DIGEST, payment_hash=PAYMENT_HASH, price=21,
     m = Macaroon(location=main.L402_LOCATION, identifier=payment_hash, key=key)
     m.add_first_party_caveat(f"digest={digest}")
     m.add_first_party_caveat(f"payment_hash={payment_hash}")
-    m.add_first_party_caveat(f"price={price}")
+    if price is not None:  # None: omit the caveat entirely (adversarial case)
+        m.add_first_party_caveat(f"price={price}")
     m.add_first_party_caveat(f"capability={capability}")
     m.add_first_party_caveat(f"expiry={expiry_ts}")
     return m.serialize()
@@ -418,23 +419,22 @@ def test_402_creates_invoice_with_digest_memo_and_configured_price():
     assert sent["private"] is True
 
 
-def test_minted_token_verifies_and_is_bound_to_digest_and_price():
+def test_minted_token_verifies_and_carries_mint_time_price():
     with patch("main.requests.post", return_value=_post_mock()):
         resp = client.post("/timestamp", json={"digest": DIGEST})
     token = resp.json()["detail"]["macaroon"]
-    # Bound to this digest: verifies and returns the payment hash.
-    assert main.verify_l402_token(token, DIGEST) == PAYMENT_HASH
-    # Bound to the configured price: fails if the gateway price changes.
+    # Bound to this digest: verifies and returns the payment hash + mint price.
+    assert main.verify_l402_token(token, DIGEST) == (PAYMENT_HASH, 21)
+    # NOT bound to the live configured price: a token minted at N validates at N
+    # forever, so repricing never strands an in-flight invoice.
     with patch("main.GATEWAY_PRICE_SATS", 99):
-        with pytest.raises(HTTPException) as ei:
-            main.verify_l402_token(token, DIGEST)
-    assert ei.value.status_code == 401
+        assert main.verify_l402_token(token, DIGEST) == (PAYMENT_HASH, 21)
 
 
 # ══ 5. L402 token verification ═════════════════════════════════════════════════
 
-def test_verify_token_valid_same_digest_returns_payment_hash():
-    assert main.verify_l402_token(valid_token(), DIGEST) == PAYMENT_HASH
+def test_verify_token_valid_same_digest_returns_payment_hash_and_price():
+    assert main.verify_l402_token(valid_token(), DIGEST) == (PAYMENT_HASH, 21)
 
 
 def test_verify_token_rejects_wrong_digest():
@@ -450,8 +450,29 @@ def test_verify_token_rejects_expired():
     assert ei.value.status_code == 401
 
 
-def test_verify_token_rejects_wrong_price():
+def test_verify_token_accepts_any_genuinely_signed_price():
+    # The price caveat is signed by the gateway at mint; verification trusts it
+    # rather than the live config. Payment settlement enforces the amount.
     token = build_macaroon(price=99)
+    assert main.verify_l402_token(token, DIGEST) == (PAYMENT_HASH, 99)
+
+
+def test_verify_token_rejects_missing_price_caveat():
+    token = build_macaroon(price=None)
+    with pytest.raises(HTTPException) as ei:
+        main.verify_l402_token(token, DIGEST)
+    assert ei.value.status_code == 401
+
+
+def test_verify_token_rejects_non_numeric_price_caveat():
+    token = build_macaroon(price="21sats")
+    with pytest.raises(HTTPException) as ei:
+        main.verify_l402_token(token, DIGEST)
+    assert ei.value.status_code == 401
+
+
+def test_verify_token_rejects_zero_price_caveat():
+    token = build_macaroon(price=0)
     with pytest.raises(HTTPException) as ei:
         main.verify_l402_token(token, DIGEST)
     assert ei.value.status_code == 401
@@ -537,22 +558,34 @@ def test_same_token_preimage_different_digest_rejected():
 
 def test_verify_payment_true_when_settled_correct_memo_and_amount():
     with patch("main.requests.get", return_value=_settled_get()):
-        assert main.verify_payment(PAYMENT_HASH, DIGEST) is True
+        assert main.verify_payment(PAYMENT_HASH, DIGEST, 21) is True
 
 
 def test_verify_payment_false_when_unsettled():
     with patch("main.requests.get", return_value=_get_mock(False, DIGEST, 21)):
-        assert main.verify_payment(PAYMENT_HASH, DIGEST) is False
+        assert main.verify_payment(PAYMENT_HASH, DIGEST, 21) is False
 
 
 def test_verify_payment_false_when_wrong_memo():
     with patch("main.requests.get", return_value=_get_mock(True, "0" * 64, 21)):
-        assert main.verify_payment(PAYMENT_HASH, DIGEST) is False
+        assert main.verify_payment(PAYMENT_HASH, DIGEST, 21) is False
 
 
 def test_verify_payment_false_when_underpaid():
     with patch("main.requests.get", return_value=_get_mock(True, DIGEST, 5)):
-        assert main.verify_payment(PAYMENT_HASH, DIGEST) is False
+        assert main.verify_payment(PAYMENT_HASH, DIGEST, 21) is False
+
+
+def test_verify_payment_enforces_mint_time_price_not_static_config():
+    # Paid 21 against a token minted at 30: insufficient even though the static
+    # price says 21 is enough.
+    with patch("main.requests.get", return_value=_get_mock(True, DIGEST, 21)):
+        assert main.verify_payment(PAYMENT_HASH, DIGEST, 30) is False
+    # Paid 900 against a token minted at 900: settles even if the static price
+    # has since moved — the binding is to the mint-time amount alone.
+    with patch("main.GATEWAY_PRICE_SATS", 21):
+        with patch("main.requests.get", return_value=_get_mock(True, DIGEST, 900)):
+            assert main.verify_payment(PAYMENT_HASH, DIGEST, 900) is True
 
 
 def test_endpoint_settled_wrong_memo_returns_402():
@@ -569,13 +602,24 @@ def test_endpoint_settled_underpaid_returns_402():
     assert resp.status_code == 402
 
 
+def test_endpoint_honors_in_flight_invoice_after_repricing():
+    # Challenge quoted 900; by redemption the live price is back at 21. The
+    # invoice paid in full at its mint-time amount must still redeem.
+    token = valid_token(price=900)
+    with patch("main.requests.get", return_value=_get_mock(True, DIGEST, 900)):
+        with patch("main.stamp_digest", return_value=FAKE_OTS):
+            resp = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+    assert resp.status_code == 200
+    assert resp.content == FAKE_OTS
+
+
 def test_verify_payment_lookup_failure_raises_generic_502_and_logs(caplog):
     m = MagicMock()
     m.raise_for_status.side_effect = Exception("boom-internal-detail")
     with patch("main.requests.get", return_value=m):
         with caplog.at_level(logging.ERROR):
             with pytest.raises(HTTPException) as ei:
-                main.verify_payment(PAYMENT_HASH, DIGEST)
+                main.verify_payment(PAYMENT_HASH, DIGEST, 21)
     assert ei.value.status_code == 502
     assert ei.value.detail == "LND error: could not verify payment"
     assert "boom-internal-detail" not in ei.value.detail

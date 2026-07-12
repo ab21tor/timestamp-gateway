@@ -815,13 +815,23 @@ def _payment_hash_satisfier(caveat_id) -> bool:
     return re.fullmatch(r"payment_hash=[0-9a-f]{64}", _caveat_text(caveat_id)) is not None
 
 
-def verify_l402_token(macaroon_b64: str, digest: str) -> str:
+def _price_satisfier(caveat_id) -> bool:
+    return re.fullmatch(r"price=[1-9][0-9]*", _caveat_text(caveat_id)) is not None
+
+
+def verify_l402_token(macaroon_b64: str, digest: str) -> tuple[str, int]:
     """Verify an L402 macaroon against the request digest and the server root key.
 
-    Checks token integrity (signature), the digest binding, the price binding, the
-    capability binding, and the expiry. On success returns the bound payment hash
-    (hex). Any invalid, expired, tampered, or wrong-digest token raises
-    HTTPException 401 — an authorization failure, not a payment one."""
+    Checks token integrity (signature), the digest binding, the capability
+    binding, and the expiry. The price is read from the macaroon's own signed
+    caveat rather than compared to the current configured price: a token minted
+    at price N validates at N forever, so repricing between challenge and
+    payment never strands an in-flight invoice. The HMAC prevents a client
+    from lowering the caveat; what the mint-time price must buy is enforced
+    against the settled invoice in verify_payment. On success returns
+    (payment_hash, mint_time_price_sats). Any invalid, expired, tampered, or
+    wrong-digest token raises HTTPException 401 — an authorization failure,
+    not a payment one."""
     try:
         m = Macaroon.deserialize(macaroon_b64)
     except Exception:
@@ -832,11 +842,15 @@ def verify_l402_token(macaroon_b64: str, digest: str) -> str:
     if not payment_hash or not re.fullmatch(r"[0-9a-f]{64}", payment_hash):
         raise HTTPException(status_code=401, detail="Invalid L402 token")
 
+    price_str = _caveat_value(m, "price")
+    if not price_str or not re.fullmatch(r"[1-9][0-9]*", price_str):
+        raise HTTPException(status_code=401, detail="Invalid L402 token")
+
     verifier = Verifier()
     verifier.satisfy_exact(f"digest={digest}")
-    verifier.satisfy_exact(f"price={GATEWAY_PRICE_SATS}")
     verifier.satisfy_exact(f"capability={L402_CAPABILITY}")
     verifier.satisfy_general(_payment_hash_satisfier)
+    verifier.satisfy_general(_price_satisfier)
     verifier.satisfy_general(_expiry_satisfier)
 
     try:
@@ -847,7 +861,7 @@ def verify_l402_token(macaroon_b64: str, digest: str) -> str:
         logging.exception("L402 verification raised unexpectedly")
         raise HTTPException(status_code=401, detail="Invalid L402 token")
 
-    return payment_hash
+    return payment_hash, int(price_str)
 
 
 def parse_l402_auth(auth: str) -> tuple[str, str] | None:
@@ -1114,16 +1128,18 @@ def stamp_digest(hex_digest: str) -> bytes:
     return buf.getvalue()
 
 
-def verify_payment(payment_hash: str, digest: str) -> bool:
+def verify_payment(payment_hash: str, digest: str, price_sats: int) -> bool:
     """Fetch the invoice for a payment hash from LND and confirm it is settled, was
-    issued for the specific digest (memo), and the paid amount meets the price. The
+    issued for the specific digest (memo), and the paid amount meets ``price_sats``
+    — the mint-time price carried in the token's signed caveat, not the current
+    configured price, so a repriced gateway still honors in-flight invoices. The
     caller must already have proven that the presented preimage hashes to this
     payment hash."""
     status = PAYMENT_BACKEND.lookup_invoice(payment_hash)
     return (
         status.settled
         and status.memo == digest
-        and status.amount_paid_sat >= GATEWAY_PRICE_SATS
+        and status.amount_paid_sat >= price_sats
     )
 
 
@@ -1261,15 +1277,15 @@ def timestamp(body: TimestampRequest, request: Request):
         macaroon_b64, preimage_hex = parsed
 
         # 1. Token must be valid and bound to THIS digest (401 otherwise).
-        payment_hash = verify_l402_token(macaroon_b64, body.digest)
+        payment_hash, mint_price_sats = verify_l402_token(macaroon_b64, body.digest)
 
         # 2. The presented preimage must hash to the token's payment hash.
         derived = hashlib.sha256(bytes.fromhex(preimage_hex)).hexdigest()
         if derived != payment_hash:
             raise HTTPException(status_code=401, detail="Preimage does not match token payment hash")
 
-        # 3. The invoice must be settled, for this digest, at the required amount.
-        if not verify_payment(payment_hash, body.digest):
+        # 3. The invoice must be settled, for this digest, at the mint-time amount.
+        if not verify_payment(payment_hash, body.digest, mint_price_sats):
             raise HTTPException(status_code=402, detail="Payment required or not settled")
 
         # 4. Return cached proof if this payment_hash was already redeemed.
