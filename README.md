@@ -151,7 +151,7 @@ OTS_BACKEND_MODE=calendar
 OTS_CALENDAR_URL=http://otsd:14788
 ```
 
-The gateway forwards paid digests to the operator's own otsd instance. otsd aggregates submissions and anchors the aggregate root in Bitcoin once per block cycle. This is the intended production mode.
+The gateway forwards paid digests to the operator's own otsd instance. otsd aggregates submissions and anchors the aggregate root in Bitcoin when commitments are pending, at most once per `--btc-min-tx-interval` (default 6 hours). This is the intended production mode.
 
 If the calendar backend fails, the gateway returns generic 502. It does not retry against public calendars.
 
@@ -244,12 +244,11 @@ otsd is the OpenTimestamps calendar server. It is the proof engine. The gateway 
 - A wallet loaded in Bitcoin Core with enough BTC to pay for periodic OP_RETURN anchoring transactions.
 - A persistent data directory for calendar state.
 
-**Transaction cost:** otsd submits approximately one Bitcoin transaction per block cycle, containing an OP_RETURN with the Merkle root of all digests aggregated since the last anchoring. Normal on-chain fees apply. A small wallet (50k–100k sats) is sufficient for extended low-volume operation.
+**Transaction cost:** otsd submits an anchoring transaction only when commitments are pending, at most one per `--btc-min-tx-interval` (default 6 hours), containing an OP_RETURN with the Merkle root of all digests aggregated since the last anchoring. Normal on-chain fees apply. A small wallet (50k–100k sats) is sufficient for extended low-volume operation.
 
-**Initial vs anchored proof:** When a digest is first submitted, otsd returns a receipt with a pending attestation pointing to the calendar URL. This is not yet Bitcoin-anchored. After Bitcoin confirms the anchoring block (~1 hour), the proof can be upgraded to a full Bitcoin-anchored `.ots` file using:
+**Initial vs anchored proof:** When a digest is first submitted, otsd returns a receipt with a pending attestation pointing to the calendar URL. This is not yet Bitcoin-anchored. Once the anchoring transaction reaches 6 confirmations — typically a few hours under the shipped defaults — the proof can be upgraded to a full Bitcoin-anchored `.ots` file via the gateway's `/upgrade` endpoint (see the status vocabulary below), or verified locally:
 
 ```bash
-ots upgrade proof.ots
 ots verify proof.ots
 ```
 
@@ -331,10 +330,9 @@ pytest -q
 
 ## Verifying a proof
 
-After receiving a `.ots` file, the proof is pending calendar confirmation. After Bitcoin confirms the anchoring block (~1 hour):
+After receiving a `.ots` file, the proof is pending calendar confirmation. Once the anchoring transaction reaches 6 confirmations — typically a few hours under the shipped defaults — POST the pending proof (base64) with its digest to the gateway's `/upgrade` endpoint, which fetches the Bitcoin anchoring from the calendar and returns the anchored proof. (Plain `ots upgrade proof.ots` contacts the calendar URL inside the attestation directly, so it works only where the operator serves that URL publicly.) Then verify locally:
 
 ```bash
-ots upgrade proof.ots   # fetches the Bitcoin anchoring from the calendar
 ots verify proof.ots    # verifies against Bitcoin
 ```
 

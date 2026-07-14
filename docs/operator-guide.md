@@ -10,18 +10,18 @@ timestamp-gateway is portable paid OpenTimestamps calendar-node software. The ga
 client / Flagpole
   → Lightning-gated gateway       (this repo — collects payment, forwards digest)
   → operator-controlled OTS calendar  (otsd — aggregates, anchors in Bitcoin)
-  → Bitcoin anchoring             (one OP_RETURN transaction per block cycle)
+  → Bitcoin anchoring             (batched OP_RETURN transactions)
   → .ots                          (returned to client as pending receipt)
 ```
 
-The gateway cannot produce Bitcoin-anchored proofs on its own. It requires a running OTS calendar backend (otsd). The initial `.ots` returned to the client is a pending receipt. After Bitcoin confirms the anchoring block (~1 hour), the proof can be upgraded using `ots upgrade`.
+The gateway cannot produce Bitcoin-anchored proofs on its own. It requires a running OTS calendar backend (otsd). The initial `.ots` returned to the client is a pending receipt. Once the anchoring transaction reaches 6 confirmations — typically a few hours end to end under the shipped defaults (see "Proof lifecycle") — the proof can be upgraded to a Bitcoin-anchored one.
 
 ---
 
 ## Prerequisites
 
 - Docker Engine 24+ and Docker Compose v2.17+ (BuildKit; needed for the calendar profile's named build context)
-- A running phoenixd instance (the live payment backend) — or an LND node with REST API and invoice macaroon if using the LND test-payer / alternative backend
+- A running phoenixd instance (the live payment backend — see "Payment backend (phoenixd)" below for how to get one) — or an LND node with REST API and invoice macaroon if using the LND test-payer / alternative backend
 - Inbound Lightning liquidity on the payment backend
 - An OTS calendar backend (otsd) — bundled via `--profile calendar` or external
 - A Bitcoin Core node reachable by otsd, with a wallet loaded and funded
@@ -55,7 +55,7 @@ OTS_CALENDAR_URL=http://otsd:14788      # bundled compose profile
 # OTS_CALENDAR_URL=http://127.0.0.1:14788  # systemd path (host-networked otsd)
 ```
 
-The gateway forwards paid digests to the operator's own otsd instance. otsd aggregates submissions and anchors the Merkle root in Bitcoin once per block cycle. This is the only production mode.
+The gateway forwards paid digests to the operator's own otsd instance. otsd aggregates submissions and anchors the Merkle root in Bitcoin when commitments are pending, at most once per `--btc-min-tx-interval` (default 6 hours). This is the only production mode.
 
 **There is no silent fallback.** If the calendar backend fails, the gateway returns 502. It does not retry against the public OpenTimestamps aggregators.
 
@@ -76,7 +76,7 @@ The gateway forwards paid digests to the four public OpenTimestamps aggregators 
 
 ### What otsd is
 
-otsd is the OpenTimestamps calendar server. It accepts raw digest bytes over HTTP (`POST /digest`), aggregates them into a Merkle tree, and submits one Bitcoin transaction per block cycle containing an OP_RETURN output with the Merkle root. The resulting proof links any submitted digest to the block height of that Bitcoin transaction.
+otsd is the OpenTimestamps calendar server. It accepts raw digest bytes over HTTP (`POST /digest`), aggregates them into a Merkle tree, and — when commitments are pending — submits a Bitcoin transaction containing an OP_RETURN output with the Merkle root, at most one per `--btc-min-tx-interval` (default 6 hours). The resulting proof links any submitted digest to the block height of that Bitcoin transaction.
 
 ### What otsd needs
 
@@ -87,9 +87,9 @@ otsd is the OpenTimestamps calendar server. It accepts raw digest bytes over HTT
 
 ### Bitcoin transaction cost
 
-otsd submits approximately one Bitcoin transaction per block cycle (~10 minutes under normal conditions). Each transaction contains a single OP_RETURN output. Transaction cost depends on prevailing on-chain fee rates. At normal fee rates (5–20 sat/vbyte), a single anchoring transaction costs 500–2000 sats. A wallet of 100,000 sats sustains several months of uninterrupted operation at typical rates.
+otsd submits an anchoring transaction only when commitments are pending, and at most one per `--btc-min-tx-interval` (default 6 hours) — at most 4 per day, and none while idle. Each transaction contains a single OP_RETURN output. Cost depends on prevailing on-chain fee rates: at 5–20 sat/vbyte a single anchoring transaction costs roughly 500–2000 sats, and the fork fee-bumps a stuck transaction, which can raise the per-anchor cost. At the default cadence a 100,000-sat wallet covers weeks of continuous anchoring, and far longer at low volume where most intervals see no pending commitments.
 
-otsd will stop anchoring if the wallet is empty. Proofs submitted during a gap are eventually anchored when the wallet is refunded, but the gap delays proof finalisation.
+otsd will stop anchoring if the wallet is empty. Proofs submitted during a gap are eventually anchored when the wallet is refilled, but the gap delays proof finalisation.
 
 ### Bitcoin RPC configuration
 
@@ -169,8 +169,8 @@ Do not expose otsd on a public port. It has no authentication. Access should be 
 ### Proof lifecycle
 
 1. **Immediate:** The gateway submits the digest to otsd and receives a receipt with a `PendingAttestation` pointing to the calendar URL. This is the `.ots` file returned to the client. It is not yet Bitcoin-anchored.
-2. **~1 hour:** otsd submits a Bitcoin transaction anchoring the Merkle root for this aggregation window. The transaction is confirmed in a block.
-3. **Upgrade:** The client runs `ots upgrade proof.ots` to fetch the Bitcoin anchoring from the calendar. The proof is now a full Bitcoin-anchored `.ots` file.
+2. **Within hours:** otsd submits a Bitcoin transaction anchoring the Merkle root of the pending digests — at most one transaction per `--btc-min-tx-interval` (default 6 hours) — then waits for `--btc-min-confirmations` (default 6) before writing the Bitcoin attestation. Best case is about an hour; the default worst case is the 6-hour interval plus confirmations.
+3. **Upgrade:** The client POSTs the pending proof (base64) with its digest to the gateway's `/upgrade` endpoint, which fetches the Bitcoin anchoring from the operator's calendar and returns the anchored proof (see the README's `/verify` and `/upgrade` status vocabulary). Plain `ots upgrade proof.ots` reaches the calendar URL inside the pending attestation directly, so it works only if the operator serves that URL publicly — with the calendar private, as this guide recommends, the gateway endpoint is the client path.
 4. **Verify:** The client runs `ots verify proof.ots` to verify the proof against the Bitcoin blockchain independently.
 
 The `.ots` file returned immediately by the gateway is a valid receipt. It is not incomplete or broken. It simply has not been finalized yet because Bitcoin blocks take time.
@@ -209,6 +209,17 @@ Two environment variables (see `.env.example`):
 Under Docker Compose the database lives on the persistent `gateway_data` volume, mounted at `/var/lib/timestamp-gateway`. This volume must survive container recreation — otherwise a settled-but-unstamped obligation could be lost. SQLite runs in WAL mode, so the database is accompanied by `-wal` and `-shm` sidecar files; back up all three together (see the backup notes below).
 
 > Backup: on the live VPS, `ops/backup-live-state.sh` and `ops/BACKUP-RECOVERY.md` cover the operational backup set and now include the obligations database and its `-wal`/`-shm` sidecars. If you run the gateway outside that layout, ensure your own backups capture `OBLIGATIONS_DB_PATH` and its two sidecar files while the gateway is stopped (or use SQLite's `.backup`/`VACUUM INTO` for a consistent hot copy).
+
+---
+
+## Payment backend (phoenixd)
+
+phoenixd is the live payment backend: a self-custodial Lightning node daemon by ACINQ. The gateway needs exactly two values from it — `PHOENIXD_URL` (its HTTP API) and `PHOENIXD_HTTP_PASSWORD`.
+
+- **Install:** download a release from https://github.com/ACINQ/phoenixd (or build from source) and run `phoenixd`. Upstream docs: https://phoenix.acinq.co/server. On first run it creates its data directory (`~/.phoenix`) including the wallet seed — back the seed up; it is the money.
+- **API password:** first run also generates `http-password` in `~/.phoenix/phoenix.conf`. That value is `PHOENIXD_HTTP_PASSWORD`.
+- **URL:** the HTTP API listens on `127.0.0.1:9740` by default. For a host-run gateway `PHOENIXD_URL=http://127.0.0.1:9740`; from the gateway container use `http://host.docker.internal:9740`. phoenixd stays outside the compose stack — it is the wallet holding your funds.
+- **Inbound liquidity:** a fresh phoenixd has no channels and cannot receive. It opens (and later extends) a channel from ACINQ automatically when a received payment needs one, at a fee deducted from that payment — see `ops/OPERATOR-NOTES.md` and the "Inbound liquidity" section below.
 
 ---
 
@@ -282,11 +293,17 @@ Store the output somewhere safe. To restore, copy the key back into the volume b
 
 ## Inbound liquidity
 
-To receive Lightning payments, the payment backend (Phoenixd by default) must have inbound capacity — channels where the remote peer has sats to push toward you. Phoenixd opens a channel automatically on first payment, at a fee — see `ops/OPERATOR-NOTES.md`.
+To receive Lightning payments, the payment backend must have inbound capacity — channel balance the remote peer can push toward you.
 
 **This is a Lightning network problem, not a gateway or OTS problem.** The gateway issues valid invoices regardless; routing failures happen before the invoice is ever paid.
 
-### Options
+### phoenixd (live default backend)
+
+phoenixd manages its own liquidity. It opens — and later extends — a channel from ACINQ automatically when a received payment needs one, at a fee deducted from that payment (see `ops/OPERATOR-NOTES.md`). There is nothing to pre-provision: the first real payment simply nets less. Third-party channel-open services do not apply — phoenixd peers only with ACINQ.
+
+### LND (test payer / alternative backend only)
+
+Inbound capacity must be arranged manually:
 
 **Boltz submarine swap** (no new channel needed):
 
@@ -299,13 +316,13 @@ Boltz pays the invoice over Lightning (creating inbound capacity on that channel
 
 **Receive a channel from a well-connected node:**
 
-Services like ACINQ, Bitrefill Thor, or Amboss Magma open a channel to your node for a fee. Gives you immediate inbound capacity.
+Services like Bitrefill Thor or Amboss Magma open a channel to your node for a fee. Gives you immediate inbound capacity.
 
 **Lightning Terminal (Loop In):**
 
 Submarine swap via Terminal to move sats from your local channel balance to the remote side, creating inbound capacity.
 
-### Tor-only routing difficulty
+### Tor-only routing difficulty (self-hosted LND-style nodes)
 
 If your Lightning node is Tor-only, nodes that have disabled Tor routing cannot route payments to you. This reduces the routing path count significantly.
 
@@ -346,6 +363,8 @@ timestamp.yourdomain.com {
     reverse_proxy localhost:8000
 }
 ```
+
+When the gateway sits behind a reverse proxy, also set `GATEWAY_BEHIND_PROXY=true` in `.env`: the per-IP rate limiter then reads the client address from the `X-Forwarded-For` entry your proxy appends. Without it every client shares the proxy's address — and one rate-limit bucket. The header is never trusted unless this is set, because clients can forge it.
 
 ---
 
@@ -393,6 +412,24 @@ sudo systemctl enable --now wallet-balance-check.timer
 - `stale` — the status file is older than `WALLET_STATUS_MAX_AGE_SECONDS` (default 3600 = 2× the timer interval): the timer itself died. Degrades to 503.
 - `absent` — no status file: the alarm is not installed. Reported but does **not** degrade health (operators without the calendar profile don't need it).
 
+### Alarm delivery (ntfy)
+
+`ops/health-monitor.sh` (run by `ops/systemd/health-monitor.{service,timer}`, every 5 minutes) polls `/health` and pushes state changes through `ops/notify.sh` to the ntfy topic URL in `NTFY_URL` — set it in `.env` and treat it as a secret (anyone holding the URL can read and post alarms). Unset, `notify.sh` logs and exits non-zero: an unconfigured alarm channel is a failure, not silence. A persisting problem re-alerts after `HEALTH_REALERT_SECONDS` (default 14400); recovery to `ok` pushes once.
+
+The monitor polls `HEALTH_URL` (default `http://127.0.0.1:8000/health`), and that URL must match where the gateway actually listens **as seen from the monitor's host**. The compose default publishes `127.0.0.1:8000` on the Docker host, so the default matches out of the box. If you change the gateway's publish address or port — or bind it elsewhere on bare metal — change `HEALTH_URL` with it, or the monitor alarms against a dead URL while the gateway is fine.
+
+Install:
+
+```bash
+sudo cp ops/systemd/health-monitor.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now health-monitor.timer
+```
+
+### Other /health fields
+
+`/health` also reports `proofs` — written by `ops/upgrade-all-proofs.sh` (run by `timestamp-gateway-upgrade-proofs.timer`), the sweep that upgrades pending proofs against the local calendar and flags attestation mismatches — and `backup`, written by `ops/backup-live-state.sh` (run by `backup-live-state.timer`; see `ops/BACKUP-RECOVERY.md`). Both follow the wallet pattern: `absent` (not installed) is reported without degrading health; failure and stale states degrade to 503.
+
 ---
 
 ## Stopping and removing
@@ -436,6 +473,14 @@ cd opentimestamps-server && pip install -r requirements.txt
 ./otsd --calendar /path/to/calendar-data
 ```
 
+First run only: the calendar identity must exist or otsd exits at startup — the same three files as under compose, in the calendar data directory (replace both example values with your own):
+
+```bash
+echo "https://calendar.example.com/" > /path/to/calendar-data/uri
+head -c 32 /dev/urandom > /path/to/calendar-data/hmac-key
+echo "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4" > /path/to/calendar-data/donation_addr
+```
+
 For Tor exposure without Docker, add to `/etc/tor/torrc`:
 
 ```
@@ -464,5 +509,5 @@ sudo cat /var/lib/tor/timestamp_gateway/hostname
 - [ ] Tor hidden service private key is backed up.
 - [ ] `docker compose logs -f otsd` shows otsd starting without errors.
 - [ ] A test payment has been completed end-to-end: invoice issued → paid → `.ots` returned.
-- [ ] `ots upgrade` and `ots verify` work on a test proof after ~1 hour.
+- [ ] A test proof upgrades (gateway `/upgrade`, or the ops sweep) and `ots verify` passes once anchored — typically a few hours under the default 6-hour transaction interval.
 - [ ] I understand that Lightning graph exposure (clearnet Lightning node IP) is permanent once published.
