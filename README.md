@@ -56,7 +56,7 @@ Public calendar mode (`OTS_BACKEND_MODE=public`) is retained as a compatibility/
 
 ## What you need
 
-- Docker and Docker Compose
+- Docker Engine 24+ with Docker Compose v2.17+ (BuildKit)
 - A running phoenixd instance (the live payment backend) — or an LND node with REST API and invoice macaroon if using the LND test-payer / alternative backend
 - An OpenTimestamps calendar backend (otsd) — bundled in the Compose stack or external
 - A Bitcoin Core node reachable by otsd, with a wallet loaded and funded for anchoring transactions
@@ -67,12 +67,23 @@ Public calendar mode (`OTS_BACKEND_MODE=public`) is retained as a compatibility/
 ## Quick start
 
 ```bash
+# Two repos: the gateway, and the calendar code it mounts into otsd.
 git clone https://github.com/ab21tor/timestamp-gateway
+git clone -b calendar-ops https://github.com/ab21tor/opentimestamps-server
 cd timestamp-gateway
 cp .env.example .env
-# Edit .env — set PHOENIXD_URL and PHOENIXD_HTTP_PASSWORD (live default
-# backend; LND_* only if using the lnd test payer / alternative backend),
-# and BITCOIN_RPC_SERVICE_URL for otsd
+# Edit .env — set PHOENIXD_HTTP_PASSWORD (live default backend; LND_* only
+# if using the lnd test payer / alternative backend) and
+# BITCOIN_RPC_SERVICE_URL for otsd (see .env.example for the three shapes).
+
+# First run only: give the calendar its identity — the URI callers will see
+# in pending attestations, the HMAC key, and a donation address its web page
+# displays (any Bitcoin address of yours). otsd refuses to start without them.
+docker compose --profile calendar run --rm otsd sh -c \
+  'echo "https://<your-calendar-hostname>/" > /calendar/uri \
+   && head -c 32 /dev/urandom > /calendar/hmac-key \
+   && echo "<your-bitcoin-address>" > /calendar/donation_addr'
+
 docker compose --profile calendar up -d
 ```
 
@@ -111,14 +122,14 @@ curl -X POST http://localhost:8000/timestamp \
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `PAYMENT_BACKEND_TYPE` | No | `phoenixd` | `phoenixd` (live backend) or `lnd` (test payer / alternative only) |
-| `PHOENIXD_URL` | No | `http://127.0.0.1:9740` | phoenixd HTTP API endpoint (live default backend) |
+| `PHOENIXD_URL` | No | `http://127.0.0.1:9740` | phoenixd HTTP API endpoint (live default backend); from the compose stack use `http://host.docker.internal:9740` |
 | `PHOENIXD_HTTP_PASSWORD` | No | — | phoenixd HTTP API password (`http-password` in `phoenix.conf`) |
 | `LND_HOST` | When `lnd` | — | Hostname, IP, or `.onion` address of your LND REST API (test payer / alternative) |
 | `LND_PORT` | When `lnd` | — | LND REST port, typically `8080` (test payer / alternative) |
 | `LND_MACAROON_HEX` | When `lnd` | — | Hex-encoded invoice macaroon (test payer / alternative) |
 | `GATEWAY_PRICE_SATS` | Yes | — | Satoshis charged per timestamp |
 | `OTS_BACKEND_MODE` | Yes | — | `calendar` (real mode) or `public` (compatibility/testing only) |
-| `OTS_CALENDAR_URL` | When `calendar` | — | URL of the operator-controlled otsd instance (e.g. `http://127.0.0.1:14788`) |
+| `OTS_CALENDAR_URL` | When `calendar` | — | URL of the operator-controlled otsd instance (`http://otsd:14788` for the bundled compose profile; `http://127.0.0.1:14788` on the systemd path) |
 | `TOR_PROXY` | No | — | SOCKS5h proxy for LND connections (lnd test payer / alternative only). Required if `LND_HOST` is `.onion`. |
 | `LND_TLS_VERIFY` | No | `false` | Set `true` only for CA-signed LND TLS certs (lnd test payer / alternative only). |
 
@@ -136,7 +147,7 @@ curl -X POST http://localhost:8000/timestamp \
 
 ```
 OTS_BACKEND_MODE=calendar
-OTS_CALENDAR_URL=http://127.0.0.1:14788
+OTS_CALENDAR_URL=http://otsd:14788
 ```
 
 The gateway forwards paid digests to the operator's own otsd instance. otsd aggregates submissions and anchors the aggregate root in Bitcoin once per block cycle. This is the intended production mode.
@@ -166,7 +177,7 @@ Gateway exposed as a Tor hidden service. LND (test payer / alternative backend) 
 LND_HOST=yourlnd.onion
 TOR_PROXY=tor:9050
 OTS_BACKEND_MODE=calendar
-OTS_CALENDAR_URL=http://127.0.0.1:14788
+OTS_CALENDAR_URL=http://otsd:14788
 ```
 
 ```bash
@@ -184,14 +195,15 @@ Gateway onion. LND (test payer / alternative backend) clearnet or hybrid. otsd o
 LND_HOST=192.168.1.x
 TOR_PROXY=              # blank — direct LND connection
 OTS_BACKEND_MODE=calendar
-OTS_CALENDAR_URL=http://127.0.0.1:14788
+OTS_CALENDAR_URL=http://otsd:14788
 ```
 
 **Trade-off:** A clearnet Lightning node links its pubkey to an IP on the Lightning graph permanently.
 
 ### Clearnet
 
-Uncomment in `docker-compose.yml`:
+The gateway publishes `127.0.0.1:8000` by default (reachable from the Docker
+host only). For clearnet, edit the mapping in `docker-compose.yml`:
 
 ```yaml
 ports:
@@ -215,8 +227,7 @@ Paste the output as `LND_MACAROON_HEX`.
 
 | LND location | `LND_HOST` value | `TOR_PROXY` |
 |---|---|---|
-| Same Docker host (Linux) | Host LAN IP | blank |
-| Same Docker host (Mac/Windows) | `host.docker.internal` | blank |
+| Same Docker host | `host.docker.internal` | blank |
 | Remote LAN machine | LAN IP | blank |
 | Onion address | `.onion` address | `tor:9050` |
 | Umbrel | `umbrel.local` | blank |
@@ -246,10 +257,12 @@ The initial `.ots` file returned by the gateway is a valid pending receipt, not 
 **Bitcoin RPC config** (set in gitignored `.env` only — full URL including credentials):
 
 ```
-BITCOIN_RPC_SERVICE_URL=http://rpcuser:rpcpassword@127.0.0.1:18332/wallet/otsd-hot
+BITCOIN_RPC_SERVICE_URL=http://rpcuser:rpcpassword@host.docker.internal:18332/wallet/otsd-hot
 ```
 
-**otsd is not publicly exposed.** It runs with host networking and binds loopback only. The gateway reaches it at `http://127.0.0.1:14788`. Clients have no direct access to otsd; they interact only with the gateway.
+For an onion-only node, the bundled `--profile onion-rpc` bridge forwards `rpc-bridge:18332` to your node over Tor; the systemd path uses a host socat bridge instead (see the operator guide for both).
+
+**otsd is not publicly exposed.** It publishes no port; the gateway reaches it at `http://otsd:14788` on the compose network. Clients have no direct access to otsd; they interact only with the gateway.
 
 The calendar code is the `opentimestamps-server` fork:
 `https://github.com/ab21tor/opentimestamps-server` (branch `calendar-ops`, fork of `opentimestamps/opentimestamps-server`).

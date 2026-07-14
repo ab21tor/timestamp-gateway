@@ -20,7 +20,7 @@ The gateway cannot produce Bitcoin-anchored proofs on its own. It requires a run
 
 ## Prerequisites
 
-- Docker Engine 24+ and Docker Compose v2
+- Docker Engine 24+ and Docker Compose v2.17+ (BuildKit; needed for the calendar profile's named build context)
 - A running phoenixd instance (the live payment backend) — or an LND node with REST API and invoice macaroon if using the LND test-payer / alternative backend
 - Inbound Lightning liquidity on the payment backend
 - An OTS calendar backend (otsd) — bundled via `--profile calendar` or external
@@ -32,15 +32,16 @@ You do not need a VPS. You do not need a static IP. You do not need to expose an
 
 ## First-run checklist
 
-1. Clone the repository and copy `.env.example` to `.env`.
-2. Set `PAYMENT_BACKEND_TYPE=phoenixd` (the default) and fill in `PHOENIXD_URL` and `PHOENIXD_HTTP_PASSWORD`. Only fill in `LND_*` if using the LND test-payer / alternative backend.
+1. Clone this repository, clone the calendar fork next to it (`git clone -b calendar-ops https://github.com/ab21tor/opentimestamps-server`), and copy `.env.example` to `.env`.
+2. Set `PAYMENT_BACKEND_TYPE=phoenixd` (the default) and fill in `PHOENIXD_URL` (`http://host.docker.internal:9740` for a phoenixd on this host) and `PHOENIXD_HTTP_PASSWORD`. Only fill in `LND_*` if using the LND test-payer / alternative backend.
 3. (lnd test-payer backend only) Set `TOR_PROXY=tor:9050` if `LND_HOST` is a `.onion` address; leave blank otherwise.
-4. Set `OTS_BACKEND_MODE=calendar` and `OTS_CALENDAR_URL=http://127.0.0.1:14788`.
-5. Set `BITCOIN_RPC_SERVICE_URL` for otsd (full URL including credentials, in `.env` only).
-6. Start the full stack: `docker compose --profile calendar up -d`.
-7. Check logs: `docker compose logs -f`.
-8. Retrieve onion address: `docker compose exec tor cat /var/lib/tor/timestamp_gateway/hostname`.
-9. Test the endpoint with `curl` (see README quick start).
+4. Set `OTS_BACKEND_MODE=calendar` and `OTS_CALENDAR_URL=http://otsd:14788`.
+5. Set `BITCOIN_RPC_SERVICE_URL` for otsd (full URL including credentials, in `.env` only — see `.env.example` for the LAN, onion-bridge, and systemd shapes).
+6. First run only: initialise the calendar identity (see "Deploying the calendar" below).
+7. Start the full stack: `docker compose --profile calendar up -d`.
+8. Check logs: `docker compose logs -f`.
+9. Retrieve onion address: `docker compose exec tor cat /var/lib/tor/timestamp_gateway/hostname`.
+10. Test the endpoint with `curl` (see README quick start).
 
 ---
 
@@ -50,7 +51,8 @@ You do not need a VPS. You do not need a static IP. You do not need to expose an
 
 ```
 OTS_BACKEND_MODE=calendar
-OTS_CALENDAR_URL=http://127.0.0.1:14788
+OTS_CALENDAR_URL=http://otsd:14788      # bundled compose profile
+# OTS_CALENDAR_URL=http://127.0.0.1:14788  # systemd path (host-networked otsd)
 ```
 
 The gateway forwards paid digests to the operator's own otsd instance. otsd aggregates submissions and anchors the Merkle root in Bitcoin once per block cycle. This is the only production mode.
@@ -81,7 +83,7 @@ otsd is the OpenTimestamps calendar server. It accepts raw digest bytes over HTT
 - A Bitcoin Core node reachable via JSON-RPC.
 - A wallet loaded in Bitcoin Core (use `bitcoin-cli loadwallet` or `createwallet`).
 - Enough BTC in the wallet to pay for OP_RETURN transaction fees. A small wallet (50k–100k sats) is sufficient for extended low-volume operation. otsd does not spend to the wallet — it only draws from it to fund transactions.
-- A persistent data directory for the calendar state (`/data` in the container).
+- A persistent data directory for the calendar state (`/calendar` in the container — the `otsd_calendar` volume under compose).
 
 ### Bitcoin transaction cost
 
@@ -91,13 +93,18 @@ otsd will stop anchoring if the wallet is empty. Proofs submitted during a gap a
 
 ### Bitcoin RPC configuration
 
-otsd reads a single env var — the full RPC URL including credentials. Set it in gitignored `.env` ONLY (never in tracked files, never on a command line):
+otsd reads a single env var — the full RPC URL including credentials. Set it in gitignored `.env` ONLY (never in tracked files, never on a command line). Three shapes, by where your node is:
 
 ```
+# Node reachable from this host (LAN, or bitcoind on the Docker host):
+BITCOIN_RPC_SERVICE_URL=http://rpcuser:rpcpassword@host.docker.internal:18332/wallet/otsd-hot
+# Onion-only node, bundled Tor bridge (--profile onion-rpc; set BITCOIN_RPC_ONION):
+BITCOIN_RPC_SERVICE_URL=http://rpcuser:rpcpassword@rpc-bridge:18332/wallet/otsd-hot
+# systemd path (host socat bridge, deploy/socat-bitcoin-rpc.service.example):
 BITCOIN_RPC_SERVICE_URL=http://rpcuser:rpcpassword@127.0.0.1:18332/wallet/otsd-hot
 ```
 
-With the socat/Tor bridge (see "Deploying the calendar" below), `127.0.0.1:18332` forwards to your Bitcoin node's RPC hidden service. For a directly reachable node, point the URL at its RPC address instead and ensure it is in `rpcbind`/`rpcallowip` in bitcoin.conf.
+For a directly reachable node, ensure the otsd host is allowed by `rpcbind`/`rpcallowip` in bitcoin.conf.
 
 **Pruned nodes:** A pruned Bitcoin Core node is acceptable for otsd's transaction submission role. otsd does not need to download the full chain — it only submits transactions and reads the current tip.
 
@@ -107,32 +114,45 @@ With the socat/Tor bridge (see "Deploying the calendar" below), `127.0.0.1:18332
 docker compose --profile calendar up -d
 ```
 
-This starts `gateway`, `tor`, and `otsd`. otsd is not publicly exposed — it runs with host networking and binds loopback only. The gateway reaches it at `http://127.0.0.1:14788` (set `OTS_CALENDAR_URL=http://127.0.0.1:14788`).
+This starts `gateway`, `tor`, and `otsd`. otsd is not publicly exposed — it publishes no port; the gateway reaches it at `http://otsd:14788` on the compose network (set `OTS_CALENDAR_URL=http://otsd:14788`).
 
 ### Deploying the calendar (otsd)
 
-The otsd image ships Python + dependencies only. The calendar **code** is the `opentimestamps-server` fork — `https://github.com/ab21tor/opentimestamps-server`, branch `calendar-ops` — mounted at `/app` at runtime, so the build context is the fork checkout, not this repo.
+The otsd image ships Python + dependencies only. The calendar **code** is the `opentimestamps-server` fork — `https://github.com/ab21tor/opentimestamps-server`, branch `calendar-ops` — mounted at `/app` at runtime, so code-only updates deploy with a pull + restart, no rebuild. The fork checkout is passed to the build as a named context; compose does this automatically from `OTSD_FORK_PATH`.
 
 ```bash
-# 1. Clone the opentimestamps-server fork (the calendar code).
-git clone -b calendar-ops https://github.com/ab21tor/opentimestamps-server /home/gateway/opentimestamps-server
+# 1. Clone the opentimestamps-server fork (the calendar code) next to this
+#    repo — or anywhere, if you set OTSD_FORK_PATH in .env to match.
+git clone -b calendar-ops https://github.com/ab21tor/opentimestamps-server ../opentimestamps-server
 
-# 2. Build the otsd image with the fork checkout as the build context.
-docker build -t otsd-local -f otsd/Dockerfile /home/gateway/opentimestamps-server
+# 2. Set BITCOIN_RPC_SERVICE_URL in .env (gitignored). See .env.example for
+#    the three shapes; for an onion-only node also set BITCOIN_RPC_ONION and
+#    start with --profile onion-rpc in step 4 (the bundled Tor bridge), or
+#    install the host socat bridge instead (systemd path):
+#      sudo cp deploy/socat-bitcoin-rpc.service.example /etc/systemd/system/socat-bitcoin-rpc.service
+#      sudo sed -i 's/YOUR_NODE_ONION/<your-node-onion>/' /etc/systemd/system/socat-bitcoin-rpc.service
+#      sudo systemctl daemon-reload && sudo systemctl enable --now socat-bitcoin-rpc
 
-# 3. Install the socat -> Bitcoin RPC bridge (provides 127.0.0.1:18332).
-sudo cp deploy/socat-bitcoin-rpc.service.example /etc/systemd/system/socat-bitcoin-rpc.service
-sudo sed -i 's/YOUR_NODE_ONION/<your-node-onion>/' /etc/systemd/system/socat-bitcoin-rpc.service
-sudo systemctl daemon-reload && sudo systemctl enable --now socat-bitcoin-rpc
+# 3. First run only: give the calendar its identity — the URI callers will
+#    see in pending attestations, the HMAC key, and a donation address its
+#    web page displays (any Bitcoin address of yours). otsd exits at
+#    startup until all three exist.
+docker compose --profile calendar run --rm otsd sh -c \
+  'echo "https://<your-calendar-hostname>/" > /calendar/uri \
+   && head -c 32 /dev/urandom > /calendar/hmac-key \
+   && echo "<your-bitcoin-address>" > /calendar/donation_addr'
 
-# 4. Set BITCOIN_RPC_SERVICE_URL and OTSD_FORK_PATH in .env (gitignored).
-#    See .env.example.
+# 4. Start it (add --profile onion-rpc if using the bundled bridge).
+docker compose --profile calendar up -d --build
 
-# 5. Start it.
-docker compose --profile calendar up -d
+# 5. Verify: expect a Bitcoin RPC connection and no auth errors.
+docker compose logs otsd
+```
 
-# 6. Verify: expect a Bitcoin RPC connection and no auth errors.
-docker logs otsd
+Building the image by hand (outside compose) uses the same named context:
+
+```bash
+docker build -t otsd-local --build-context fork=../opentimestamps-server otsd/
 ```
 
 ### Pointing to an external otsd
@@ -303,13 +323,13 @@ docker compose --profile calendar build
 docker compose --profile calendar up -d
 ```
 
-The `tor_keys` volume and `otsd_data` volume are preserved across updates. Your `.onion` address and calendar state are retained.
+The `tor_keys` and `otsd_calendar` volumes are preserved across updates. Your `.onion` address and calendar state are retained. otsd code updates need no image rebuild — pull the fork checkout and restart the service.
 
 ---
 
 ## Clearnet exposure (optional)
 
-To expose the gateway on clearnet in addition to Tor, edit `docker-compose.yml` and uncomment:
+The gateway publishes `127.0.0.1:8000` by default — reachable from the Docker host (curl, the ops scripts, the health monitor) but not from the network. To expose it on clearnet in addition to Tor, edit the mapping in `docker-compose.yml`:
 
 ```yaml
 services:
@@ -361,6 +381,8 @@ sudo cp ops/systemd/wallet-balance-check.{service,timer} /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now wallet-balance-check.timer
 ```
+
+**Under Docker Compose**, the timers run on the host but `/health` runs in the gateway container — they must share the status directory. Set `GATEWAY_STATE_DIR=/var/lib/timestamp-gateway` in `.env` (and create that directory) so the container mounts the same path the timers write to. Without it the gateway uses a private named volume and reports these checks as `absent`.
 
 **What `/health` reports** in its `wallet` field:
 
