@@ -1,0 +1,27 @@
+# timestamp-gateway under systemd (bare-metal path).
+# Copy to /etc/systemd/system/timestamp-gateway.service, adjust the paths
+# and the bind address for your host, then:
+# systemctl daemon-reload && systemctl enable --now timestamp-gateway
+#
+# Paths below assume the repo at /home/gateway/timestamp-gateway with a
+# .venv created per the operator guide ("Running without Docker").
+
+[Unit]
+Description=timestamp-gateway Lightning-gated OpenTimestamps gateway
+# phoenixd (the default payment backend) needs no unit dependency.
+# Operators running the lnd test-payer may add lnd.service here.
+After=network.target
+
+[Service]
+User=gateway
+WorkingDirectory=/home/gateway/timestamp-gateway
+EnvironmentFile=/home/gateway/timestamp-gateway/.env
+# Set --host to where the gateway should actually listen; 127.0.0.1 suits a
+# local Tor hidden service or reverse proxy. The health monitor's HEALTH_URL
+# must match this bind — see the operator guide's Monitoring section.
+ExecStart=/home/gateway/timestamp-gateway/.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

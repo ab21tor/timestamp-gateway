@@ -104,6 +104,8 @@ BITCOIN_RPC_SERVICE_URL=http://rpcuser:rpcpassword@rpc-bridge:18332/wallet/otsd-
 BITCOIN_RPC_SERVICE_URL=http://rpcuser:rpcpassword@127.0.0.1:18332/wallet/otsd-hot
 ```
 
+On the systemd path otsd reads this URL from `/etc/systemd/system/otsd.env` instead of the repo `.env` — see `deploy/otsd.service.example`.
+
 For a directly reachable node, ensure the otsd host is allowed by `rpcbind`/`rpcallowip` in bitcoin.conf.
 
 **Pruned nodes:** A pruned Bitcoin Core node is acceptable for otsd's transaction submission role. otsd does not need to download the full chain — it only submits transactions and reads the current tip.
@@ -155,6 +157,8 @@ Building the image by hand (outside compose) uses the same named context:
 ```bash
 docker build -t otsd-local --build-context fork=../opentimestamps-server otsd/
 ```
+
+On the systemd path that image runs as a unit: `deploy/otsd.service.example` wraps it in `docker run --network host` with the fork checkout mounted at `/app`, so code-only updates deploy with a pull + restart.
 
 ### Pointing to an external otsd
 
@@ -456,6 +460,8 @@ cp .env.example .env   # fill in all vars
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
+To run this under systemd, start from `deploy/timestamp-gateway.service.example` — adjust its paths and bind address, and keep the monitor's `HEALTH_URL` matching the bind (see Monitoring).
+
 **Create the durable state directory first.** The gateway writes its obligation log (and the `PAUSED` switch) under `OBLIGATIONS_DB_PATH` — default `/var/lib/timestamp-gateway`. On a bare-metal/systemd deployment the service runs as an unprivileged user (e.g. `gateway`) that cannot create a directory under `/var/lib`, and the process **fails loud at startup** if the path is unwritable. Create it once, owned by the service user, before first start:
 
 ```bash
@@ -480,6 +486,8 @@ echo "https://calendar.example.com/" > /path/to/calendar-data/uri
 head -c 32 /dev/urandom > /path/to/calendar-data/hmac-key
 echo "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4" > /path/to/calendar-data/donation_addr
 ```
+
+To run the otsd container under systemd instead of bare Python, see `deploy/otsd.service.example`.
 
 For Tor exposure without Docker, add to `/etc/tor/torrc`:
 

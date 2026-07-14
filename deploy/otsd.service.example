@@ -1,0 +1,42 @@
+# otsd calendar under systemd (bare-metal path): runs the otsd container via
+# docker run. Copy to /etc/systemd/system/otsd.service, adjust the paths,
+# then: systemctl daemon-reload && systemctl enable --now otsd
+#
+# Companion file /etc/systemd/system/otsd.env (root-owned, mode 600) holds
+# BITCOIN_RPC_SERVICE_URL — the full RPC URL including credentials. It lives
+# in that file only, never on a command line and never in tracked files.
+#
+# The otsd-local image is built per otsd/Dockerfile with the
+# opentimestamps-server fork checkout as the named "fork" build context
+# (exact command in the Dockerfile header). The same checkout is mounted at
+# /app, so code-only updates deploy with a git pull + systemctl restart otsd
+# — no rebuild.
+#
+# First run only: /var/lib/otsd/calendar needs the three identity files
+# (uri, hmac-key, donation_addr) or otsd exits at startup — see the operator
+# guide, "Deploying the calendar (otsd)". --btc-conf-target 12 matches the
+# deployed fee policy.
+
+[Unit]
+Description=otsd OpenTimestamps calendar (docker)
+# Drop socat-bitcoin-rpc.service from both lines if your Bitcoin node is
+# reachable without the Tor bridge.
+After=docker.service socat-bitcoin-rpc.service
+Requires=docker.service socat-bitcoin-rpc.service
+
+[Service]
+# The service user needs docker group membership; or run as root and omit this line.
+User=gateway
+EnvironmentFile=/etc/systemd/system/otsd.env
+ExecStartPre=-/usr/bin/docker rm -f otsd
+ExecStart=/usr/bin/docker run --name otsd --network host \
+  -v /var/lib/otsd/calendar:/calendar \
+  -v /home/gateway/opentimestamps-server:/app \
+  -w /app \
+  -e BITCOIN_RPC_SERVICE_URL=${BITCOIN_RPC_SERVICE_URL} \
+  otsd-local python3 otsd --calendar /calendar --btc-conf-target 12 -v
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

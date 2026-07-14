@@ -260,7 +260,7 @@ The initial `.ots` file returned by the gateway is a valid pending receipt, not 
 BITCOIN_RPC_SERVICE_URL=http://rpcuser:rpcpassword@host.docker.internal:18332/wallet/otsd-hot
 ```
 
-For an onion-only node, the bundled `--profile onion-rpc` bridge forwards `rpc-bridge:18332` to your node over Tor; the systemd path uses a host socat bridge instead (see the operator guide for both).
+For an onion-only node, the bundled `--profile onion-rpc` bridge forwards `rpc-bridge:18332` to your node over Tor; the systemd path uses a host socat bridge instead (see the operator guide for both). Example systemd units — gateway, otsd container, socat bridge — are in `deploy/`.
 
 **otsd is not publicly exposed.** It publishes no port; the gateway reaches it at `http://otsd:14788` on the compose network. Clients have no direct access to otsd; they interact only with the gateway.
 
