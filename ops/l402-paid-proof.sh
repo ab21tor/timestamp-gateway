@@ -2,7 +2,7 @@
 set -euo pipefail
 umask 077
 
-GATEWAY_URL="${GATEWAY_URL:-http://100.98.161.106:8000}"
+GATEWAY_URL="${GATEWAY_URL:?set GATEWAY_URL to the gateway URL reachable from this host (e.g. your tailnet URL)}"
 ENDPOINT="${ENDPOINT:-/timestamp}"
 ARTIFACTS="${ARTIFACTS:-/home/gateway/timestamp-gateway-live-artifacts}"
 OTS="${OTS:-/home/gateway/timestamp-gateway/.venv/bin/ots}"
