@@ -1,3 +1,20 @@
+# Scope: this file is the Docker-only deployment path — gateway + tor, plus
+# the operator-controlled OTS calendar (otsd) via --profile calendar and an
+# optional Tor bridge to an onion Bitcoin node via --profile onion-rpc.
+#
+# It does NOT run:
+#   - phoenixd — the Lightning wallet holding your funds is external by
+#     design; point PHOENIXD_URL at it (http://host.docker.internal:9740
+#     when it runs on this host).
+#   - a Bitcoin Core node — otsd needs BITCOIN_RPC_SERVICE_URL reachable
+#     from its container (LAN node, host node via host.docker.internal, or
+#     an onion node via --profile onion-rpc).
+#   - the ops/ alarm timers (systemd) — without them /health reports
+#     wallet/proofs/backup as "absent": honest, not degraded. To run them
+#     on this host alongside compose, see GATEWAY_STATE_DIR below.
+#
+# The reference production deployment runs the gateway under systemd
+# instead; both paths are documented in docs/operator-guide.md.
 services:
   gateway:
     build: .
@@ -7,15 +24,25 @@ services:
       - tor
     networks:
       - ts_net
-    # Persistent state: the durable obligation log (obligations.db) and the
-    # operator PAUSED switch live under /var/lib/timestamp-gateway. This volume
-    # must survive container recreation or a settled-but-unstamped obligation
-    # could be lost. See OBLIGATIONS_DB_PATH in .env.example.
+    # host.docker.internal = this Docker host, on Linux and macOS alike —
+    # how the container reaches host services (phoenixd).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Persistent state: the durable obligation log (obligations.db), the
+    # operator PAUSED switch and the ops status files live under
+    # /var/lib/timestamp-gateway. This mount must survive container
+    # recreation or a settled-but-unstamped obligation could be lost.
+    # Default: named volume. Operators running the ops/ systemd timers on
+    # this host set GATEWAY_STATE_DIR=/var/lib/timestamp-gateway in .env so
+    # the status files the timers write are the ones /health reads.
     volumes:
-      - gateway_data:/var/lib/timestamp-gateway
-    # Uncomment to expose the gateway on clearnet in addition to the onion address:
-    # ports:
-    #   - "8000:8000"
+      - ${GATEWAY_STATE_DIR:-gateway_data}:/var/lib/timestamp-gateway
+    # Loopback-only publish: reachable from this host (curl, ops scripts,
+    # the health monitor) but not from the network — Tor is the public
+    # front door. For clearnet exposure change to "8000:8000" and see
+    # "Clearnet exposure" in the operator guide.
+    ports:
+      - "127.0.0.1:8000:8000"
 
   tor:
     build: ./tor
@@ -28,37 +55,73 @@ services:
     # ports:
     #   - "127.0.0.1:9050:9050"
 
-  # ── OTS calendar backend (otsd) ────────────────────────────────────────────
-  # The operator-controlled OpenTimestamps calendar server.
-  # This is the proof engine. The gateway is the paid front door to this service.
+  # ── OTS calendar backend (otsd) ── docker compose --profile calendar up -d
+  # The operator-controlled OpenTimestamps calendar server. This is the
+  # proof engine; the gateway is the paid front door to this service.
+  # Or point OTS_CALENDAR_URL at an external otsd instance and omit this
+  # profile.
   #
-  # Usage:
-  #   docker compose --profile calendar up -d
+  # The image is Python + dependencies ONLY. The calendar CODE is the
+  # opentimestamps-server fork (https://github.com/ab21tor/opentimestamps-server,
+  # branch calendar-ops) mounted at /app: clone it and set OTSD_FORK_PATH in
+  # .env (default: a checkout next to this repo).
   #
-  # Or point OTS_CALENDAR_URL at an external otsd instance and omit this service.
+  # First run only — otsd refuses to start until its calendar identity
+  # exists: the URI callers see in pending attestations, the HMAC key, and
+  # a donation address its web page displays (any Bitcoin address of
+  # yours). See "Deploying the calendar" in the operator guide:
+  #   docker compose --profile calendar run --rm otsd sh -c \
+  #     'echo "https://<your-calendar-hostname>/" > /calendar/uri \
+  #      && head -c 32 /dev/urandom > /calendar/hmac-key \
+  #      && echo "<your-bitcoin-address>" > /calendar/donation_addr'
   #
-  # otsd requires access to a Bitcoin Core node (RPC) and a wallet with funds
-  # to pay for on-chain anchoring transactions. See docs/operator-guide.md.
-  #
-  # otsd is NOT publicly exposed. On the calendar profile it runs with host
-  # networking and binds loopback only; the gateway reaches it on
-  # 127.0.0.1:14788.
+  # otsd is NOT publicly exposed: no published port; the gateway reaches it
+  # at http://otsd:14788 on the compose network (OTS_CALENDAR_URL).
   otsd:
-    build: ./otsd
+    build:
+      context: ./otsd
+      additional_contexts:
+        fork: ${OTSD_FORK_PATH:-../opentimestamps-server}
     profiles: ["calendar"]
     restart: unless-stopped
-    # Host networking: otsd reaches Bitcoin RPC via the socat/Tor bridge
-    # on 127.0.0.1:18332; the gateway reaches otsd on 127.0.0.1:14788
-    # (set OTS_CALENDAR_URL=http://127.0.0.1:14788 when using this profile).
-    network_mode: host
+    networks:
+      - ts_net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # --rpc-address 0.0.0.0: reachable on the compose network (unpublished);
+    # the image default binds localhost for non-compose runs.
+    command: ["python", "/app/otsd", "--rpc-address", "0.0.0.0", "--calendar", "/calendar", "--btc-conf-target", "12", "-v"]
     volumes:
-      - /var/lib/otsd/calendar:/calendar
-      # Calendar code: the opentimestamps-server fork checkout (ab21tor/opentimestamps-server, branch calendar-ops).
-      - ${OTSD_FORK_PATH:-./opentimestamps-server}:/app
+      # Calendar state — the proof namespace. Destroying it strands every
+      # pending proof this calendar has issued. Default: named volume; set
+      # OTSD_CALENDAR_DIR to a host path to manage it yourself.
+      - ${OTSD_CALENDAR_DIR:-otsd_calendar}:/calendar
+      # Calendar code: the fork checkout (see above).
+      - ${OTSD_FORK_PATH:-../opentimestamps-server}:/app
     environment:
       # Full RPC URL including credentials. Set in gitignored .env ONLY.
-      # Compose fails loud if unset.
-      - BITCOIN_RPC_SERVICE_URL=${BITCOIN_RPC_SERVICE_URL:?set in .env}
+      # Unset -> otsd exits at startup with a clear error. Runtime
+      # fail-loud, deliberately not ${VAR:?}: parse-time errors here would
+      # break every compose command for operators not using this profile.
+      - BITCOIN_RPC_SERVICE_URL=${BITCOIN_RPC_SERVICE_URL:-}
+
+  # ── socat bridge to an onion Bitcoin node ── --profile onion-rpc ──
+  # For operators whose Bitcoin node exposes RPC as a Tor onion service
+  # (Start9 and self-hosted-over-Tor setups — the reference deployment's
+  # own shape). Forwards rpc-bridge:18332 on the compose network to your
+  # node's onion RPC through the tor service. Set BITCOIN_RPC_ONION in .env
+  # and point BITCOIN_RPC_SERVICE_URL at
+  # http://<user>:<password>@rpc-bridge:18332/... — the systemd-path
+  # equivalent is deploy/socat-bitcoin-rpc.service.example.
+  rpc-bridge:
+    build: ./tor
+    profiles: ["onion-rpc"]
+    restart: unless-stopped
+    depends_on:
+      - tor
+    networks:
+      - ts_net
+    command: ["socat", "TCP-LISTEN:18332,fork,reuseaddr", "SOCKS4A:tor:${BITCOIN_RPC_ONION:-}:8332,socksport=9050"]
 
 networks:
   ts_net:
@@ -67,3 +130,4 @@ networks:
 volumes:
   tor_keys:
   gateway_data:
+  otsd_calendar:
