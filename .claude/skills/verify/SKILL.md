@@ -42,6 +42,27 @@ floor (stubs.py: ThreadingHTTPServer x3 on 18401-18403, modes switched via small
 3. Restart the gateway between pricing-floor scenarios — the feerate cache TTL is 60s
    and there is no way to flush it from outside.
 
+## Compose stack (instead of bare uvicorn)
+
+The full compose path is testable the same way (proven 2026-07-14, colima on this
+Mac): stubs on host 0.0.0.0 ports, containers reach them via
+`host.docker.internal` (works under colima). Copy the working tree to a dir
+under $HOME (colima only mounts $HOME; never touch the repo's real .env), write
+a test .env there (`OTS_CALENDAR_URL=http://otsd:14788`,
+`OTSD_FORK_PATH=/Users/operator/opentimestamps-server`, stub URLs via
+host.docker.internal), then `docker compose --profile calendar up -d --build`.
+
+- Calendar first-run identity is THREE files or otsd exits: `/calendar/uri`,
+  `/calendar/hmac-key`, `/calendar/donation_addr` (must parse as a real
+  Bitcoin address — genesis coinbase `1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa` works).
+- Real otsd idles cleanly against a bitcoind stub that answers
+  getblockcount→0, getbestblockhash/getblockhash→mainnet genesis hash,
+  getblock→genesis raw hex, listunspent→[] ("No pending commitments, no tx
+  needed") — so the redeem leg serves a real otsd-minted .ots.
+- The 402 body nests under FastAPI's `detail` key: `r.json()["detail"]["price_sats"]`.
+- Parse regression: `docker compose --env-file /dev/null --profile calendar
+  --profile onion-rpc config --quiet` must succeed with zero variables set.
+
 ## Gotchas
 
 - Underpaid redemption is checked BEFORE the proof cache, so re-probing the same
