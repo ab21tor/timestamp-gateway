@@ -72,6 +72,8 @@ class GatewayConfig:
     price_bump_reserve: float
     price_margin: float
     price_conf_target: int
+    rate_limit_per_minute: int
+    gateway_behind_proxy: bool
 
 
 def _parse_config() -> GatewayConfig:
@@ -295,6 +297,32 @@ def _parse_config() -> GatewayConfig:
             f"1-1008, got {price_conf_target}"
         )
 
+    # ── Invoice-mint rate limit ───────────────────────────────────────────────
+    # Per-IP token bucket on the unauthenticated 402 path. Every anonymous
+    # request makes phoenixd sign AND durably store an invoice, so minting is
+    # the one request whose backend cost is not bounded by payment. 0 disables.
+    try:
+        rate_limit_per_minute = int(os.getenv("RATE_LIMIT_PER_MINUTE", "10"))
+    except ValueError:
+        raise RuntimeError("RATE_LIMIT_PER_MINUTE must be an integer")
+    if rate_limit_per_minute < 0:
+        raise RuntimeError(
+            f"RATE_LIMIT_PER_MINUTE must be >= 0 (0 disables the limit), "
+            f"got {rate_limit_per_minute}"
+        )
+
+    # Whether a reverse proxy the OPERATOR controls sits in front of the
+    # gateway. Only then is X-Forwarded-For consulted for the client address —
+    # the header is client-forgeable and must never be trusted by default.
+    # Strict parse: a typo silently treated as false would bucket every client
+    # under the proxy's address and rate-limit them collectively.
+    behind_proxy_raw = os.getenv("GATEWAY_BEHIND_PROXY", "false").lower()
+    if behind_proxy_raw not in ("true", "false"):
+        raise RuntimeError(
+            f"GATEWAY_BEHIND_PROXY must be 'true' or 'false', got {behind_proxy_raw!r}"
+        )
+    gateway_behind_proxy = behind_proxy_raw == "true"
+
     return GatewayConfig(
         lnd_host=os.getenv("LND_HOST"),
         lnd_port=os.getenv("LND_PORT"),
@@ -328,6 +356,8 @@ def _parse_config() -> GatewayConfig:
         price_bump_reserve=price_bump_reserve,
         price_margin=price_margin,
         price_conf_target=price_conf_target,
+        rate_limit_per_minute=rate_limit_per_minute,
+        gateway_behind_proxy=gateway_behind_proxy,
     )
 
 
@@ -368,6 +398,8 @@ PRICE_TX_VSIZE_ESTIMATE = _CONFIG.price_tx_vsize_estimate
 PRICE_BUMP_RESERVE = _CONFIG.price_bump_reserve
 PRICE_MARGIN = _CONFIG.price_margin
 PRICE_CONF_TARGET = _CONFIG.price_conf_target
+RATE_LIMIT_PER_MINUTE = _CONFIG.rate_limit_per_minute
+GATEWAY_BEHIND_PROXY = _CONFIG.gateway_behind_proxy
 
 if not LND_TLS_VERIFY:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -394,6 +426,56 @@ def _proof_cache_put(payment_hash: str, ots_bytes: bytes) -> None:
     if payment_hash not in _proof_cache and len(_proof_cache) >= _PROOF_CACHE_MAX:
         del _proof_cache[next(iter(_proof_cache))]
     _proof_cache[payment_hash] = ots_bytes
+
+
+# ── Invoice-mint rate limiter ─────────────────────────────────────────────────
+# Per-IP token bucket guarding the unauthenticated mint path. Every anonymous
+# POST /timestamp makes phoenixd sign a bolt11 and persist an invoice row in its
+# own database, so minting is the one request whose backend cost is not bounded
+# by payment. Same bounded module-dict shape as _proof_cache: FIFO eviction (by
+# first sighting) at _RATE_BUCKETS_MAX. Evicting a bucket refills it — a spammer
+# spread across that many addresses is beyond what a per-IP limit can bound
+# anyway. Lock-free like _proof_cache: a concurrent get/set race can only
+# under-count a request or two, never corrupt the dict.
+_RATE_BUCKETS_MAX = 10_000
+# ip -> (tokens remaining, time.monotonic() at the last refill)
+_rate_buckets: dict[str, tuple[float, float]] = {}
+
+
+def _client_ip(request: Request) -> str:
+    """The address the rate limiter buckets on. The direct peer address, unless
+    the operator has declared a reverse proxy in front (GATEWAY_BEHIND_PROXY=true)
+    — then the rightmost X-Forwarded-For entry, the one appended by the
+    operator's own proxy. Leftmost entries are client-supplied and never used."""
+    if GATEWAY_BEHIND_PROXY:
+        forwarded = request.headers.get("X-Forwarded-For", "")
+        if forwarded:
+            return forwarded.split(",")[-1].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _rate_limit_retry_after(ip: str) -> int | None:
+    """Take one token from ip's bucket. Returns None when the request is
+    allowed, else the whole seconds (>= 1) until a token accrues. Capacity and
+    refill rate are both RATE_LIMIT_PER_MINUTE, so a full bucket is one
+    minute's allowance of burst. A denied request consumes nothing."""
+    if RATE_LIMIT_PER_MINUTE <= 0:
+        return None
+    now = time.monotonic()
+    tokens, last_refill = _rate_buckets.get(ip, (float(RATE_LIMIT_PER_MINUTE), now))
+    tokens = min(
+        float(RATE_LIMIT_PER_MINUTE),
+        tokens + (now - last_refill) * RATE_LIMIT_PER_MINUTE / 60,
+    )
+    if tokens >= 1:
+        tokens -= 1
+        retry_after = None
+    else:
+        retry_after = math.ceil((1 - tokens) * 60 / RATE_LIMIT_PER_MINUTE)
+    if ip not in _rate_buckets and len(_rate_buckets) >= _RATE_BUCKETS_MAX:
+        del _rate_buckets[next(iter(_rate_buckets))]
+    _rate_buckets[ip] = (tokens, now)
+    return retry_after
 
 
 # ── Durable obligation log ────────────────────────────────────────────────────
@@ -1482,6 +1564,15 @@ def timestamp(body: TimestampRequest, request: Request):
     # No authorization — mint an invoice and an L402 token bound to it. The
     # quote floats with the solvency floor; invoice, macaroon, and body all
     # carry the same mint-time amount, which is what redemption later enforces.
+    # Rate-limit before touching any backend: a 429 costs neither phoenixd nor
+    # the fee-estimation RPC anything.
+    retry_after = _rate_limit_retry_after(_client_ip(request))
+    if retry_after is not None:
+        raise HTTPException(
+            status_code=429,
+            headers={"Retry-After": str(retry_after)},
+            detail={"status": "rate_limited", "retry_after_seconds": retry_after},
+        )
     quoted = quoted_price_sats()
     payment_request, payment_hash = create_invoice(body.digest, quoted)
     expiry_ts = int(time.time()) + L402_TOKEN_EXPIRY_SECONDS

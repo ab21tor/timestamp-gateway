@@ -33,6 +33,8 @@ os.environ["L402_SECRET_HEX"] = "ab" * 32          # stable, known signing key
 os.environ["L402_TOKEN_EXPIRY_SECONDS"] = "3600"
 os.environ["OTS_SUBMIT_BACKOFF_SECONDS"] = "0"     # keep retry tests fast
 os.environ["OBLIGATIONS_DB_PATH"] = ":memory:"     # overridden per-test by fixture below
+os.environ["RATE_LIMIT_PER_MINUTE"] = "0"          # whole suite shares one client IP;
+                                                   # rate-limit tests patch the global
 
 import main  # noqa: E402
 from fastapi import HTTPException  # noqa: E402
@@ -142,6 +144,13 @@ def clear_proof_cache():
     main._proof_cache.clear()
     yield
     main._proof_cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def clear_rate_buckets():
+    main._rate_buckets.clear()
+    yield
+    main._rate_buckets.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -1966,3 +1975,161 @@ def test_quoted_price_floor_rounds_up(fresh_feerate_cache):
 def test_quoted_price_static_on_feerate_fallback(fresh_feerate_cache):
     main._feerate_cache = (None, time.monotonic())
     assert main.quoted_price_sats() == 21
+
+
+# ══ 16. Invoice-mint rate limit ══════════════════════════════════════════════════
+
+def test_rate_limit_non_integer_fails():
+    with patch.dict(os.environ, {"RATE_LIMIT_PER_MINUTE": "many"}):
+        with pytest.raises(RuntimeError, match="RATE_LIMIT_PER_MINUTE must be an integer"):
+            main._parse_config()
+
+
+def test_rate_limit_negative_fails():
+    with patch.dict(os.environ, {"RATE_LIMIT_PER_MINUTE": "-1"}):
+        with pytest.raises(RuntimeError, match="RATE_LIMIT_PER_MINUTE must be >= 0"):
+            main._parse_config()
+
+
+def test_rate_limit_zero_valid_and_default_ten():
+    with patch.dict(os.environ, {"RATE_LIMIT_PER_MINUTE": "0"}):
+        assert main._parse_config().rate_limit_per_minute == 0
+    with patch.dict(os.environ):
+        del os.environ["RATE_LIMIT_PER_MINUTE"]
+        assert main._parse_config().rate_limit_per_minute == 10
+
+
+def test_behind_proxy_invalid_value_fails():
+    with patch.dict(os.environ, {"GATEWAY_BEHIND_PROXY": "yes"}):
+        with pytest.raises(RuntimeError,
+                           match="GATEWAY_BEHIND_PROXY must be 'true' or 'false'"):
+            main._parse_config()
+
+
+def test_behind_proxy_defaults_false_and_parses_true():
+    with patch.dict(os.environ):
+        os.environ.pop("GATEWAY_BEHIND_PROXY", None)
+        assert main._parse_config().gateway_behind_proxy is False
+    with patch.dict(os.environ, {"GATEWAY_BEHIND_PROXY": "TRUE"}):
+        assert main._parse_config().gateway_behind_proxy is True
+
+
+def test_rate_limit_allows_burst_then_denies(monkeypatch):
+    monkeypatch.setattr(main, "RATE_LIMIT_PER_MINUTE", 3)
+    assert [main._rate_limit_retry_after("ip-a") for _ in range(3)] == [None] * 3
+    retry = main._rate_limit_retry_after("ip-a")
+    assert isinstance(retry, int) and retry >= 1
+
+
+def test_rate_limit_refills_over_time(monkeypatch):
+    monkeypatch.setattr(main, "RATE_LIMIT_PER_MINUTE", 2)
+    # Empty bucket last refilled 30s ago: 30 x 2/60 = 1 token has accrued.
+    main._rate_buckets["ip-b"] = (0.0, time.monotonic() - 30)
+    assert main._rate_limit_retry_after("ip-b") is None      # spends the accrued token
+    assert main._rate_limit_retry_after("ip-b") is not None  # bucket empty again
+
+
+def test_rate_limit_denied_request_consumes_nothing(monkeypatch):
+    monkeypatch.setattr(main, "RATE_LIMIT_PER_MINUTE", 1)
+    main._rate_buckets["ip-c"] = (0.5, time.monotonic())
+    assert main._rate_limit_retry_after("ip-c") is not None
+    tokens, _ = main._rate_buckets["ip-c"]
+    assert tokens >= 0.5  # refill only adds; the denial spent nothing
+
+
+def test_rate_limit_retry_after_reflects_refill_rate(monkeypatch):
+    monkeypatch.setattr(main, "RATE_LIMIT_PER_MINUTE", 60)  # one token per second
+    main._rate_buckets["ip-d"] = (0.0, time.monotonic())
+    assert main._rate_limit_retry_after("ip-d") == 1
+
+
+def test_rate_buckets_bounded_fifo(monkeypatch):
+    """_rate_buckets never exceeds _RATE_BUCKETS_MAX: the earliest-seen IP is
+    evicted to admit a new one — the same bounded-module-dict property as
+    _proof_cache, so a spammer rotating source addresses cannot grow memory."""
+    monkeypatch.setattr(main, "_RATE_BUCKETS_MAX", 3)
+    monkeypatch.setattr(main, "RATE_LIMIT_PER_MINUTE", 10)
+    for i in range(5):
+        main._rate_limit_retry_after(f"ip-{i}")
+        assert len(main._rate_buckets) <= 3
+    assert set(main._rate_buckets) == {"ip-2", "ip-3", "ip-4"}
+    main._rate_limit_retry_after("ip-3")  # existing key: no growth, no eviction
+    assert set(main._rate_buckets) == {"ip-2", "ip-3", "ip-4"}
+
+
+def test_mint_rate_limited_returns_429_and_spares_phoenixd(monkeypatch):
+    monkeypatch.setattr(main, "RATE_LIMIT_PER_MINUTE", 1)
+    with patch("main.requests.post", return_value=_post_mock()) as p:
+        first = client.post("/timestamp", json={"digest": DIGEST})
+        second = client.post("/timestamp", json={"digest": DIGEST})
+    assert first.status_code == 402
+    assert second.status_code == 429
+    detail = second.json()["detail"]
+    assert detail["status"] == "rate_limited"
+    assert isinstance(detail["retry_after_seconds"], int)
+    assert detail["retry_after_seconds"] >= 1
+    assert second.headers["retry-after"] == str(detail["retry_after_seconds"])
+    p.assert_called_once()  # the 429 never reached invoice creation
+
+
+def test_rate_limit_does_not_gate_paid_redemption(monkeypatch):
+    """An exhausted mint bucket must not block redemption: the paid path's cost
+    is bounded by payment, and a client who already paid is owed the proof."""
+    monkeypatch.setattr(main, "RATE_LIMIT_PER_MINUTE", 1)
+    with patch("main.requests.post", return_value=_post_mock()):
+        assert client.post("/timestamp", json={"digest": DIGEST}).status_code == 402
+        assert client.post("/timestamp", json={"digest": DIGEST}).status_code == 429
+    token = valid_token()
+    with patch("main.requests.get", return_value=_settled_get()):
+        with patch("main.stamp_digest", return_value=FAKE_OTS):
+            resp = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+    assert resp.status_code == 200 and resp.content == FAKE_OTS
+
+
+def test_spoofed_forwarded_for_ignored_by_default(monkeypatch):
+    """Without GATEWAY_BEHIND_PROXY, X-Forwarded-For must not segregate buckets —
+    otherwise any spammer escapes the limit by rotating the header."""
+    monkeypatch.setattr(main, "RATE_LIMIT_PER_MINUTE", 1)
+    with patch("main.requests.post", return_value=_post_mock()):
+        r1 = client.post("/timestamp", json={"digest": DIGEST},
+                         headers={"X-Forwarded-For": "1.1.1.1"})
+        r2 = client.post("/timestamp", json={"digest": DIGEST},
+                         headers={"X-Forwarded-For": "2.2.2.2"})
+    assert r1.status_code == 402
+    assert r2.status_code == 429  # same direct peer, same bucket
+
+
+def test_forwarded_for_rightmost_used_when_behind_proxy(monkeypatch):
+    """Behind a declared proxy the bucket key is the RIGHTMOST X-Forwarded-For
+    entry (the one the operator's proxy appended); leftmost entries stay
+    client-supplied and must not segregate buckets."""
+    monkeypatch.setattr(main, "RATE_LIMIT_PER_MINUTE", 1)
+    monkeypatch.setattr(main, "GATEWAY_BEHIND_PROXY", True)
+    with patch("main.requests.post", return_value=_post_mock()):
+        r1 = client.post("/timestamp", json={"digest": DIGEST},
+                         headers={"X-Forwarded-For": "1.1.1.1, 9.9.9.9"})
+        r2 = client.post("/timestamp", json={"digest": DIGEST},
+                         headers={"X-Forwarded-For": "2.2.2.2, 9.9.9.9"})
+        r3 = client.post("/timestamp", json={"digest": DIGEST},
+                         headers={"X-Forwarded-For": "1.1.1.1, 8.8.8.8"})
+    assert r1.status_code == 402
+    assert r2.status_code == 429  # spoofed leftmost, same real client 9.9.9.9
+    assert r3.status_code == 402  # genuinely different client
+
+
+def test_behind_proxy_without_header_falls_back_to_peer(monkeypatch):
+    monkeypatch.setattr(main, "RATE_LIMIT_PER_MINUTE", 1)
+    monkeypatch.setattr(main, "GATEWAY_BEHIND_PROXY", True)
+    with patch("main.requests.post", return_value=_post_mock()):
+        r1 = client.post("/timestamp", json={"digest": DIGEST})
+        r2 = client.post("/timestamp", json={"digest": DIGEST})
+    assert r1.status_code == 402 and r2.status_code == 429
+
+
+def test_rate_limit_zero_disables(monkeypatch):
+    monkeypatch.setattr(main, "RATE_LIMIT_PER_MINUTE", 0)
+    with patch("main.requests.post", return_value=_post_mock()):
+        codes = [client.post("/timestamp", json={"digest": DIGEST}).status_code
+                 for _ in range(15)]
+    assert codes == [402] * 15
+    assert main._rate_buckets == {}  # disabled limiter keeps no state
