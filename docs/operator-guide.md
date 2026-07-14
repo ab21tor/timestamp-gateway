@@ -130,17 +130,18 @@ git clone -b calendar-ops https://github.com/ab21tor/opentimestamps-server ../op
 #    start with --profile onion-rpc in step 4 (the bundled Tor bridge), or
 #    install the host socat bridge instead (systemd path):
 #      sudo cp deploy/socat-bitcoin-rpc.service.example /etc/systemd/system/socat-bitcoin-rpc.service
-#      sudo sed -i 's/YOUR_NODE_ONION/<your-node-onion>/' /etc/systemd/system/socat-bitcoin-rpc.service
+#      sudo sed -i 's/YOUR_NODE_ONION/replace-with-your-node-onion.onion/' /etc/systemd/system/socat-bitcoin-rpc.service
 #      sudo systemctl daemon-reload && sudo systemctl enable --now socat-bitcoin-rpc
 
 # 3. First run only: give the calendar its identity — the URI callers will
 #    see in pending attestations, the HMAC key, and a donation address its
-#    web page displays (any Bitcoin address of yours). otsd exits at
-#    startup until all three exist.
+#    web page displays. otsd exits at startup until all three exist.
+#    Replace both example values with your own (the address below is the
+#    BIP173 example, not yours).
 docker compose --profile calendar run --rm otsd sh -c \
-  'echo "https://<your-calendar-hostname>/" > /calendar/uri \
+  'echo "https://calendar.example.com/" > /calendar/uri \
    && head -c 32 /dev/urandom > /calendar/hmac-key \
-   && echo "<your-bitcoin-address>" > /calendar/donation_addr'
+   && echo "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4" > /calendar/donation_addr'
 
 # 4. Start it (add --profile onion-rpc if using the bundled bridge).
 docker compose --profile calendar up -d --build

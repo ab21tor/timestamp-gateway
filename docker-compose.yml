@@ -68,12 +68,12 @@ services:
   #
   # First run only — otsd refuses to start until its calendar identity
   # exists: the URI callers see in pending attestations, the HMAC key, and
-  # a donation address its web page displays (any Bitcoin address of
-  # yours). See "Deploying the calendar" in the operator guide:
+  # a donation address its web page displays. Replace both example values
+  # with your own; see "Deploying the calendar" in the operator guide:
   #   docker compose --profile calendar run --rm otsd sh -c \
-  #     'echo "https://<your-calendar-hostname>/" > /calendar/uri \
+  #     'echo "https://calendar.example.com/" > /calendar/uri \
   #      && head -c 32 /dev/urandom > /calendar/hmac-key \
-  #      && echo "<your-bitcoin-address>" > /calendar/donation_addr'
+  #      && echo "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4" > /calendar/donation_addr'
   #
   # otsd is NOT publicly exposed: no published port; the gateway reaches it
   # at http://otsd:14788 on the compose network (OTS_CALENDAR_URL).

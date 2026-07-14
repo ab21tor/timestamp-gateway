@@ -78,11 +78,12 @@ cp .env.example .env
 
 # First run only: give the calendar its identity — the URI callers will see
 # in pending attestations, the HMAC key, and a donation address its web page
-# displays (any Bitcoin address of yours). otsd refuses to start without them.
+# displays. otsd refuses to start without them. Replace both example values
+# with your own (the address below is the BIP173 example, not yours).
 docker compose --profile calendar run --rm otsd sh -c \
-  'echo "https://<your-calendar-hostname>/" > /calendar/uri \
+  'echo "https://calendar.example.com/" > /calendar/uri \
    && head -c 32 /dev/urandom > /calendar/hmac-key \
-   && echo "<your-bitcoin-address>" > /calendar/donation_addr'
+   && echo "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4" > /calendar/donation_addr'
 
 docker compose --profile calendar up -d
 ```
