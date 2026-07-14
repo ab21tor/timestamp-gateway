@@ -5,7 +5,7 @@ timestamp-gateway is portable paid OpenTimestamps calendar-node software. It acc
 This is not a hosted service. It is software for running a Lightning-gated OpenTimestamps calendar node.
 
 ```
-client / Flagpole
+client
   → Lightning-gated gateway       (this repo)
   → operator-controlled OTS calendar  (otsd — the proof engine)
   → Bitcoin anchoring

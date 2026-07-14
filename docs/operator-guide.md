@@ -7,7 +7,7 @@ timestamp-gateway is portable paid OpenTimestamps calendar-node software. The ga
 ## Architecture
 
 ```
-client / Flagpole
+client
   → Lightning-gated gateway       (this repo — collects payment, forwards digest)
   → operator-controlled OTS calendar  (otsd — aggregates, anchors in Bitcoin)
   → Bitcoin anchoring             (batched OP_RETURN transactions)
