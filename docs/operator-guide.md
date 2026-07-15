@@ -33,15 +33,16 @@ You do not need a VPS. You do not need a static IP. You do not need to expose an
 ## First-run checklist
 
 1. Clone this repository, clone the calendar fork next to it (`git clone -b calendar-ops https://github.com/ab21tor/opentimestamps-server`), and copy `.env.example` to `.env`.
-2. Set `PAYMENT_BACKEND_TYPE=phoenixd` (the default) and fill in `PHOENIXD_URL` (`http://host.docker.internal:9740` for a phoenixd on this host) and `PHOENIXD_HTTP_PASSWORD_LIMITED`. Only fill in `LND_*` if using the LND test-payer / alternative backend.
-3. (lnd test-payer backend only) Set `TOR_PROXY=tor:9050` if `LND_HOST` is a `.onion` address; leave blank otherwise.
-4. Set `OTS_BACKEND_MODE=calendar` and `OTS_CALENDAR_URL=http://otsd:14788`.
-5. Set `BITCOIN_RPC_SERVICE_URL` for otsd (full URL including credentials, in `.env` only — see `.env.example` for the LAN, onion-bridge, and systemd shapes).
-6. First run only: initialise the calendar identity (see "Deploying the calendar" below).
-7. Start the full stack: `docker compose --profile calendar up -d`.
-8. Check logs: `docker compose logs -f`.
-9. Retrieve onion address: `docker compose exec tor cat /var/lib/tor/timestamp_gateway/hostname`.
-10. Test the endpoint with `curl` (see README quick start).
+2. Generate the L402 signing key and set `L402_SECRET_HEX` in `.env`: `python3 -c 'import secrets; print(secrets.token_hex(32))'`. The gateway refuses to start without it.
+3. Set `PAYMENT_BACKEND_TYPE=phoenixd` (the default) and fill in `PHOENIXD_URL` (`http://host.docker.internal:9740` for a phoenixd on this host) and `PHOENIXD_HTTP_PASSWORD_LIMITED`. Only fill in `LND_*` if using the LND test-payer / alternative backend.
+4. (lnd test-payer backend only) Set `TOR_PROXY=tor:9050` if `LND_HOST` is a `.onion` address; leave blank otherwise.
+5. Set `OTS_BACKEND_MODE=calendar` and `OTS_CALENDAR_URL=http://otsd:14788`.
+6. Set `BITCOIN_RPC_SERVICE_URL` for otsd (full URL including credentials, in `.env` only — see `.env.example` for the LAN, onion-bridge, and systemd shapes).
+7. First run only: initialise the calendar identity (see "Deploying the calendar" below).
+8. Start the full stack: `docker compose --profile calendar up -d`.
+9. Check logs: `docker compose logs -f`.
+10. Retrieve onion address: `docker compose exec tor cat /var/lib/tor/timestamp_gateway/hostname`.
+11. Test the endpoint with `curl` (see README quick start).
 
 ---
 

@@ -72,7 +72,10 @@ git clone https://github.com/ab21tor/timestamp-gateway
 git clone -b calendar-ops https://github.com/ab21tor/opentimestamps-server
 cd timestamp-gateway
 cp .env.example .env
-# Edit .env — set PHOENIXD_HTTP_PASSWORD_LIMITED (live default backend;
+# Edit .env — set L402_SECRET_HEX (required, the gateway refuses to start
+# without it; generate with:
+#   python3 -c 'import secrets; print(secrets.token_hex(32))'
+# ), PHOENIXD_HTTP_PASSWORD_LIMITED (live default backend;
 # LND_* only if using the lnd test payer / alternative backend) and
 # BITCOIN_RPC_SERVICE_URL for otsd (see .env.example for the three shapes).
 
@@ -124,11 +127,12 @@ curl -X POST http://localhost:8000/timestamp \
 |---|---|---|---|
 | `PAYMENT_BACKEND_TYPE` | No | `phoenixd` | `phoenixd` (live backend) or `lnd` (test payer / alternative only) |
 | `PHOENIXD_URL` | No | `http://127.0.0.1:9740` | phoenixd HTTP API endpoint (live default backend); from the compose stack use `http://host.docker.internal:9740` |
-| `PHOENIXD_HTTP_PASSWORD_LIMITED` | No | — | phoenixd API password: `http-password-limited-access` in `phoenix.conf` (invoice/read only, cannot spend). Never the full `http-password`. Old name `PHOENIXD_HTTP_PASSWORD` read as a fallback. |
+| `PHOENIXD_HTTP_PASSWORD_LIMITED` | When `phoenixd` | — | phoenixd API password: `http-password-limited-access` in `phoenix.conf` (invoice/read only, cannot spend). Never the full `http-password`. Old name `PHOENIXD_HTTP_PASSWORD` read as a fallback. |
 | `LND_HOST` | When `lnd` | — | Hostname, IP, or `.onion` address of your LND REST API (test payer / alternative) |
 | `LND_PORT` | When `lnd` | — | LND REST port, typically `8080` (test payer / alternative) |
 | `LND_MACAROON_HEX` | When `lnd` | — | Hex-encoded invoice macaroon (test payer / alternative) |
 | `GATEWAY_PRICE_SATS` | Yes | — | Satoshis charged per timestamp |
+| `L402_SECRET_HEX` | Yes | — | L402 macaroon root signing key (hex, at least 16 bytes; 32 recommended). Generate with `python3 -c 'import secrets; print(secrets.token_hex(32))'`. The gateway refuses to start without it (dev-only escape: `L402_ALLOW_EPHEMERAL_SECRET=true`). |
 | `OTS_BACKEND_MODE` | Yes | — | `calendar` (real mode) or `public` (compatibility/testing only) |
 | `OTS_CALENDAR_URL` | When `calendar` | — | URL of the operator-controlled otsd instance (`http://otsd:14788` for the bundled compose profile; `http://127.0.0.1:14788` on the systemd path) |
 | `TOR_PROXY` | No | — | SOCKS5h proxy for LND connections (lnd test payer / alternative only). Required if `LND_HOST` is `.onion`. |
