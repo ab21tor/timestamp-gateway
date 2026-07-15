@@ -24,8 +24,12 @@ services:
       - tor
     networks:
       - ts_net
-    # host.docker.internal = this Docker host, on Linux and macOS alike —
-    # how the container reaches host services (phoenixd).
+    # host.docker.internal = this Docker host — how the container reaches
+    # host services (phoenixd). Caveat: on Docker Desktop (macOS/Windows)
+    # this reaches loopback-bound host services via the VM proxy; on a
+    # Linux engine it maps to a bridge IP, so a phoenixd bound to
+    # 127.0.0.1 (its default) is NOT reachable — bind it where the
+    # container can reach it (see PHOENIXD_URL in .env.example).
     extra_hosts:
       - "host.docker.internal:host-gateway"
     # Persistent state: the durable obligation log (obligations.db), the
