@@ -1499,6 +1499,23 @@ def health():
         try:
             resp = requests.get(OTS_CALENDAR_URL, timeout=5)
             resp.raise_for_status()
+            # A 200 from otsd proves nothing: its homepage commits the status
+            # line (fork rpc.py:204) BEFORE any Bitcoin call, and both failure
+            # shapes — Proxy() construction failing (bare return, rpc.py:214-217)
+            # or the first RPC call dying after the headers went out — yield an
+            # empty 200 body. "Best-block" renders only after getbestblockhash
+            # and getblockcount both succeed, so its presence is the only
+            # external proof that otsd's Bitcoin RPC path is alive. Residual:
+            # this proves RPC reachability, not that the stamper thread is
+            # unwedged — that class surfaces at outcome level in the
+            # proofs-status field, with hours of latency.
+            if b"Best-block" not in resp.content:
+                logging.warning(
+                    "Health check: otsd HTTP up but Bitcoin-blind at %s "
+                    "(homepage lacks the Best-block marker)",
+                    OTS_CALENDAR_URL,
+                )
+                otsd_status = "error"
         except Exception:
             logging.warning("Health check: otsd unreachable at %s", OTS_CALENDAR_URL)
             otsd_status = "error"

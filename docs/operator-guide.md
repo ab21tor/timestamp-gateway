@@ -391,6 +391,17 @@ docker compose logs -f otsd      # OTS calendar server
 
 The gateway logs one line per request (uvicorn access log) and logs warnings/errors for payment backend and OTS backend failures at `WARNING`/`ERROR` level. It does not log digests or preimages.
 
+### What `otsd: error` in `/health` means (and what it does not)
+
+`/health` probes otsd's homepage and requires the `Best-block` line in the body, not just a 200. otsd commits its 200 status line before making any Bitcoin call, so with Bitcoin RPC dead it still answers 200 — with an empty page. `Best-block` renders only after otsd's `getbestblockhash`/`getblockcount` succeed, so its presence is the only external proof that otsd can reach Bitcoin. `otsd: error` therefore means one of two things: otsd is unreachable, or otsd is up but **Bitcoin-blind** — the gateway log distinguishes them (`otsd unreachable` vs `otsd HTTP up but Bitcoin-blind`).
+
+Not covered: a wedged stamper thread with healthy RPC still renders the page. That class surfaces at outcome level in the `proofs` field (pending-too-long), with hours of latency.
+
+Two different "anchoring isn't happening" signals, and how to tell them apart:
+
+- **Bitcoin-blind** — `/health` shows `otsd: error`, the gateway log says `otsd HTTP up but Bitcoin-blind`, otsd's own log shows `__do_bitcoin() failed` / connection errors. Something broke: fix the Bitcoin RPC path (bitcoind down, credentials rotated, socat/onion bridge dead).
+- **Stalled at the fee cap (by design)** — `/health` shows `otsd: ok`, proofs stay pending, otsd's log shows `Maximum txfee reached!`. Nothing broke: the last under-cap transaction is waiting for fees to fall or confirm. The action is patience — or a deliberate decision to raise `--btc-max-fee`.
+
 ### Wallet liquidity alarm
 
 The otsd-hot wallet funds anchoring transactions. If it drains, anchoring silently stops — so its balance is checked unattended and surfaced through `/health`.

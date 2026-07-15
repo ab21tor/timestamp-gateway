@@ -137,6 +137,18 @@ def _ok_lnd():
 def _ok_otsd():
     m = MagicMock()
     m.raise_for_status.return_value = None
+    # Minimal healthy homepage: the Best-block marker renders only after
+    # otsd's Bitcoin RPC calls succeed (see the /health probe comment).
+    m.content = b"<html>Best-block: 00000000abc, height 900000</html>"
+    return m
+
+
+def _blind_otsd(body):
+    """otsd's Bitcoin-blind shape: the 200 was committed before any Bitcoin
+    call, so the body is empty (or at least missing the Best-block marker)."""
+    m = MagicMock()
+    m.raise_for_status.return_value = None
+    m.content = body
     return m
 
 
@@ -953,6 +965,29 @@ def test_health_otsd_down_in_calendar_mode_returns_503():
     assert resp.status_code == 503
     body = resp.json()
     assert body["status"] == "degraded" and body["otsd"] == "error"
+
+
+def test_health_otsd_bitcoin_blind_empty_200_returns_503(caplog):
+    # otsd commits its 200 before any Bitcoin call, so a dead Bitcoin RPC
+    # yields an empty 200 body. That must read as error, not ok — and the
+    # log line must name the condition.
+    with patch("main.requests.get", side_effect=[_ok_lnd(), _blind_otsd(b"")]):
+        with caplog.at_level(logging.WARNING):
+            resp = client.get("/health")
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["status"] == "degraded" and body["otsd"] == "error"
+    assert any("Bitcoin-blind" in r.message for r in caplog.records)
+
+
+def test_health_otsd_markerless_200_returns_503():
+    # A rendered body without the Best-block marker (template drift, partial
+    # render) fails loud rather than passing as healthy.
+    with patch("main.requests.get",
+               side_effect=[_ok_lnd(), _blind_otsd(b"<html>calendar</html>")]):
+        resp = client.get("/health")
+    assert resp.status_code == 503
+    assert resp.json()["otsd"] == "error"
 
 
 def test_health_otsd_na_in_public_mode():
