@@ -139,12 +139,12 @@ The local calendar is your own `otsd`, not the public OpenTimestamps calendars.
 
 Current command:
 
-`python3 otsd --calendar /calendar --btc-conf-target 2 -v`
+`python3 otsd --calendar /calendar --btc-conf-target 12 -v`
 
 Current policy:
 
 - batch up to 6 hours by default
-- when anchoring, aim for about 2-block Bitcoin confirmation
+- when anchoring, aim for about 12-block Bitcoin confirmation
 - save the Bitcoin proof after 6 confirmations by default
 
 The 6-hour default comes from:

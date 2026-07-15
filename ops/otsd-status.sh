@@ -30,8 +30,8 @@ echo
 echo "=== plain policy ==="
 CMD="$(docker inspect "$CONTAINER" --format '{{json .Config.Cmd}}' 2>/dev/null || true)"
 
-if echo "$CMD" | grep -q -- '--btc-conf-target","2'; then
-  echo "bitcoin_fee_target: about_2_blocks"
+if echo "$CMD" | grep -q -- '--btc-conf-target","12"'; then
+  echo "bitcoin_fee_target: about_12_blocks"
 else
   echo "bitcoin_fee_target: check_command"
 fi

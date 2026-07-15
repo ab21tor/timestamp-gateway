@@ -112,12 +112,12 @@ Current Docker shape:
 - working dir: `/app`
 - app mount: `/home/gateway/opentimestamps-server:/app`
 - calendar mount: `/var/lib/otsd/calendar:/calendar`
-- command: `python3 otsd --calendar /calendar --btc-conf-target 2 -v`
+- command: `python3 otsd --calendar /calendar --btc-conf-target 12 -v`
 
 Current plain anchoring policy:
 
 - batch up to 6 hours by default
-- when anchoring, target about 2-block Bitcoin confirmation
+- when anchoring, target about 12-block Bitcoin confirmation
 - save Bitcoin proof after 6 confirmations by default
 
 ### Bitcoin RPC bridge
