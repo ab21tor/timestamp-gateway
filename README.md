@@ -72,8 +72,8 @@ git clone https://github.com/ab21tor/timestamp-gateway
 git clone -b calendar-ops https://github.com/ab21tor/opentimestamps-server
 cd timestamp-gateway
 cp .env.example .env
-# Edit .env — set PHOENIXD_HTTP_PASSWORD (live default backend; LND_* only
-# if using the lnd test payer / alternative backend) and
+# Edit .env — set PHOENIXD_HTTP_PASSWORD_LIMITED (live default backend;
+# LND_* only if using the lnd test payer / alternative backend) and
 # BITCOIN_RPC_SERVICE_URL for otsd (see .env.example for the three shapes).
 
 # First run only: give the calendar its identity — the URI callers will see
@@ -124,7 +124,7 @@ curl -X POST http://localhost:8000/timestamp \
 |---|---|---|---|
 | `PAYMENT_BACKEND_TYPE` | No | `phoenixd` | `phoenixd` (live backend) or `lnd` (test payer / alternative only) |
 | `PHOENIXD_URL` | No | `http://127.0.0.1:9740` | phoenixd HTTP API endpoint (live default backend); from the compose stack use `http://host.docker.internal:9740` |
-| `PHOENIXD_HTTP_PASSWORD` | No | — | phoenixd HTTP API password (`http-password` in `phoenix.conf`) |
+| `PHOENIXD_HTTP_PASSWORD_LIMITED` | No | — | phoenixd API password: `http-password-limited-access` in `phoenix.conf` (invoice/read only, cannot spend). Never the full `http-password`. Old name `PHOENIXD_HTTP_PASSWORD` read as a fallback. |
 | `LND_HOST` | When `lnd` | — | Hostname, IP, or `.onion` address of your LND REST API (test payer / alternative) |
 | `LND_PORT` | When `lnd` | — | LND REST port, typically `8080` (test payer / alternative) |
 | `LND_MACAROON_HEX` | When `lnd` | — | Hex-encoded invoice macaroon (test payer / alternative) |
@@ -215,7 +215,7 @@ ports:
 
 ## Connecting to LND (test payer / alternative backend only)
 
-This section applies only when `PAYMENT_BACKEND_TYPE=lnd` (test payer / alternative). The live default backend is Phoenixd, which needs only `PHOENIXD_URL` and `PHOENIXD_HTTP_PASSWORD`.
+This section applies only when `PAYMENT_BACKEND_TYPE=lnd` (test payer / alternative). The live default backend is Phoenixd, which needs only `PHOENIXD_URL` and `PHOENIXD_HTTP_PASSWORD_LIMITED`.
 
 The gateway needs an invoice macaroon — it authorises creating and reading invoices, nothing else.
 

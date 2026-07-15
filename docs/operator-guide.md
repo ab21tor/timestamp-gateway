@@ -33,7 +33,7 @@ You do not need a VPS. You do not need a static IP. You do not need to expose an
 ## First-run checklist
 
 1. Clone this repository, clone the calendar fork next to it (`git clone -b calendar-ops https://github.com/ab21tor/opentimestamps-server`), and copy `.env.example` to `.env`.
-2. Set `PAYMENT_BACKEND_TYPE=phoenixd` (the default) and fill in `PHOENIXD_URL` (`http://host.docker.internal:9740` for a phoenixd on this host) and `PHOENIXD_HTTP_PASSWORD`. Only fill in `LND_*` if using the LND test-payer / alternative backend.
+2. Set `PAYMENT_BACKEND_TYPE=phoenixd` (the default) and fill in `PHOENIXD_URL` (`http://host.docker.internal:9740` for a phoenixd on this host) and `PHOENIXD_HTTP_PASSWORD_LIMITED`. Only fill in `LND_*` if using the LND test-payer / alternative backend.
 3. (lnd test-payer backend only) Set `TOR_PROXY=tor:9050` if `LND_HOST` is a `.onion` address; leave blank otherwise.
 4. Set `OTS_BACKEND_MODE=calendar` and `OTS_CALENDAR_URL=http://otsd:14788`.
 5. Set `BITCOIN_RPC_SERVICE_URL` for otsd (full URL including credentials, in `.env` only — see `.env.example` for the LAN, onion-bridge, and systemd shapes).
@@ -218,10 +218,10 @@ Under Docker Compose the database lives on the persistent `gateway_data` volume,
 
 ## Payment backend (phoenixd)
 
-phoenixd is the live payment backend: a self-custodial Lightning node daemon by ACINQ. The gateway needs exactly two values from it — `PHOENIXD_URL` (its HTTP API) and `PHOENIXD_HTTP_PASSWORD`.
+phoenixd is the live payment backend: a self-custodial Lightning node daemon by ACINQ. The gateway needs exactly two values from it — `PHOENIXD_URL` (its HTTP API) and `PHOENIXD_HTTP_PASSWORD_LIMITED`.
 
 - **Install:** download a release from https://github.com/ACINQ/phoenixd (or build from source) and run `phoenixd`. Upstream docs: https://phoenix.acinq.co/server. On first run it creates its data directory (`~/.phoenix`) including the wallet seed — back the seed up; it is the money.
-- **API password:** first run also generates `http-password` in `~/.phoenix/phoenix.conf`. That value is `PHOENIXD_HTTP_PASSWORD`.
+- **API password:** first run also generates two passwords in `~/.phoenix/phoenix.conf`. Use `http-password-limited-access` as `PHOENIXD_HTTP_PASSWORD_LIMITED` — it covers the gateway's entire phoenixd surface (`createinvoice`, `getinfo`, `payments/incoming`) and cannot reach `/payinvoice` or `/sendtoaddress` (verified against phoenixd 0.8.0). Never use the full `http-password` here: that hands an internet-facing process the authority to drain the wallet.
 - **URL:** the HTTP API listens on `127.0.0.1:9740` by default. For a host-run gateway `PHOENIXD_URL=http://127.0.0.1:9740`; from the gateway container use `http://host.docker.internal:9740`. phoenixd stays outside the compose stack — it is the wallet holding your funds.
 - **Inbound liquidity:** a fresh phoenixd has no channels and cannot receive. It opens (and later extends) a channel from ACINQ automatically when a received payment needs one, at a fee deducted from that payment — see `ops/OPERATOR-NOTES.md` and the "Inbound liquidity" section below.
 
@@ -229,7 +229,7 @@ phoenixd is the live payment backend: a self-custodial Lightning node daemon by 
 
 ## Getting the invoice macaroon (LND test payer / alternative backend only)
 
-This section applies only when `PAYMENT_BACKEND_TYPE=lnd` (test payer / alternative). The live default backend is Phoenixd, which needs no macaroon — only `PHOENIXD_URL` and `PHOENIXD_HTTP_PASSWORD`.
+This section applies only when `PAYMENT_BACKEND_TYPE=lnd` (test payer / alternative). The live default backend is Phoenixd, which needs no macaroon — only `PHOENIXD_URL` and `PHOENIXD_HTTP_PASSWORD_LIMITED`.
 
 The invoice macaroon authorises creating and reading invoices. It cannot spend funds, open channels, or take any other action.
 

@@ -1281,11 +1281,28 @@ def test_phoenixd_backend_does_not_require_lnd_vars():
         "OTS_BACKEND_MODE": "calendar",
         "OTS_CALENDAR_URL": "http://127.0.0.1:14788",
         "L402_SECRET_HEX": "ab" * 16,
-        "PHOENIXD_HTTP_PASSWORD": "testpassword",
+        "PHOENIXD_HTTP_PASSWORD_LIMITED": "testpassword",
     }
     with patch.dict(os.environ, env, clear=True):
         result = main._parse_config()
     assert result is not None
+
+
+def test_phoenixd_password_pre_rename_alias():
+    """The pre-rename PHOENIXD_HTTP_PASSWORD still fills the limited field."""
+    env = {
+        "PAYMENT_BACKEND_TYPE": "phoenixd",
+        "GATEWAY_PRICE_SATS": "500",
+        "MIN_GATEWAY_PRICE_SATS": "500",
+        "OTS_BACKEND_MODE": "calendar",
+        "OTS_CALENDAR_URL": "http://127.0.0.1:14788",
+        "L402_SECRET_HEX": "ab" * 16,
+        "PHOENIXD_HTTP_PASSWORD": "legacyname",
+    }
+    with patch.dict(os.environ, env, clear=True):
+        result = main._parse_config()
+    assert result is not None
+    assert result.phoenixd_http_password_limited == "legacyname"
 
 
 def test_parse_config_rejects_invalid_payment_backend():
@@ -1371,7 +1388,7 @@ def test_phoenixd_password_not_logged(caplog):
         "serialized": FAKE_INVOICE,
         "paymentHash": PAYMENT_HASH,
     }
-    with patch("main.PHOENIXD_HTTP_PASSWORD", secret):
+    with patch("main.PHOENIXD_HTTP_PASSWORD_LIMITED", secret):
         assert backend._auth() == ("", secret)
         with caplog.at_level(logging.DEBUG):
             with patch("main.requests.post", return_value=resp):

@@ -53,7 +53,11 @@ echo
 
 echo "=== api ==="
 if [ -f "$REPO/.env" ]; then
-  PASSWORD="$(grep '^PHOENIXD_HTTP_PASSWORD=' "$REPO/.env" | cut -d= -f2-)"
+  PASSWORD="$(grep '^PHOENIXD_HTTP_PASSWORD_LIMITED=' "$REPO/.env" | cut -d= -f2-)"
+  # Pre-rename alias, same fallback the gateway applies.
+  if [ -z "$PASSWORD" ]; then
+    PASSWORD="$(grep '^PHOENIXD_HTTP_PASSWORD=' "$REPO/.env" | cut -d= -f2-)"
+  fi
 else
   PASSWORD=""
 fi
@@ -63,7 +67,7 @@ if [ -n "$PASSWORD" ]; then
   echo
 else
   echo "state: needs_attention"
-  echo "message: PHOENIXD_HTTP_PASSWORD not found in $REPO/.env"
+  echo "message: PHOENIXD_HTTP_PASSWORD_LIMITED (or legacy PHOENIXD_HTTP_PASSWORD) not found in $REPO/.env"
 fi
 echo
 

@@ -58,7 +58,7 @@ class GatewayConfig:
     ots_submit_backoff_seconds: float
     payment_backend_type: str
     phoenixd_url: str
-    phoenixd_http_password: str | None
+    phoenixd_http_password_limited: str | None
     obligations_db_path: str
     obligation_sweep_interval: int
     wallet_status_path: str
@@ -191,7 +191,12 @@ def _parse_config() -> GatewayConfig:
     if payment_backend_type not in ("lnd", "phoenixd"):
         raise RuntimeError("PAYMENT_BACKEND_TYPE must be 'lnd' or 'phoenixd'")
     phoenixd_url = os.getenv("PHOENIXD_URL", "http://127.0.0.1:9740")
-    phoenixd_http_password = os.getenv("PHOENIXD_HTTP_PASSWORD") or None
+    phoenixd_http_password_limited = (
+        os.getenv("PHOENIXD_HTTP_PASSWORD_LIMITED")
+        # Pre-rename alias: an existing .env keeps working until swapped.
+        or os.getenv("PHOENIXD_HTTP_PASSWORD")
+        or None
+    )
 
     # ── Durable obligation log ────────────────────────────────────────────────
     # Path to the SQLite obligation store and how often the backstop sweeper
@@ -209,9 +214,14 @@ def _parse_config() -> GatewayConfig:
 
     # ── Wallet liquidity alarm (file-mediated; NO Bitcoin RPC from the gateway)
     # /health reads the status file written by ops/wallet-balance-check.sh.
-    # The gateway never holds wallet credentials — the rails stay separate.
-    # One carve-out (the pricing floor): the gateway may hold a fee-estimation
-    # credential (PRICE_RPC_URL, node-level), never a spending one.
+    # The gateway never holds a SPENDING credential — the rails stay separate.
+    # It holds two scoped ones: PHOENIXD_HTTP_PASSWORD_LIMITED (old name
+    # PHOENIXD_HTTP_PASSWORD read as a fallback), which must be phoenixd's
+    # http-password-limited-access key — the gateway calls only createinvoice,
+    # payments/incoming, and getinfo (PhoenixdPaymentBackend), all covered by
+    # the limited key, which cannot reach /payinvoice — and, for the pricing
+    # floor, a fee-estimation credential (PRICE_RPC_URL, node-level), never a
+    # spending one.
     wallet_status_path = os.getenv(
         "WALLET_STATUS_PATH", "/var/lib/timestamp-gateway/wallet-status"
     )
@@ -342,7 +352,7 @@ def _parse_config() -> GatewayConfig:
         ots_submit_backoff_seconds=ots_backoff,
         payment_backend_type=payment_backend_type,
         phoenixd_url=phoenixd_url,
-        phoenixd_http_password=phoenixd_http_password,
+        phoenixd_http_password_limited=phoenixd_http_password_limited,
         obligations_db_path=obligations_db_path,
         obligation_sweep_interval=obligation_sweep_interval,
         wallet_status_path=wallet_status_path,
@@ -384,7 +394,7 @@ OTS_SUBMIT_MAX_ATTEMPTS = _CONFIG.ots_submit_max_attempts
 OTS_SUBMIT_BACKOFF_SECONDS = _CONFIG.ots_submit_backoff_seconds
 PAYMENT_BACKEND_TYPE = _CONFIG.payment_backend_type
 PHOENIXD_URL = _CONFIG.phoenixd_url
-PHOENIXD_HTTP_PASSWORD = _CONFIG.phoenixd_http_password
+PHOENIXD_HTTP_PASSWORD_LIMITED = _CONFIG.phoenixd_http_password_limited
 OBLIGATIONS_DB_PATH = _CONFIG.obligations_db_path
 OBLIGATION_SWEEP_INTERVAL = _CONFIG.obligation_sweep_interval
 WALLET_STATUS_PATH = _CONFIG.wallet_status_path
@@ -1231,7 +1241,11 @@ class PhoenixdPaymentBackend:
     """PaymentBackend backed by the phoenixd HTTP API."""
 
     def _auth(self):
-        return ("", PHOENIXD_HTTP_PASSWORD) if PHOENIXD_HTTP_PASSWORD else None
+        return (
+            ("", PHOENIXD_HTTP_PASSWORD_LIMITED)
+            if PHOENIXD_HTTP_PASSWORD_LIMITED
+            else None
+        )
 
     def create_invoice(self, digest: str, amount_sats: int) -> Invoice:
         external_id = f"{digest[:16]}-{uuid.uuid4().hex}"
