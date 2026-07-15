@@ -9,7 +9,9 @@ The gateway's surface is HTTP on `/timestamp` (L402 402-challenge → pay → re
 It needs three backends, all stubable on localhost:
 
 - **phoenixd** (payments): POST `/createinvoice` (form-encoded, returns `serialized` +
-  `paymentHash`), GET `/payments/incoming/{hash}` (returns `isPaid`/`receivedSat`/`description`).
+  `paymentHash`), GET `/payments/incoming/{hash}` (returns `isPaid`/`requestedSat`/
+  `receivedSat`/`description` — the gateway verifies against `requestedSat`, the face
+  amount; a stub without it fails closed).
   Pick a fixed preimage, return sha256(preimage) as paymentHash, and you can redeem.
 - **OTS calendar**: POST `/digest` with raw digest bytes → serialized `Timestamp` built with
   the venv's own opentimestamps lib (`Timestamp(digest)` + `PendingAttestation`,

@@ -90,11 +90,17 @@ def auth(token, preimage=PREIMAGE):
     return {"Authorization": f"L402 {token}:{preimage}"}
 
 
-def _get_mock(settled, memo, amt_paid_sat):
-    """Mock LND invoice-lookup response (verify_payment)."""
+def _get_mock(settled, memo, amt_paid_sat, value=None):
+    """Mock LND invoice-lookup response (verify_payment). ``value`` is the
+    invoice face amount; defaults to amt_paid_sat (paid exactly)."""
     m = MagicMock()
     m.raise_for_status.return_value = None
-    m.json.return_value = {"settled": settled, "memo": memo, "amt_paid_sat": str(amt_paid_sat)}
+    m.json.return_value = {
+        "settled": settled,
+        "memo": memo,
+        "amt_paid_sat": str(amt_paid_sat),
+        "value": str(value if value is not None else amt_paid_sat),
+    }
     return m
 
 
@@ -649,15 +655,55 @@ def test_verify_payment_false_when_underpaid():
 
 
 def test_verify_payment_enforces_mint_time_price_not_static_config():
-    # Paid 21 against a token minted at 30: insufficient even though the static
-    # price says 21 is enough.
+    # Face amount 21 against a token minted at 30: insufficient even though
+    # the static price says 21 is enough.
     with patch("main.requests.get", return_value=_get_mock(True, DIGEST, 21)):
         assert main.verify_payment(PAYMENT_HASH, DIGEST, 30) is False
-    # Paid 900 against a token minted at 900: settles even if the static price
-    # has since moved — the binding is to the mint-time amount alone.
+    # Face amount 900 against a token minted at 900: settles even if the
+    # static price has since moved — the binding is to the mint-time amount
+    # alone.
     with patch("main.GATEWAY_PRICE_SATS", 21):
         with patch("main.requests.get", return_value=_get_mock(True, DIGEST, 900)):
             assert main.verify_payment(PAYMENT_HASH, DIGEST, 900) is True
+
+
+def test_h3_liquidity_fee_netted_receive_still_verifies(caplog):
+    # H3 regression: phoenixd nets an ACINQ liquidity fee off the credited
+    # amount. bolt11 settlement is atomic — the customer paid the face amount
+    # in full; the fee is our cost. Face 21 >= mint price 21 → verified, and
+    # the node's first liquidity-fee event documents itself as a WARNING.
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {
+        "isPaid": True,
+        "requestedSat": 21,
+        "receivedSat": 18,
+        "description": DIGEST,
+    }
+    with patch("main.PAYMENT_BACKEND", main.PhoenixdPaymentBackend()):
+        with patch("main.requests.get", return_value=resp):
+            with caplog.at_level(logging.WARNING):
+                assert main.verify_payment(PAYMENT_HASH, DIGEST, 21) is True
+    assert any("Liquidity fee observed" in r.message for r in caplog.records)
+
+
+def test_malformed_response_missing_requested_sat_fails_closed():
+    # No requestedSat in the response: parses to 0, and 0 >= 21 rejects even
+    # though isPaid claims settled.
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {"isPaid": True, "receivedSat": 21, "description": DIGEST}
+    with patch("main.PAYMENT_BACKEND", main.PhoenixdPaymentBackend()):
+        with patch("main.requests.get", return_value=resp):
+            assert main.verify_payment(PAYMENT_HASH, DIGEST, 21) is False
+
+
+def test_lnd_overpaid_underminted_invoice_rejected():
+    # Uniform-rule pin: face amount 10 < price 21 rejects even though the
+    # payer overpaid to 30. An invoice minted below its bound price is a
+    # gateway mint bug to surface, not a payment to honor.
+    with patch("main.requests.get", return_value=_get_mock(True, DIGEST, 30, value=10)):
+        assert main.verify_payment(PAYMENT_HASH, DIGEST, 21) is False
 
 
 def test_endpoint_settled_wrong_memo_returns_402():
@@ -683,6 +729,27 @@ def test_endpoint_honors_in_flight_invoice_after_repricing():
             resp = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
     assert resp.status_code == 200
     assert resp.content == FAKE_OTS
+
+
+def test_h3_liquidity_fee_payment_yields_obligation_and_proof(obligations_db):
+    # End to end: settled with the credited amount netted below the mint
+    # price still redeems — 200, real proof bytes, obligation recorded.
+    token = valid_token()
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {
+        "isPaid": True,
+        "requestedSat": 21,
+        "receivedSat": 18,
+        "description": DIGEST,
+    }
+    with patch("main.PAYMENT_BACKEND", main.PhoenixdPaymentBackend()):
+        with patch("main.requests.get", return_value=resp):
+            with patch("main.stamp_digest", return_value=FAKE_OTS):
+                r = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+    assert r.status_code == 200
+    assert r.content == FAKE_OTS
+    assert _obligation_row() is not None
 
 
 def test_verify_payment_lookup_failure_raises_generic_502_and_logs(caplog):
@@ -1341,6 +1408,7 @@ def test_phoenixd_lookup_invoice_maps_neutral_status_only():
     resp.raise_for_status.return_value = None
     resp.json.return_value = {
         "isPaid": True,
+        "requestedSat": 21,
         "receivedSat": 21,
         "description": DIGEST,
         "isExpired": False,
@@ -1350,11 +1418,13 @@ def test_phoenixd_lookup_invoice_maps_neutral_status_only():
     with patch("main.requests.get", return_value=resp) as get:
         status = backend.lookup_invoice(PAYMENT_HASH)
     assert status.settled is True
-    assert status.amount_paid_sat == 21
+    assert status.amount_requested_sat == 21
+    assert status.amount_received_sat == 21
     assert status.memo == DIGEST
     assert status.expired is False
     assert not hasattr(status, "preimage")
     assert not hasattr(status, "invoice")
+    assert not hasattr(status, "amount_paid_sat")  # the conflated field is gone
     assert get.call_args.args[0].endswith("/payments/incoming/" + PAYMENT_HASH)
 
 
@@ -1364,6 +1434,7 @@ def test_phoenixd_lookup_invoice_expired_none_when_absent():
     resp.raise_for_status.return_value = None
     resp.json.return_value = {
         "isPaid": False,
+        "requestedSat": 21,
         "receivedSat": 0,
         "description": DIGEST,
     }

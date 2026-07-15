@@ -1162,9 +1162,20 @@ class InvoiceStatus:
 
     ``expired`` is ``None`` when the backend exposes no expiry signal,
     distinguishing "not expired" from "unknown".
+
+    Two amounts, deliberately not one: the old single ``amount_paid_sat``
+    conflated what the customer paid with what our wallet was credited, and
+    "paid" was the lie — phoenixd reports the credited amount NET of any ACINQ
+    liquidity fee, so a fully paid invoice could look underpaid.
     """
     settled: bool
-    amount_paid_sat: int
+    # The invoice's face amount — what the gateway itself minted at quote
+    # time. phoenixd: requestedSat. LND: value.
+    amount_requested_sat: int
+    # Sats actually credited to our wallet. phoenixd: receivedSat (net of any
+    # ACINQ liquidity fee). LND: amt_paid_sat (gross; LND has no receive-side
+    # deduction, so credited = paid).
+    amount_received_sat: int
     memo: str | None
     expired: bool | None
 
@@ -1233,7 +1244,8 @@ class LndPaymentBackend:
             raise HTTPException(status_code=502, detail="LND error: could not verify payment")
         return InvoiceStatus(
             settled=bool(data.get("settled", False)),
-            amount_paid_sat=int(data.get("amt_paid_sat") or 0),
+            amount_requested_sat=int(data.get("value") or 0),
+            amount_received_sat=int(data.get("amt_paid_sat") or 0),
             memo=data.get("memo"),
             expired=None,
         )
@@ -1309,7 +1321,8 @@ class PhoenixdPaymentBackend:
 
         return InvoiceStatus(
             settled=bool(data.get("isPaid", False)),
-            amount_paid_sat=int(data.get("receivedSat") or 0),
+            amount_requested_sat=int(data.get("requestedSat") or 0),
+            amount_received_sat=int(data.get("receivedSat") or 0),
             memo=data.get("description"),
             expired=data.get("isExpired") if "isExpired" in data else None,
         )
@@ -1404,17 +1417,33 @@ def stamp_digest(hex_digest: str) -> bytes:
 
 
 def verify_payment(payment_hash: str, digest: str, price_sats: int) -> bool:
-    """Fetch the invoice for a payment hash from LND and confirm it is settled, was
-    issued for the specific digest (memo), and the paid amount meets ``price_sats``
-    — the mint-time price carried in the token's signed caveat, not the current
-    configured price, so a repriced gateway still honors in-flight invoices. The
-    caller must already have proven that the presented preimage hashes to this
-    payment hash."""
+    """Fetch the invoice for a payment hash and confirm it is settled, was
+    issued for the specific digest (memo), and its FACE amount meets
+    ``price_sats`` — the mint-time price carried in the token's signed caveat,
+    not the current configured price, so a repriced gateway still honors
+    in-flight invoices. The caller must already have proven that the presented
+    preimage hashes to this payment hash.
+
+    The check is against amount_requested_sat, never amount_received_sat: a
+    settled bolt11 invoice is atomic, so settled=True proves the face amount
+    was paid in full, and the face amount is what the gateway itself minted at
+    quote time. The provider's cut (phoenixd nets an ACINQ liquidity fee off
+    the credited amount) is our cost, never the customer's shortfall. The
+    overpayment case this drops can only arise from an invoice minted below
+    its bound price — a gateway mint bug — and passing on a payer's accidental
+    overpayment would mask it rather than honor a payment."""
     status = PAYMENT_BACKEND.lookup_invoice(payment_hash)
+    if status.settled and status.amount_received_sat < status.amount_requested_sat:
+        logging.warning(
+            "Liquidity fee observed on %s: requested %d sat, received %d sat",
+            payment_hash,
+            status.amount_requested_sat,
+            status.amount_received_sat,
+        )
     return (
         status.settled
         and status.memo == digest
-        and status.amount_paid_sat >= price_sats
+        and status.amount_requested_sat >= price_sats
     )
 
 
