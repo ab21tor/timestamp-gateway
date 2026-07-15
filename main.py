@@ -72,6 +72,7 @@ class GatewayConfig:
     price_bump_reserve: float
     price_margin: float
     price_conf_target: int
+    price_blind_sats: int
     rate_limit_per_minute: int
     gateway_behind_proxy: bool
 
@@ -307,6 +308,16 @@ def _parse_config() -> GatewayConfig:
             f"1-1008, got {price_conf_target}"
         )
 
+    try:
+        price_blind_sats = int(os.getenv("PRICE_BLIND_SATS", "5000"))
+    except ValueError:
+        raise RuntimeError("PRICE_BLIND_SATS must be an integer")
+    if price_blind_sats <= 0:
+        raise RuntimeError(
+            f"PRICE_BLIND_SATS must be a positive integer (it is the quote "
+            f"floor when no feerate is available), got {price_blind_sats}"
+        )
+
     # ── Invoice-mint rate limit ───────────────────────────────────────────────
     # Per-IP token bucket on the unauthenticated 402 path. Every anonymous
     # request makes phoenixd sign AND durably store an invoice, so minting is
@@ -366,6 +377,7 @@ def _parse_config() -> GatewayConfig:
         price_bump_reserve=price_bump_reserve,
         price_margin=price_margin,
         price_conf_target=price_conf_target,
+        price_blind_sats=price_blind_sats,
         rate_limit_per_minute=rate_limit_per_minute,
         gateway_behind_proxy=gateway_behind_proxy,
     )
@@ -408,6 +420,7 @@ PRICE_TX_VSIZE_ESTIMATE = _CONFIG.price_tx_vsize_estimate
 PRICE_BUMP_RESERVE = _CONFIG.price_bump_reserve
 PRICE_MARGIN = _CONFIG.price_margin
 PRICE_CONF_TARGET = _CONFIG.price_conf_target
+PRICE_BLIND_SATS = _CONFIG.price_blind_sats
 RATE_LIMIT_PER_MINUTE = _CONFIG.rate_limit_per_minute
 GATEWAY_BEHIND_PROXY = _CONFIG.gateway_behind_proxy
 
@@ -1115,14 +1128,19 @@ def _cached_feerate_sat_per_vb() -> float | None:
 
 
 def quoted_price_sats() -> int:
-    """The price the 402 challenge quotes: the static price or the solvency
-    floor, whichever is higher. Floats with the fee market; never refuses."""
+    """The price the 402 challenge quotes: the static price or the floor,
+    whichever is higher. Floats with the fee market; never refuses.
+    The floor is the computed solvency floor when a feerate is available
+    and PRICE_BLIND_SATS when it is not: blind, the gateway cannot tell a
+    calm market from a spiking one, so it quotes a price the market cannot
+    hurt — the default 5000 covers a 20 sat/vB anchor at cost with margin."""
     feerate = _cached_feerate_sat_per_vb()
     if feerate is None:
-        return GATEWAY_PRICE_SATS
-    floor = math.ceil(
-        PRICE_TX_VSIZE_ESTIMATE * feerate * PRICE_BUMP_RESERVE * PRICE_MARGIN
-    )
+        floor = PRICE_BLIND_SATS
+    else:
+        floor = math.ceil(
+            PRICE_TX_VSIZE_ESTIMATE * feerate * PRICE_BUMP_RESERVE * PRICE_MARGIN
+        )
     return max(GATEWAY_PRICE_SATS, floor)
 
 

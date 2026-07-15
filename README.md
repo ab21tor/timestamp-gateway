@@ -132,6 +132,7 @@ curl -X POST http://localhost:8000/timestamp \
 | `LND_PORT` | When `lnd` | — | LND REST port, typically `8080` (test payer / alternative) |
 | `LND_MACAROON_HEX` | When `lnd` | — | Hex-encoded invoice macaroon (test payer / alternative) |
 | `GATEWAY_PRICE_SATS` | Yes | — | Satoshis charged per timestamp |
+| `PRICE_BLIND_SATS` | No | `5000` | Quote floor when no feerate is available (RPC unset, down, or no estimate): the 402 quotes max(`GATEWAY_PRICE_SATS`, this). A blind gateway charges enough that a fee market it cannot see cannot hurt it; the default covers a 20 sat/vB anchor at cost with margin. |
 | `L402_SECRET_HEX` | Yes | — | L402 macaroon root signing key (hex, at least 16 bytes; 32 recommended). Generate with `python3 -c 'import secrets; print(secrets.token_hex(32))'`. The gateway refuses to start without it (dev-only escape: `L402_ALLOW_EPHEMERAL_SECRET=true`). |
 | `OTS_BACKEND_MODE` | Yes | — | `calendar` (real mode) or `public` (compatibility/testing only) |
 | `OTS_CALENDAR_URL` | When `calendar` | — | URL of the operator-controlled otsd instance (`http://otsd:14788` for the bundled compose profile; `http://127.0.0.1:14788` on the systemd path) |

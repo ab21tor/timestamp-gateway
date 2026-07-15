@@ -146,6 +146,7 @@ Current policy:
 - batch up to 6 hours by default
 - when anchoring, aim for about 12-block Bitcoin confirmation
 - save the Bitcoin proof after 6 confirmations by default
+- fee cap (in the shipped run commands; reaches the VPS only when its systemd unit is updated, at rotation): `--btc-max-fee 0.0002` — the flag takes BTC, 0.0002 BTC = 20,000 sats; never "fix" it to 20000, that would mean 20,000 BTC. Bounds one anchor cycle's total spend across its RBF bump ladder. At the cap otsd logs `Maximum txfee reached!` and waits — the last under-cap transaction stays pending until fees fall or it confirms; a sustained spike means proofs stay pending. Intended trade: wallet safety over anchor latency.
 
 The 6-hour default comes from:
 

@@ -15,7 +15,11 @@
 # First run only: /var/lib/otsd/calendar needs the three identity files
 # (uri, hmac-key, donation_addr) or otsd exits at startup — see the operator
 # guide, "Deploying the calendar (otsd)". --btc-conf-target 12 matches the
-# deployed fee policy.
+# deployed fee policy. --btc-max-fee caps what ONE anchor can cost across
+# its whole RBF bump ladder — chosen so a bad fee market cannot drain a
+# small wallet in a single transaction. The flag takes BTC:
+# 0.0002 BTC = 20,000 sats. Never "fix" 0.0002 to 20000 — that would mean
+# 20,000 BTC.
 
 [Unit]
 Description=otsd OpenTimestamps calendar (docker)
@@ -34,7 +38,7 @@ ExecStart=/usr/bin/docker run --name otsd --network host \
   -v /home/gateway/opentimestamps-server:/app \
   -w /app \
   -e BITCOIN_RPC_SERVICE_URL=${BITCOIN_RPC_SERVICE_URL} \
-  otsd-local python3 otsd --calendar /calendar --btc-conf-target 12 -v
+  otsd-local python3 otsd --calendar /calendar --btc-conf-target 12 --btc-max-fee 0.0002 -v
 Restart=on-failure
 RestartSec=30
 

@@ -26,6 +26,9 @@ os.environ["LND_MACAROON_HEX"] = "deadbeef" * 8
 os.environ["TOR_PROXY"] = "127.0.0.1:9050"
 os.environ["GATEWAY_PRICE_SATS"] = "21"
 os.environ["MIN_GATEWAY_PRICE_SATS"] = "1"
+# Pinned to the static price so quote assertions stay 21 (the suite runs with
+# no feerate); blind-price behavior is tested by patching main.PRICE_BLIND_SATS.
+os.environ["PRICE_BLIND_SATS"] = "21"
 os.environ["PAYMENT_BACKEND_TYPE"] = "lnd"  # explicit: suite mocks LND REST (the test payer)
 os.environ["OTS_BACKEND_MODE"] = "calendar"
 os.environ["OTS_CALENDAR_URL"] = "http://test-calendar:14788"
@@ -413,7 +416,7 @@ def test_402_json_body_has_status_price_invoice_macaroon_expiry():
         resp = client.post("/timestamp", json={"digest": DIGEST})
     body = resp.json()["detail"]
     assert body["status"] == "payment_required"
-    assert body["price_sats"] == 21          # no feerate in test env: static quote
+    assert body["price_sats"] == 21          # no feerate in test env; blind floor pinned to 21 here
     assert body["invoice"] == FAKE_INVOICE
     assert isinstance(body["macaroon"], str) and body["macaroon"]
     assert isinstance(body["expiry"], int) and body["expiry"] > int(time.time())
@@ -1989,9 +1992,84 @@ def test_quoted_price_floor_rounds_up(fresh_feerate_cache):
     assert main.quoted_price_sats() == 1389
 
 
-def test_quoted_price_static_on_feerate_fallback(fresh_feerate_cache):
+def test_quoted_price_blind_floor_on_feerate_fallback(fresh_feerate_cache):
+    # Was test_quoted_price_static_on_feerate_fallback: blind now quotes
+    # max(static, PRICE_BLIND_SATS), never the bare static price.
     main._feerate_cache = (None, time.monotonic())
-    assert main.quoted_price_sats() == 21
+    with patch("main.PRICE_BLIND_SATS", 5000):
+        assert main.quoted_price_sats() == 5000
+
+
+def test_blind_price_when_rpc_url_unset(fresh_feerate_cache):
+    with patch("main.PRICE_BLIND_SATS", 5000):
+        with patch("main.PRICE_RPC_URL", None):
+            assert main.quoted_price_sats() == 5000
+
+
+def test_blind_price_on_rpc_timeout(fresh_feerate_cache):
+    with patch("main.PRICE_BLIND_SATS", 5000):
+        with patch("main.PRICE_RPC_URL", PRICE_TEST_URL):
+            with patch("main.requests.post", MagicMock(side_effect=main.requests.exceptions.Timeout())):
+                assert main.quoted_price_sats() == 5000
+
+
+def test_blind_price_on_rpc_error(fresh_feerate_cache):
+    with patch("main.PRICE_BLIND_SATS", 5000):
+        with patch("main.PRICE_RPC_URL", PRICE_TEST_URL):
+            with patch("main.requests.post", MagicMock(side_effect=main.requests.exceptions.ConnectionError())):
+                assert main.quoted_price_sats() == 5000
+
+
+def test_blind_price_when_node_has_no_estimate(fresh_feerate_cache):
+    no_estimate = _feerate_post_mock({"errors": ["Insufficient data or no feerate found"], "blocks": 0})
+    with patch("main.PRICE_BLIND_SATS", 5000):
+        with patch("main.PRICE_RPC_URL", PRICE_TEST_URL):
+            with patch("main.requests.post", MagicMock(return_value=no_estimate)):
+                assert main.quoted_price_sats() == 5000
+
+
+def test_blind_floor_below_static_keeps_static(fresh_feerate_cache):
+    # max() holds: a blind floor below the static price never lowers the quote.
+    main._feerate_cache = (None, time.monotonic())
+    with patch("main.PRICE_BLIND_SATS", 5):
+        assert main.quoted_price_sats() == 21
+
+
+def test_price_blind_sats_default_is_5000():
+    with patch.dict(os.environ):
+        os.environ.pop("PRICE_BLIND_SATS", None)
+        assert main._parse_config().price_blind_sats == 5000
+
+
+def test_non_integer_price_blind_sats_fails():
+    with patch.dict(os.environ, {"PRICE_BLIND_SATS": "abc"}):
+        with pytest.raises(RuntimeError, match="PRICE_BLIND_SATS must be an integer"):
+            main._parse_config()
+
+
+def test_zero_price_blind_sats_fails():
+    with patch.dict(os.environ, {"PRICE_BLIND_SATS": "0"}):
+        with pytest.raises(RuntimeError, match="PRICE_BLIND_SATS must be a positive"):
+            main._parse_config()
+
+
+def test_negative_price_blind_sats_fails():
+    with patch.dict(os.environ, {"PRICE_BLIND_SATS": "-5"}):
+        with pytest.raises(RuntimeError, match="PRICE_BLIND_SATS must be a positive"):
+            main._parse_config()
+
+
+def test_token_minted_at_blind_price_validates_at_blind_price(fresh_feerate_cache):
+    # Mint-time binding invariant, blind edition: a token minted while blind
+    # carries the blind price and validates at it even after the market
+    # becomes visible again and the floor moves.
+    main._feerate_cache = (None, time.monotonic())
+    with patch("main.PRICE_BLIND_SATS", 5000):
+        price = main.quoted_price_sats()
+        assert price == 5000
+        token = valid_token(price=price)
+    main._feerate_cache = (10.0, time.monotonic())  # market back; floor now 11250
+    assert main.verify_l402_token(token, DIGEST) == (PAYMENT_HASH, 5000)
 
 
 # ══ 16. Invoice-mint rate limit ══════════════════════════════════════════════════

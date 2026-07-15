@@ -30,4 +30,5 @@ EXPOSE 14788
 # the otsd script lives in the runtime mount, not on PATH. Binds localhost
 # (otsd's default) — safe under any networking; docker-compose overrides
 # with --rpc-address 0.0.0.0 for its internal bridge network.
-CMD ["python", "/app/otsd", "--calendar", "/calendar", "--btc-conf-target", "12", "-v"]
+# --btc-max-fee takes BTC: 0.0002 BTC = 20,000 sats. Never "fix" it to 20000.
+CMD ["python", "/app/otsd", "--calendar", "/calendar", "--btc-conf-target", "12", "--btc-max-fee", "0.0002", "-v"]

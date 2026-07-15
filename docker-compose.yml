@@ -94,7 +94,8 @@ services:
       - "host.docker.internal:host-gateway"
     # --rpc-address 0.0.0.0: reachable on the compose network (unpublished);
     # the image default binds localhost for non-compose runs.
-    command: ["python", "/app/otsd", "--rpc-address", "0.0.0.0", "--calendar", "/calendar", "--btc-conf-target", "12", "-v"]
+    # --btc-max-fee takes BTC: 0.0002 BTC = 20,000 sats. Never "fix" it to 20000.
+    command: ["python", "/app/otsd", "--rpc-address", "0.0.0.0", "--calendar", "/calendar", "--btc-conf-target", "12", "--btc-max-fee", "0.0002", "-v"]
     volumes:
       # Calendar state — the proof namespace. Destroying it strands every
       # pending proof this calendar has issued. Default: named volume; set

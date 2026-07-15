@@ -90,6 +90,8 @@ otsd is the OpenTimestamps calendar server. It accepts raw digest bytes over HTT
 
 otsd submits an anchoring transaction only when commitments are pending, and at most one per `--btc-min-tx-interval` (default 6 hours) — at most 4 per day, and none while idle. Each transaction contains a single OP_RETURN output. Cost depends on prevailing on-chain fee rates: at 5–20 sat/vbyte a single anchoring transaction costs roughly 500–2000 sats, and the fork fee-bumps a stuck transaction, which can raise the per-anchor cost. At the default cadence a 100,000-sat wallet covers weeks of continuous anchoring, and far longer at low volume where most intervals see no pending commitments.
 
+The bump ladder is capped: the shipped run commands set `--btc-max-fee 0.0002` (the flag takes BTC; 0.0002 BTC = 20,000 sats), bounding what one anchor cycle can spend in total — an RBF replacement pays its own whole fee and only one transaction of the ladder confirms, so the cap is the most one anchor can cost. When the cap binds, otsd logs `Maximum txfee reached!` and stops bumping; the last under-cap transaction stays pending until fees fall or it confirms. A sustained fee spike above the cap means proofs stay pending longer — that is the intended trade: wallet safety over anchor latency.
+
 otsd will stop anchoring if the wallet is empty. Proofs submitted during a gap are eventually anchored when the wallet is refilled, but the gap delays proof finalisation.
 
 ### Bitcoin RPC configuration
@@ -225,6 +227,12 @@ phoenixd is the live payment backend: a self-custodial Lightning node daemon by 
 - **API password:** first run also generates two passwords in `~/.phoenix/phoenix.conf`. Use `http-password-limited-access` as `PHOENIXD_HTTP_PASSWORD_LIMITED` — it covers the gateway's entire phoenixd surface (`createinvoice`, `getinfo`, `payments/incoming`) and cannot reach `/payinvoice` or `/sendtoaddress` (verified against phoenixd 0.8.0). Never use the full `http-password` here: that hands an internet-facing process the authority to drain the wallet.
 - **URL:** the HTTP API listens on `127.0.0.1:9740` by default. For a host-run gateway (systemd path) `PHOENIXD_URL=http://127.0.0.1:9740` works as-is. For a container-run gateway (compose path) reachability is NOT automatic: `host.docker.internal` reaches a loopback-bound phoenixd only on Docker Desktop (macOS/Windows, via its VM proxy). On a Linux engine — VPS, Pi, Umbrel, Start9 — it maps to a bridge IP where a loopback-bound phoenixd is not listening, and the connection is refused. phoenixd must be bound where the container can reach it: `--http-bind-ip` on the docker0 bridge address, or a reverse proxy in front of it. phoenixd stays outside the compose stack — it is the wallet holding your funds.
 - **Inbound liquidity:** a fresh phoenixd has no channels and cannot receive. It opens (and later extends) a channel from ACINQ automatically when a received payment needs one, at a fee deducted from that payment — see `ops/OPERATOR-NOTES.md` and the "Inbound liquidity" section below.
+
+---
+
+## Pricing
+
+The 402 challenge quotes `max(GATEWAY_PRICE_SATS, floor)`. With a feerate available (`estimatesmartfee` over `PRICE_RPC_URL`, or the `BITCOIN_RPC_SERVICE_URL` fallback) the floor is the solvency floor — estimated anchor cost with bump reserve and margin, so the gateway is structurally unable to quote below what anchoring costs it. Without a feerate — no RPC URL configured, node down or timing out, no estimate for the target — the floor is `PRICE_BLIND_SATS` (default 5000). That is what the blind price is for: a blind gateway cannot tell a calm fee market from a spiking one, so it quotes a price the market cannot hurt it with — 5000 sats covers a 20 sat/vB anchor at cost with margin. It never quotes the bare static price on failure and it never refuses to quote; every blind quote is preceded by a logged warning. A token minted at any of these prices validates at its mint-time price forever.
 
 ---
 
