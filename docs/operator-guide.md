@@ -377,7 +377,7 @@ timestamp.yourdomain.com {
 }
 ```
 
-When the gateway sits behind a reverse proxy, also set `GATEWAY_BEHIND_PROXY=true` in `.env`: the per-IP rate limiter then reads the client address from the `X-Forwarded-For` entry your proxy appends. Without it every client shares the proxy's address — and one rate-limit bucket. The header is never trusted unless this is set, because clients can forge it.
+When the gateway sits behind a reverse proxy, also set `GATEWAY_BEHIND_PROXY=true` in `.env`: the per-IP rate limiters (`RATE_LIMIT_PER_MINUTE` on unauthenticated minting; `VERIFY_RATE_LIMIT_PER_MINUTE` on the free `/verify` and `/upgrade` endpoints — a separate budget, so proof polling can never starve the paid mint path) then read the client address from the `X-Forwarded-For` entry your proxy appends. Without it every client shares the proxy's address — and one bucket per limiter. The header is never trusted unless this is set, because clients can forge it.
 
 ---
 

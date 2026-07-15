@@ -158,8 +158,10 @@ def clear_proof_cache():
 @pytest.fixture(autouse=True)
 def clear_rate_buckets():
     main._rate_buckets.clear()
+    main._verify_rate_buckets.clear()
     yield
     main._rate_buckets.clear()
+    main._verify_rate_buckets.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -2236,6 +2238,128 @@ def test_mint_rate_limited_returns_429_and_spares_phoenixd(monkeypatch):
     assert detail["retry_after_seconds"] >= 1
     assert second.headers["retry-after"] == str(detail["retry_after_seconds"])
     p.assert_called_once()  # the 429 never reached invoice creation
+
+
+def test_verify_rate_limit_non_integer_fails():
+    with patch.dict(os.environ, {"VERIFY_RATE_LIMIT_PER_MINUTE": "many"}):
+        with pytest.raises(RuntimeError, match="VERIFY_RATE_LIMIT_PER_MINUTE must be an integer"):
+            main._parse_config()
+
+
+def test_verify_rate_limit_negative_fails():
+    with patch.dict(os.environ, {"VERIFY_RATE_LIMIT_PER_MINUTE": "-1"}):
+        with pytest.raises(RuntimeError, match="VERIFY_RATE_LIMIT_PER_MINUTE must be >= 0"):
+            main._parse_config()
+
+
+def test_verify_rate_limit_zero_valid_and_default_thirty():
+    with patch.dict(os.environ, {"VERIFY_RATE_LIMIT_PER_MINUTE": "0"}):
+        assert main._parse_config().verify_rate_limit_per_minute == 0
+    with patch.dict(os.environ):
+        os.environ.pop("VERIFY_RATE_LIMIT_PER_MINUTE", None)
+        assert main._parse_config().verify_rate_limit_per_minute == 30
+
+
+def test_verify_and_upgrade_rate_limited_from_one_bucket(monkeypatch):
+    # /verify and /upgrade draw one shared budget, and the 429 fires BEFORE
+    # the base64 decode — the third request carries invalid base64 and still
+    # gets 429, not the 200-invalid body, proving the parse was never paid.
+    monkeypatch.setattr(main, "VERIFY_RATE_LIMIT_PER_MINUTE", 2)
+    ots_b64 = base64.b64encode(FAKE_OTS).decode()
+    r1 = client.post("/verify", json={"digest": DIGEST, "ots": ots_b64})
+    r2 = client.post("/upgrade", json={"digest": DIGEST, "ots": ots_b64})
+    r3 = client.post("/verify", json={"digest": DIGEST, "ots": "!!!not-base64!!!"})
+    assert r1.status_code == 200 and r2.status_code == 200
+    assert r3.status_code == 429
+    detail = r3.json()["detail"]
+    assert detail["status"] == "rate_limited"
+    assert isinstance(detail["retry_after_seconds"], int)
+    assert detail["retry_after_seconds"] >= 1
+    assert r3.headers["retry-after"] == str(detail["retry_after_seconds"])
+
+
+def test_verify_rate_limit_refills_over_time(monkeypatch):
+    monkeypatch.setattr(main, "VERIFY_RATE_LIMIT_PER_MINUTE", 2)
+    # Empty bucket last refilled 30s ago: 30 x 2/60 = 1 token has accrued.
+    main._verify_rate_buckets["ip-v"] = (0.0, time.monotonic() - 30)
+    assert main._verify_rate_limit_retry_after("ip-v") is None      # spends the accrued token
+    assert main._verify_rate_limit_retry_after("ip-v") is not None  # bucket empty again
+
+
+def test_verify_rate_limit_zero_disables(monkeypatch):
+    monkeypatch.setattr(main, "VERIFY_RATE_LIMIT_PER_MINUTE", 0)
+    ots_b64 = base64.b64encode(FAKE_OTS).decode()
+    for _ in range(5):
+        assert client.post("/verify", json={"digest": DIGEST, "ots": ots_b64}).status_code == 200
+
+
+def test_verify_rate_buckets_bounded_fifo(monkeypatch):
+    """The second bucket dict holds the same bounded-module-dict property as
+    _rate_buckets — enforced by the shared _bucket_retry_after core, pinned
+    here so it cannot silently die in one of the two call sites."""
+    monkeypatch.setattr(main, "_RATE_BUCKETS_MAX", 3)
+    monkeypatch.setattr(main, "VERIFY_RATE_LIMIT_PER_MINUTE", 10)
+    for i in range(5):
+        main._verify_rate_limit_retry_after(f"vip-{i}")
+        assert len(main._verify_rate_buckets) <= 3
+    assert set(main._verify_rate_buckets) == {"vip-2", "vip-3", "vip-4"}
+    main._verify_rate_limit_retry_after("vip-3")  # existing key: no growth, no eviction
+    assert set(main._verify_rate_buckets) == {"vip-2", "vip-3", "vip-4"}
+
+
+def test_verify_spoofed_forwarded_for_ignored_by_default(monkeypatch):
+    monkeypatch.setattr(main, "VERIFY_RATE_LIMIT_PER_MINUTE", 1)
+    ots_b64 = base64.b64encode(FAKE_OTS).decode()
+    r1 = client.post("/verify", json={"digest": DIGEST, "ots": ots_b64},
+                     headers={"X-Forwarded-For": "1.1.1.1"})
+    r2 = client.post("/verify", json={"digest": DIGEST, "ots": ots_b64},
+                     headers={"X-Forwarded-For": "2.2.2.2"})
+    assert r1.status_code == 200
+    assert r2.status_code == 429  # same direct peer, same bucket
+
+
+def test_verify_forwarded_for_rightmost_used_when_behind_proxy(monkeypatch):
+    monkeypatch.setattr(main, "VERIFY_RATE_LIMIT_PER_MINUTE", 1)
+    monkeypatch.setattr(main, "GATEWAY_BEHIND_PROXY", True)
+    ots_b64 = base64.b64encode(FAKE_OTS).decode()
+    r1 = client.post("/upgrade", json={"digest": DIGEST, "ots": ots_b64},
+                     headers={"X-Forwarded-For": "1.1.1.1, 9.9.9.9"})
+    r2 = client.post("/upgrade", json={"digest": DIGEST, "ots": ots_b64},
+                     headers={"X-Forwarded-For": "2.2.2.2, 9.9.9.9"})
+    r3 = client.post("/upgrade", json={"digest": DIGEST, "ots": ots_b64},
+                     headers={"X-Forwarded-For": "1.1.1.1, 8.8.8.8"})
+    assert r1.status_code == 200
+    assert r2.status_code == 429  # spoofed leftmost, same real client 9.9.9.9
+    assert r3.status_code == 200  # genuinely different client
+
+
+def test_verify_and_mint_buckets_independent(monkeypatch):
+    # The independence property — the point of the separate knob: draining
+    # the verify bucket leaves minting untouched, and vice versa.
+    monkeypatch.setattr(main, "VERIFY_RATE_LIMIT_PER_MINUTE", 1)
+    monkeypatch.setattr(main, "RATE_LIMIT_PER_MINUTE", 1)
+    ots_b64 = base64.b64encode(FAKE_OTS).decode()
+    assert client.post("/verify", json={"digest": DIGEST, "ots": ots_b64}).status_code == 200
+    assert client.post("/verify", json={"digest": DIGEST, "ots": ots_b64}).status_code == 429
+    with patch("main.requests.post", return_value=_post_mock()):
+        # Verify bucket empty; the mint bucket still has its full burst.
+        assert client.post("/timestamp", json={"digest": DIGEST}).status_code == 402
+        # Now the mint bucket is empty too — because of ITS traffic alone.
+        assert client.post("/timestamp", json={"digest": DIGEST}).status_code == 429
+    # And mint traffic never touched the verify dict's bucket count:
+    assert list(main._verify_rate_buckets) == ["testclient"]
+
+
+def test_paid_redemption_ungated_even_with_empty_verify_bucket(monkeypatch):
+    monkeypatch.setattr(main, "VERIFY_RATE_LIMIT_PER_MINUTE", 1)
+    ots_b64 = base64.b64encode(FAKE_OTS).decode()
+    assert client.post("/verify", json={"digest": DIGEST, "ots": ots_b64}).status_code == 200
+    assert client.post("/verify", json={"digest": DIGEST, "ots": ots_b64}).status_code == 429
+    token = valid_token()
+    with patch("main.requests.get", return_value=_settled_get()):
+        with patch("main.stamp_digest", return_value=FAKE_OTS):
+            resp = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+    assert resp.status_code == 200 and resp.content == FAKE_OTS
 
 
 def test_rate_limit_does_not_gate_paid_redemption(monkeypatch):

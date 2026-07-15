@@ -74,6 +74,7 @@ class GatewayConfig:
     price_conf_target: int
     price_blind_sats: int
     rate_limit_per_minute: int
+    verify_rate_limit_per_minute: int
     gateway_behind_proxy: bool
 
 
@@ -332,6 +333,20 @@ def _parse_config() -> GatewayConfig:
             f"got {rate_limit_per_minute}"
         )
 
+    # The free proof endpoints (/verify, /upgrade) get their own budget: they
+    # cost gateway CPU and private-calendar round-trips, not phoenixd storage,
+    # and a client legitimately polls /upgrade while an anchor pends — free
+    # traffic must never be able to starve the paid mint path.
+    try:
+        verify_rate_limit_per_minute = int(os.getenv("VERIFY_RATE_LIMIT_PER_MINUTE", "30"))
+    except ValueError:
+        raise RuntimeError("VERIFY_RATE_LIMIT_PER_MINUTE must be an integer")
+    if verify_rate_limit_per_minute < 0:
+        raise RuntimeError(
+            f"VERIFY_RATE_LIMIT_PER_MINUTE must be >= 0 (0 disables the limit), "
+            f"got {verify_rate_limit_per_minute}"
+        )
+
     # Whether a reverse proxy the OPERATOR controls sits in front of the
     # gateway. Only then is X-Forwarded-For consulted for the client address —
     # the header is client-forgeable and must never be trusted by default.
@@ -379,6 +394,7 @@ def _parse_config() -> GatewayConfig:
         price_conf_target=price_conf_target,
         price_blind_sats=price_blind_sats,
         rate_limit_per_minute=rate_limit_per_minute,
+        verify_rate_limit_per_minute=verify_rate_limit_per_minute,
         gateway_behind_proxy=gateway_behind_proxy,
     )
 
@@ -422,6 +438,7 @@ PRICE_MARGIN = _CONFIG.price_margin
 PRICE_CONF_TARGET = _CONFIG.price_conf_target
 PRICE_BLIND_SATS = _CONFIG.price_blind_sats
 RATE_LIMIT_PER_MINUTE = _CONFIG.rate_limit_per_minute
+VERIFY_RATE_LIMIT_PER_MINUTE = _CONFIG.verify_rate_limit_per_minute
 GATEWAY_BEHIND_PROXY = _CONFIG.gateway_behind_proxy
 
 if not LND_TLS_VERIFY:
@@ -463,6 +480,11 @@ def _proof_cache_put(payment_hash: str, ots_bytes: bytes) -> None:
 _RATE_BUCKETS_MAX = 10_000
 # ip -> (tokens remaining, time.monotonic() at the last refill)
 _rate_buckets: dict[str, tuple[float, float]] = {}
+# Same shape for the free proof endpoints (/verify, /upgrade): a separate
+# budget so free traffic can never starve the paid mint path. Same
+# _RATE_BUCKETS_MAX — past 10k rotating source addresses a per-IP limiter
+# is the wrong tool regardless of endpoint.
+_verify_rate_buckets: dict[str, tuple[float, float]] = {}
 
 
 def _client_ip(request: Request) -> str:
@@ -477,28 +499,43 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-def _rate_limit_retry_after(ip: str) -> int | None:
+def _bucket_retry_after(
+    buckets: dict[str, tuple[float, float]], ip: str, per_minute: int
+) -> int | None:
     """Take one token from ip's bucket. Returns None when the request is
     allowed, else the whole seconds (>= 1) until a token accrues. Capacity and
-    refill rate are both RATE_LIMIT_PER_MINUTE, so a full bucket is one
-    minute's allowance of burst. A denied request consumes nothing."""
-    if RATE_LIMIT_PER_MINUTE <= 0:
+    refill rate are both per_minute, so a full bucket is one minute's
+    allowance of burst. A denied request consumes nothing. One implementation
+    for every bucket dict, so the FIFO eviction bound cannot silently die in
+    a copy."""
+    if per_minute <= 0:
         return None
     now = time.monotonic()
-    tokens, last_refill = _rate_buckets.get(ip, (float(RATE_LIMIT_PER_MINUTE), now))
+    tokens, last_refill = buckets.get(ip, (float(per_minute), now))
     tokens = min(
-        float(RATE_LIMIT_PER_MINUTE),
-        tokens + (now - last_refill) * RATE_LIMIT_PER_MINUTE / 60,
+        float(per_minute),
+        tokens + (now - last_refill) * per_minute / 60,
     )
     if tokens >= 1:
         tokens -= 1
         retry_after = None
     else:
-        retry_after = math.ceil((1 - tokens) * 60 / RATE_LIMIT_PER_MINUTE)
-    if ip not in _rate_buckets and len(_rate_buckets) >= _RATE_BUCKETS_MAX:
-        del _rate_buckets[next(iter(_rate_buckets))]
-    _rate_buckets[ip] = (tokens, now)
+        retry_after = math.ceil((1 - tokens) * 60 / per_minute)
+    if ip not in buckets and len(buckets) >= _RATE_BUCKETS_MAX:
+        del buckets[next(iter(buckets))]
+    buckets[ip] = (tokens, now)
     return retry_after
+
+
+def _rate_limit_retry_after(ip: str) -> int | None:
+    """Invoice-mint bucket: bounds what a spammer can make phoenixd do."""
+    return _bucket_retry_after(_rate_buckets, ip, RATE_LIMIT_PER_MINUTE)
+
+
+def _verify_rate_limit_retry_after(ip: str) -> int | None:
+    """/verify + /upgrade bucket (one budget for both — they contend for the
+    same resources: gateway CPU and private-calendar round-trips)."""
+    return _bucket_retry_after(_verify_rate_buckets, ip, VERIFY_RATE_LIMIT_PER_MINUTE)
 
 
 # ── Durable obligation log ────────────────────────────────────────────────────
@@ -1513,7 +1550,17 @@ def health():
 
 
 @app.post("/verify")
-def verify(body: VerifyRequest):
+def verify(body: VerifyRequest, request: Request):
+    # Rate-limit BEFORE the base64 decode: parsing up to 256KB of
+    # attacker-controlled bytes is part of what the limiter defends; a
+    # denial must not pay the cost it exists to refuse.
+    retry_after = _verify_rate_limit_retry_after(_client_ip(request))
+    if retry_after is not None:
+        raise HTTPException(
+            status_code=429,
+            headers={"Retry-After": str(retry_after)},
+            detail={"status": "rate_limited", "retry_after_seconds": retry_after},
+        )
     try:
         ots_bytes = base64.b64decode(body.ots, validate=True)
     except Exception:
@@ -1538,7 +1585,15 @@ def verify(body: VerifyRequest):
 
 
 @app.post("/upgrade")
-def upgrade(body: VerifyRequest):
+def upgrade(body: VerifyRequest, request: Request):
+    # Same pre-decode gate as /verify — one shared bucket for both.
+    retry_after = _verify_rate_limit_retry_after(_client_ip(request))
+    if retry_after is not None:
+        raise HTTPException(
+            status_code=429,
+            headers={"Retry-After": str(retry_after)},
+            detail={"status": "rate_limited", "retry_after_seconds": retry_after},
+        )
     try:
         ots_bytes = base64.b64decode(body.ots, validate=True)
     except Exception:
