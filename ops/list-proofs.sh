@@ -4,8 +4,8 @@
 # checks — a check must not mutate what it is checking.
 set -u
 
-REPO="/home/gateway/timestamp-gateway"
-ARTIFACTS="/home/gateway/timestamp-gateway-live-artifacts"
+REPO="${REPO:-/home/gateway/timestamp-gateway}"
+ARTIFACTS="${ARTIFACTS:-/home/gateway/timestamp-gateway-live-artifacts}"
 OTS="$REPO/.venv/bin/ots"
 
 if [ ! -x "$OTS" ]; then

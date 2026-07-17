@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -u
 
-REPO="/home/gateway/timestamp-gateway"
-ARTIFACTS="/home/gateway/timestamp-gateway-live-artifacts"
+REPO="${REPO:-/home/gateway/timestamp-gateway}"
+ARTIFACTS="${ARTIFACTS:-/home/gateway/timestamp-gateway-live-artifacts}"
 UPGRADE="$REPO/ops/upgrade-proof.sh"
 STATUS_FILE="${PROOFS_STATUS_PATH:-/var/lib/timestamp-gateway/proofs-status}"
 

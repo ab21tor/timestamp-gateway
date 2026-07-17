@@ -4,7 +4,12 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>timestamp-gateway</title>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <!-- Vendored, byte-identical copy of qrcodejs 1.0.0 — no third-party fetch
+       from visitors' browsers (a CDN tag leaked every visitor's IP/referer to
+       Cloudflare, and broke the page where the CDN is unreachable).
+       Source: https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js
+       sha256(static/qrcode.min.js) = c541ef06327885a8415bca8df6071e14189b4855336def4f36db54bde8484f36 -->
+  <script src="qrcode.min.js"></script>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 

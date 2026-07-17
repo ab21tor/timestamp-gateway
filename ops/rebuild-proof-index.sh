@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="/home/gateway/timestamp-gateway"
-ARTIFACTS="/home/gateway/timestamp-gateway-live-artifacts"
+REPO="${REPO:-/home/gateway/timestamp-gateway}"
+ARTIFACTS="${ARTIFACTS:-/home/gateway/timestamp-gateway-live-artifacts}"
 INDEX="$ARTIFACTS/proofs.tsv"
 TMP="$INDEX.tmp"
 OTS="$REPO/.venv/bin/ots"

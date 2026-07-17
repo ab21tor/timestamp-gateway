@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 set -u
 
-REPO="/home/gateway/timestamp-gateway"
+REPO="${REPO:-/home/gateway/timestamp-gateway}"
+ARTIFACTS="${ARTIFACTS:-/home/gateway/timestamp-gateway-live-artifacts}"
 CALENDAR_URL="${CALENDAR_URL:-http://127.0.0.1:14788}"
 OTS="$REPO/.venv/bin/ots"
 
 ARTIFACT="${1:-}"
 
 if [ -z "$ARTIFACT" ]; then
-  ARTIFACT="$(find /home/gateway/timestamp-gateway-live-artifacts -maxdepth 2 -name proof.ots -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
+  ARTIFACT="$(find "$ARTIFACTS" -maxdepth 2 -name proof.ots -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
 fi
 
 if [ -z "$ARTIFACT" ]; then

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
-REPO="/home/gateway/timestamp-gateway"
+REPO="${REPO:-/home/gateway/timestamp-gateway}"
 SERVICE="${PHOENIXD_SERVICE:-phoenixd.service}"
 PHOENIX_HOME="${PHOENIX_HOME:-/home/gateway/phoenixd/home/.phoenix}"
 PHOENIX_URL="${PHOENIXD_URL:-http://127.0.0.1:9740}"

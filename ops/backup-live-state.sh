@@ -13,6 +13,10 @@
 #   BACKUP_AGE_RECIPIENT  age public key; empty = archive stays plaintext
 #   BACKUP_REMOTE         rsync destination user@host:path; empty = no push
 #   BACKUP_KEEP           newest archives kept in BACKUP_ROOT (default 7)
+#   PHOENIX_HOME          phoenixd state dir (seed.dat, wallet db)
+#   OTSD_CALENDAR_DIR     otsd calendar state, host path
+#   ARTIFACTS             proof artifacts dir
+#   UNIT_DIR              installed systemd units dir
 set -euo pipefail
 umask 077
 
@@ -67,6 +71,10 @@ STATE_DIR="${STATE_DIR:-/var/lib/timestamp-gateway}"
 STATUS_FILE="$STATE_DIR/backup-status"
 BACKUP_ROOT="${BACKUP_ROOT:-/home/gateway/timestamp-gateway-live-backups}"
 OTSD_FORK_PATH="${OTSD_FORK_PATH:-/home/gateway/opentimestamps-server}"
+PHOENIX_HOME="${PHOENIX_HOME:-/home/gateway/phoenixd/home/.phoenix}"
+OTSD_CALENDAR_DIR="${OTSD_CALENDAR_DIR:-/var/lib/otsd/calendar}"
+ARTIFACTS="${ARTIFACTS:-/home/gateway/timestamp-gateway-live-artifacts}"
+UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
 BACKUP_AGE_RECIPIENT="${BACKUP_AGE_RECIPIENT:-}"
 BACKUP_REMOTE="${BACKUP_REMOTE:-}"
 BACKUP_KEEP="${BACKUP_KEEP:-7}"
@@ -137,14 +145,14 @@ echo "=== creating sensitive archive ==="
 # cannot restore.
 tar -czf "$ARCHIVE" \
   "$REPO_DIR/.env" \
-  /etc/systemd/system/timestamp-gateway.service \
-  /etc/systemd/system/phoenixd.service \
-  /etc/systemd/system/socat-bitcoin-rpc.service \
-  /home/gateway/phoenixd/home/.phoenix \
-  /var/lib/otsd/calendar \
+  "$UNIT_DIR/timestamp-gateway.service" \
+  "$UNIT_DIR/phoenixd.service" \
+  "$UNIT_DIR/socat-bitcoin-rpc.service" \
+  "$PHOENIX_HOME" \
+  "$OTSD_CALENDAR_DIR" \
   "$STATE_DIR" \
   "$OTSD_FORK_PATH" \
-  /home/gateway/timestamp-gateway-live-artifacts \
+  "$ARTIFACTS" \
   "$OUTDIR" \
   2>"$OUTDIR/tar-warnings.txt"
 

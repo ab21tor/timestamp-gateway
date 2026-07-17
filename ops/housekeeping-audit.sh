@@ -4,9 +4,9 @@ set -euo pipefail
 export GIT_PAGER=cat
 export PAGER=cat
 
-ROOT="/home/gateway/timestamp-gateway"
-ART="/home/gateway/timestamp-gateway-live-artifacts"
-BACKUPS="/home/gateway/timestamp-gateway-live-backups"
+ROOT="${ROOT:-/home/gateway/timestamp-gateway}"
+ART="${ART:-/home/gateway/timestamp-gateway-live-artifacts}"
+BACKUPS="${BACKUPS:-/home/gateway/timestamp-gateway-live-backups}"
 
 cd "$ROOT"
 

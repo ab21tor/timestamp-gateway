@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -u
 
-REPO="/home/gateway/timestamp-gateway"
-ARTIFACTS="/home/gateway/timestamp-gateway-live-artifacts"
+REPO="${REPO:-/home/gateway/timestamp-gateway}"
+ARTIFACTS="${ARTIFACTS:-/home/gateway/timestamp-gateway-live-artifacts}"
 # set GATEWAY_URL in .env (e.g. your Tailscale IP)
 GATEWAY_URL="${GATEWAY_URL:-$(grep "^GATEWAY_URL=" "$REPO/.env" 2>/dev/null | cut -d= -f2- || echo "http://127.0.0.1:8000")}"
 
