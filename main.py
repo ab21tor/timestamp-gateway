@@ -620,6 +620,13 @@ def mark_obligation_stamped(payment_hash: str) -> None:
         conn.close()
 
 
+def _hash8(payment_hash: str) -> str:
+    """Routine-log form of a payment hash: first 8 hex + ellipsis. Enough to
+    correlate lines within a session; not enough to identify the payment on
+    the Lightning network. WARNING-level incident lines keep the full hash."""
+    return payment_hash[:8] + "…"
+
+
 def _sweep_obligations_once() -> None:
     """Retry every 'needs_stamp' obligation once. Each row uses short, independent
     transactions so a mid-run crash is safe and the sweeper never holds a long lock.
@@ -658,7 +665,7 @@ def _sweep_obligations_once() -> None:
 
         _proof_cache_put(payment_hash, ots_bytes)
         mark_obligation_stamped(payment_hash)
-        logging.info("Sweeper: recovered obligation %s", payment_hash)
+        logging.info("Sweeper: recovered obligation %s", _hash8(payment_hash))
 
 
 def _sweeper_loop(stop_event: threading.Event) -> None:
@@ -1674,7 +1681,7 @@ def timestamp(body: TimestampRequest, request: Request):
 
         # 4. Return cached proof if this payment_hash was already redeemed.
         if payment_hash in _proof_cache:
-            logging.info("Returning cached proof for payment_hash %s", payment_hash)
+            logging.info("Returning cached proof for payment_hash %s", _hash8(payment_hash))
             ots_bytes = _proof_cache[payment_hash]
             return Response(
                 content=ots_bytes,

@@ -1372,7 +1372,7 @@ def test_make_payment_backend_invalid():
         main._make_payment_backend("invalid")
 
 
-def test_same_token_preimage_reuse_returns_cached_proof_not_double_stamp():
+def test_same_token_preimage_reuse_returns_cached_proof_not_double_stamp(caplog):
     """A replayed valid token returns the cached proof without re-submitting to otsd."""
     token = valid_token()
     submit_calls = 0
@@ -1385,11 +1385,18 @@ def test_same_token_preimage_reuse_returns_cached_proof_not_double_stamp():
     with patch("main.requests.get", return_value=_settled_get()):
         with patch("main.stamp_digest", side_effect=lambda d: b"fake-ots-proof") as mock_stamp:
             resp1 = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
-            resp2 = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+            with caplog.at_level(logging.INFO):
+                resp2 = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
 
     assert resp1.status_code == 200
     assert resp2.status_code == 200
     assert mock_stamp.call_count == 1  # stamp_digest only called once despite two requests
+
+    # The routine cached-proof line carries only the 8-hex prefix; the full
+    # payment hash never enters routine (INFO) logs.
+    cached = [r.message for r in caplog.records if "Returning cached proof" in r.message]
+    assert cached and PAYMENT_HASH[:8] + "…" in cached[0]
+    assert PAYMENT_HASH not in cached[0]
 
 
 def test_phoenixd_backend_does_not_require_lnd_vars():
@@ -1589,14 +1596,15 @@ def test_obligation_stamp_failure_returns_502_and_persists_needs_stamp():
     assert row["digest"] == DIGEST
 
 
-def test_sweeper_completes_pending_obligation_and_bumps_attempts():
+def test_sweeper_completes_pending_obligation_and_bumps_attempts(caplog):
     """The sweeper stamps a needs_stamp row, marks it stamped, bumps attempts,
     and populates _proof_cache (mirroring the endpoint success path)."""
     main.record_obligation(PAYMENT_HASH, DIGEST)
     assert _obligation_row()["status"] == "needs_stamp"
 
     with patch("main.stamp_digest", return_value=FAKE_OTS) as stamp:
-        main._sweep_obligations_once()
+        with caplog.at_level(logging.INFO):
+            main._sweep_obligations_once()
 
     stamp.assert_called_once_with(DIGEST)
     row = _obligation_row()
@@ -1604,6 +1612,12 @@ def test_sweeper_completes_pending_obligation_and_bumps_attempts():
     assert row["attempts"] == 1
     assert row["last_attempt_at"] is not None
     assert main._proof_cache[PAYMENT_HASH] == FAKE_OTS
+
+    # Routine recovery line: 8-hex prefix only, never the full payment hash
+    # (WARNING-level incident lines keep the full hash for forensics).
+    recovered = [r.message for r in caplog.records if "Sweeper: recovered" in r.message]
+    assert recovered and PAYMENT_HASH[:8] + "…" in recovered[0]
+    assert PAYMENT_HASH not in recovered[0]
 
 
 def test_sweeper_records_attempt_on_repeated_failure():
