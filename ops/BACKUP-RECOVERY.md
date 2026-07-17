@@ -112,7 +112,7 @@ Current Docker shape:
 - working dir: `/app`
 - app mount: `/home/gateway/opentimestamps-server:/app`
 - calendar mount: `/var/lib/otsd/calendar:/calendar`
-- command: `python3 otsd --calendar /calendar --btc-conf-target 12 -v`
+- command: `python3 otsd --calendar /calendar --btc-conf-target 12 -v` (verified 2026-07-17, docker inspect. The shipped run commands add `--btc-max-fee 0.0002` and drop `-v`; both land when the installed unit is next updated — see OPERATOR-NOTES "otsd boundary".)
 
 Current plain anchoring policy:
 

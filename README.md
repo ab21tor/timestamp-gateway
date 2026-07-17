@@ -27,7 +27,7 @@ Tor is supported, but not mandatory. VPS is supported, but not mandatory. Tor-on
 
 **Does not:**
 - Store files or documents.
-- Log digests, preimages, or client identities.
+- Log digests, preimages, or client identities — there is no access log (see [Privacy trade-offs](#privacy-trade-offs)).
 - Prove authorship, ownership, provenance, or claim validity.
 - Prove truth.
 - Anchor to Bitcoin itself — that is the OTS calendar backend's job.
@@ -301,7 +301,23 @@ Options:
 
 Lightning graph exposure is permanent. If your Lightning node advertises a clearnet IP, that association is recorded by Lightning explorers and cannot be undone.
 
-The gateway does not log digests, client IPs, or payment preimages beyond normal uvicorn access logs.
+**What the gateway records.** The gateway runs with uvicorn's access log
+disabled (`--no-access-log` in both shipped launch paths): there is no
+per-request log, so no client-IP or request-timing record exists anywhere.
+The application log contains no digests, preimages, or client addresses;
+routine lines truncate payment hashes to an 8-hex prefix, and only
+WARNING-level incident lines (a failing re-stamp, a Lightning liquidity-fee
+event) carry a full payment hash. One bounded residual: malformed tokens or
+proofs are logged with tracebacks, which can echo fragments of the malformed
+input itself — accepted, since by definition such input is not a valid
+secret or proof.
+
+**Where a digest does persist.** The Lightning invoice memo is the digest —
+that binding is how payment is verified — so every paid digest is stored,
+with its payment hash, amount, and time, in the operator's payment backend
+(phoenixd's own database) and in any backup of it. Clients should assume the
+operator's wallet layer retains this linkage even though the gateway itself
+keeps digests only in its obligation log.
 
 ---
 

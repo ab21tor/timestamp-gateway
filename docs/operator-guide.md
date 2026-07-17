@@ -384,12 +384,12 @@ When the gateway sits behind a reverse proxy, also set `GATEWAY_BEHIND_PROXY=tru
 ## Monitoring
 
 ```bash
-docker compose logs -f gateway   # gateway + uvicorn access log
+docker compose logs -f gateway   # gateway application log (no access log)
 docker compose logs -f tor       # Tor process
 docker compose logs -f otsd      # OTS calendar server
 ```
 
-The gateway logs one line per request (uvicorn access log) and logs warnings/errors for payment backend and OTS backend failures at `WARNING`/`ERROR` level. It does not log digests or preimages.
+The gateway runs without an access log (`--no-access-log` in both shipped launch paths) and logs warnings/errors for payment backend and OTS backend failures at `WARNING`/`ERROR` level. For the precise logging posture — what is never logged, payment-hash truncation, the traceback residual, and where digests do persist — see the README's "Privacy trade-offs" section.
 
 ### What `otsd: error` in `/health` means (and what it does not)
 
@@ -406,7 +406,7 @@ Two different "anchoring isn't happening" signals, and how to tell them apart:
 
 The otsd-hot wallet funds anchoring transactions. If it drains, anchoring silently stops — so its balance is checked unattended and surfaced through `/health`.
 
-**How it works:** `ops/wallet-balance-check.sh` (run by a systemd timer every 30 minutes) reads the wallet balance over Bitcoin JSON-RPC (`getbalances`, via `BITCOIN_RPC_SERVICE_URL` from `.env`), compares it against `WALLET_MIN_SATS` (default 50000), and atomically writes a one-line JSON status file (`WALLET_STATUS_PATH`, default `/var/lib/timestamp-gateway/wallet-status`). `/health` reads only that file — the gateway never talks to Bitcoin RPC and never holds wallet credentials.
+**How it works:** `ops/wallet-balance-check.sh` (run by a systemd timer every 30 minutes) reads the wallet balance over Bitcoin JSON-RPC (`getbalances`, via `BITCOIN_RPC_SERVICE_URL` from `.env`), compares it against `WALLET_MIN_SATS` (default 50000), and atomically writes a one-line JSON status file (`WALLET_STATUS_PATH`, default `/var/lib/timestamp-gateway/wallet-status`). `/health` reads only that file — the wallet field never comes from the gateway talking to Bitcoin RPC, and the gateway holds no wallet credential for it. (The gateway's one Bitcoin RPC use is fee estimation for the pricing floor: `PRICE_RPC_URL` — which, honest caveat, falls back to the wallet-scoped `BITCOIN_RPC_SERVICE_URL` when unset. Set a dedicated node-level `PRICE_RPC_URL` if you can; see `.env.example`.)
 
 **Install the timer:**
 

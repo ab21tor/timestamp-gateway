@@ -137,16 +137,22 @@ Once a channel is open, subsequent payments arrive at full value with no deducti
 
 The local calendar is your own `otsd`, not the public OpenTimestamps calendars.
 
-Current command:
+Current command (verified 2026-07-17, docker inspect; rotations are
+pull+restart and do not touch the installed unit):
 
 `python3 otsd --calendar /calendar --btc-conf-target 12 -v`
+
+Two committed changes are pending the next installed-unit update — the
+shipped run commands (docker-compose.yml, deploy/otsd.service.example)
+already carry both: `--btc-max-fee 0.0002` (fee cap) and the removal of
+`-v` (INFO as the production log level).
 
 Current policy:
 
 - batch up to 6 hours by default
 - when anchoring, aim for about 12-block Bitcoin confirmation
 - save the Bitcoin proof after 6 confirmations by default
-- fee cap (in the shipped run commands; reaches the VPS only when its systemd unit is updated, at rotation): `--btc-max-fee 0.0002` — the flag takes BTC, 0.0002 BTC = 20,000 sats; never "fix" it to 20000, that would mean 20,000 BTC. Bounds one anchor cycle's total spend across its RBF bump ladder. At the cap otsd logs `Maximum txfee reached!` and waits — the last under-cap transaction stays pending until fees fall or it confirms; a sustained spike means proofs stay pending. Intended trade: wallet safety over anchor latency.
+- fee cap (in the shipped run commands; NOT live on the VPS — a rotation is pull+restart and does not touch the installed unit, so it lands only when the unit is next updated): `--btc-max-fee 0.0002` — the flag takes BTC, 0.0002 BTC = 20,000 sats; never "fix" it to 20000, that would mean 20,000 BTC. Bounds one anchor cycle's total spend across its RBF bump ladder. At the cap otsd logs `Maximum txfee reached!` and waits — the last under-cap transaction stays pending until fees fall or it confirms; a sustained spike means proofs stay pending. Intended trade: wallet safety over anchor latency. Until the unit update, the live cap is otsd's default `--btc-max-fee 0.001` (100,000 sats).
 
 The 6-hour default comes from:
 
