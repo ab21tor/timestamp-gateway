@@ -46,5 +46,6 @@ chmod 600 "$INDEX"
 
 echo "state: index_written"
 echo "index: $INDEX"
-echo
-cat "$INDEX"
+# Count only on stdout: the timer sends this output to journald, and the
+# index content (digest <-> txid linkage) must live only in the 600-mode file.
+echo "entries: $PROOF_COUNT"

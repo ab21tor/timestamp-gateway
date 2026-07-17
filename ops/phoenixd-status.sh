@@ -48,7 +48,10 @@ systemctl --no-pager show "$SERVICE" \
 echo
 
 echo "=== process ==="
-pgrep -af phoenixd || true
+# Count only — pgrep -af would echo phoenixd's argv (paths, flags) into
+# status output that lands in backup snapshots and journald.
+PROC_COUNT="$(pgrep -fc phoenixd 2>/dev/null || true)"
+echo "phoenixd_processes: ${PROC_COUNT:-0}"
 echo
 
 echo "=== api ==="
@@ -63,7 +66,13 @@ else
 fi
 
 if [ -n "$PASSWORD" ]; then
-  curl -sS --max-time 10 -u ":$PASSWORD" "$PHOENIX_URL/getinfo" || true
+  # Password via curl stdin-config — never argv (ps-visible). Same pattern as
+  # notify.sh / wallet-balance-check.sh; curl stderr discarded because a
+  # config parse error can echo the config (password) back.
+  curl -sS --max-time 10 --config - 2>/dev/null <<EOF || true
+url = "$PHOENIX_URL/getinfo"
+user = ":$PASSWORD"
+EOF
   echo
 else
   echo "state: needs_attention"

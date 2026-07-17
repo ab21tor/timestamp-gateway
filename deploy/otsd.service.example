@@ -3,8 +3,11 @@
 # then: systemctl daemon-reload && systemctl enable --now otsd
 #
 # Companion file /etc/systemd/system/otsd.env (root-owned, mode 600) holds
-# BITCOIN_RPC_SERVICE_URL — the full RPC URL including credentials. It lives
-# in that file only, never on a command line and never in tracked files.
+# BITCOIN_RPC_SERVICE_URL — the full RPC URL including credentials. Docker
+# reads that file directly (--env-file below), so the URL never appears on a
+# command line (ps/argv) and never in tracked files. Residual: `docker
+# inspect otsd` still shows the container's env to local root — unavoidable
+# for container env, and why backup archives must stay encrypted.
 #
 # The otsd-local image is built per otsd/Dockerfile with the
 # opentimestamps-server fork checkout as the named "fork" build context
@@ -31,13 +34,12 @@ Requires=docker.service socat-bitcoin-rpc.service
 [Service]
 # The service user needs docker group membership; or run as root and omit this line.
 User=gateway
-EnvironmentFile=/etc/systemd/system/otsd.env
 ExecStartPre=-/usr/bin/docker rm -f otsd
 ExecStart=/usr/bin/docker run --name otsd --network host \
   -v /var/lib/otsd/calendar:/calendar \
   -v /home/gateway/opentimestamps-server:/app \
   -w /app \
-  -e BITCOIN_RPC_SERVICE_URL=${BITCOIN_RPC_SERVICE_URL} \
+  --env-file /etc/systemd/system/otsd.env \
   otsd-local python3 otsd --calendar /calendar --btc-conf-target 12 --btc-max-fee 0.0002 -v
 Restart=on-failure
 RestartSec=30
