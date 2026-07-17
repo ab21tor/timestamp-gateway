@@ -40,7 +40,7 @@ ExecStart=/usr/bin/docker run --name otsd --network host \
   -v /home/gateway/opentimestamps-server:/app \
   -w /app \
   --env-file /etc/systemd/system/otsd.env \
-  otsd-local python3 otsd --calendar /calendar --btc-conf-target 12 --btc-max-fee 0.0002 -v
+  otsd-local python3 otsd --calendar /calendar --btc-conf-target 12 --btc-max-fee 0.0002
 Restart=on-failure
 RestartSec=30
 

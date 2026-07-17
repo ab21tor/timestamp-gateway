@@ -99,51 +99,71 @@ for i, a in enumerate(args):
 echo "btc_conf_target: ${BTC_TARGET} blocks"
 echo
 
-echo "=== network fees ==="
-FEES=$(curl -sS --max-time 5 https://mempool.space/api/v1/fees/recommended 2>/dev/null || echo "")
-if [ -n "$FEES" ]; then
-  echo "$FEES" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-fastest = d.get('fastestFee', '?')
-half    = d.get('halfHourFee', '?')
-hour    = d.get('hourFee', '?')
-economy = d.get('economyFee', '?')
-print(f'fastest_fee:   {fastest} sat/vB')
-print(f'half_hour_fee: {half} sat/vB')
-print(f'hour_fee:      {hour} sat/vB')
-print(f'economy_fee:   {economy} sat/vB')
-est = hour * 256
-print(f'est_anchor_tx: ~{est} sats (hour_fee x 256 vB)')
-" 2>/dev/null
+echo "=== network fees (operator node) ==="
+# estimatesmartfee via the operator's own node — no third-party fee API in
+# the ops path. The RPC URL (with credentials) comes from the gitignored
+# .env and goes to curl via stdin config (never argv); stderr is discarded
+# because it can echo the URL back (wallet-balance-check.sh pattern).
+# PRICE_RPC_URL preferred, BITCOIN_RPC_SERVICE_URL fallback — mirroring the
+# gateway's own pricing-floor lookup. Anchor vsize comes from
+# PRICE_TX_VSIZE_ESTIMATE so status, quote floor, and docs share one number.
+FEE_RPC_URL=""
+CONF_TARGET="6"
+VSIZE="150"
+if [ -f "$REPO/.env" ]; then
+  FEE_RPC_URL="$(grep '^PRICE_RPC_URL=' "$REPO/.env" | cut -d= -f2-)"
+  if [ -z "$FEE_RPC_URL" ]; then
+    FEE_RPC_URL="$(grep '^BITCOIN_RPC_SERVICE_URL=' "$REPO/.env" | cut -d= -f2-)"
+  fi
+  CT="$(grep '^PRICE_CONF_TARGET=' "$REPO/.env" | cut -d= -f2-)"
+  [ -n "$CT" ] && CONF_TARGET="$CT"
+  VS="$(grep '^PRICE_TX_VSIZE_ESTIMATE=' "$REPO/.env" | cut -d= -f2-)"
+  [ -n "$VS" ] && VSIZE="$VS"
+fi
+FEERATE_SAT_VB=""
+if [ -n "$FEE_RPC_URL" ]; then
+  RESPONSE="$(curl -sS --max-time 10 \
+    -H 'Content-Type: text/plain' \
+    --data-binary "{\"jsonrpc\":\"1.0\",\"id\":\"status-fees\",\"method\":\"estimatesmartfee\",\"params\":[$CONF_TARGET]}" \
+    --config - 2>/dev/null <<EOF
+url = "$FEE_RPC_URL"
+EOF
+)" || RESPONSE=""
+  FEERATE_SAT_VB="$(printf '%s' "$RESPONSE" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    rate = data["result"]["feerate"]  # BTC/kvB
+    print(round(rate * 100_000_000 / 1000, 1))
+except Exception:
+    pass
+' 2>/dev/null)"
+fi
+if [ -n "$FEERATE_SAT_VB" ]; then
+  echo "feerate: $FEERATE_SAT_VB sat/vB (estimatesmartfee, conf_target $CONF_TARGET)"
+  python3 -c "print(f'est_anchor_tx: ~{round($FEERATE_SAT_VB * $VSIZE)} sats ($FEERATE_SAT_VB sat/vB x $VSIZE vB)')"
 else
-  echo "fees: unavailable"
+  echo "fees: unavailable (no RPC URL in .env, node unreachable, or no estimate)"
 fi
 echo
 
 echo "=== anchor economics ==="
 BATCH_SIZE=$(awk 'NR > 1 && $1=="waiting_for_bitcoin" {count++} END {print (count ? count : 1)}' "$ARTIFACTS/proofs.tsv" 2>/dev/null || echo 1)
-if [ -n "$FEES" ] && [ -n "${PRICE:-}" ]; then
-  echo "$FEES" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-hour    = d.get('hourFee', 0)
-fastest = d.get('fastestFee', 0)
-anchor_tx_sats = hour * 256
-batch = $BATCH_SIZE
-cost_per_proof = anchor_tx_sats / batch if batch > 0 else anchor_tx_sats
-price = ${PRICE:-500}
-margin = price - cost_per_proof
+if [ -n "$FEERATE_SAT_VB" ] && [ -n "${PRICE:-}" ]; then
+  python3 - "$FEERATE_SAT_VB" "$VSIZE" "$BATCH_SIZE" "${PRICE:-500}" 2>/dev/null <<'PY'
+import sys
+rate, vsize, batch, price = float(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+anchor = rate * vsize
+cost = anchor / batch if batch > 0 else anchor
+margin = price - cost
 pct = (margin / price * 100) if price > 0 else 0
 print(f'current_batch_size:      {batch} proofs (waiting_for_bitcoin)')
-print(f'anchor_tx_fee:           ~{anchor_tx_sats:.0f} sats ({hour} sat/vB x 256 vB)')
-print(f'anchor_cost_per_proof:   ~{cost_per_proof:.1f} sats (tx_fee / batch_size)')
+print(f'anchor_tx_fee:           ~{anchor:.0f} sats ({rate} sat/vB x {vsize} vB)')
+print(f'anchor_cost_per_proof:   ~{cost:.1f} sats (tx_fee / batch_size)')
 print(f'proof_price:             {price} sats')
 print(f'margin_per_proof:        ~{margin:.1f} sats ({pct:.1f}%)')
 print(f'batch_revenue:           ~{price * batch:.0f} sats ({batch} proofs x {price} sats)')
-print()
-
-" 2>/dev/null
+PY
 else
   echo "economics: unavailable"
 fi

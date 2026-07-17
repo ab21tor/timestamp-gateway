@@ -15,10 +15,22 @@
 #
 # The reference production deployment runs the gateway under systemd
 # instead; both paths are documented in docs/operator-guide.md.
+
+# Bounded container logs for every service: without this, the json-file
+# driver keeps every line until the container is recreated — an unbounded,
+# unrotated record (the otsd log includes per-request lines; see
+# reports/privacy-inventory.md).
+x-logging: &bounded-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   gateway:
     build: .
     env_file: .env
+    logging: *bounded-logging
     restart: unless-stopped
     depends_on:
       - tor
@@ -52,6 +64,7 @@ services:
     build: ./tor
     volumes:
       - tor_keys:/var/lib/tor
+    logging: *bounded-logging
     restart: unless-stopped
     networks:
       - ts_net
@@ -87,6 +100,7 @@ services:
       additional_contexts:
         fork: ${OTSD_FORK_PATH:-../opentimestamps-server}
     profiles: ["calendar"]
+    logging: *bounded-logging
     restart: unless-stopped
     networks:
       - ts_net
@@ -95,7 +109,9 @@ services:
     # --rpc-address 0.0.0.0: reachable on the compose network (unpublished);
     # the image default binds localhost for non-compose runs.
     # --btc-max-fee takes BTC: 0.0002 BTC = 20,000 sats. Never "fix" it to 20000.
-    command: ["python", "/app/otsd", "--rpc-address", "0.0.0.0", "--calendar", "/calendar", "--btc-conf-target", "12", "--btc-max-fee", "0.0002", "-v"]
+    # No -v: INFO is the production level — DEBUG ships commitment hexes and
+    # wallet outpoints into the container log (reports/privacy-inventory.md §5).
+    command: ["python", "/app/otsd", "--rpc-address", "0.0.0.0", "--calendar", "/calendar", "--btc-conf-target", "12", "--btc-max-fee", "0.0002"]
     volumes:
       # Calendar state — the proof namespace. Destroying it strands every
       # pending proof this calendar has issued. Default: named volume; set
@@ -121,6 +137,7 @@ services:
   rpc-bridge:
     build: ./tor
     profiles: ["onion-rpc"]
+    logging: *bounded-logging
     restart: unless-stopped
     depends_on:
       - tor
