@@ -1031,6 +1031,19 @@ def test_health_never_raises():
     assert resp.json()["payment"] == "error"
 
 
+def test_health_otsd_probe_timeout_pairs_with_fork_homepage():
+    """The otsd probe's read leg races otsd's FULL homepage render (headers
+    commit instantly; the body arrives in one write after ~4 Bitcoin RPCs over
+    Tor, each allowed a 30s stall by the fork's make_proxy(timeout=30)), so a
+    single-stall render can honestly take ~34s. A plain timeout=5 marked ~11%
+    of honest renders red (2026-07-17). Pin (5, 45) so neither side of the
+    pair moves alone."""
+    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]) as mock_get:
+        resp = client.get("/health")
+    assert resp.status_code == 200
+    assert mock_get.call_args_list[1].kwargs["timeout"] == (5, 45)
+
+
 # ══ 11. Error discipline (cross-cutting) ═══════════════════════════════════════
 
 def test_lnd_create_error_detail_is_generic_no_leak():

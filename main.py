@@ -1497,7 +1497,15 @@ def health():
     if OTS_CALENDAR_URL:
         otsd_status = "ok"
         try:
-            resp = requests.get(OTS_CALENDAR_URL, timeout=5)
+            # (5, 45): connect is local (compose network / localhost) — 5s is
+            # generous. The read leg races otsd's FULL homepage render: otsd
+            # commits headers instantly and writes the body in ONE shot after
+            # ~4 Bitcoin RPCs over Tor, each allowed up to a 30s stall by the
+            # fork's make_proxy(timeout=30) — so a single-stall render can
+            # honestly take ~34s. A plain 5 here timed out ~11% of honest
+            # renders (2026-07-17). Paired with the fork homepage timeout:
+            # change the two together.
+            resp = requests.get(OTS_CALENDAR_URL, timeout=(5, 45))
             resp.raise_for_status()
             # A 200 from otsd proves nothing: its homepage commits the status
             # line (fork rpc.py:204) BEFORE any Bitcoin call, and both failure
