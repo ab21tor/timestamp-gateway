@@ -143,7 +143,7 @@ services:
       - tor
     networks:
       - ts_net
-    command: ["socat", "TCP-LISTEN:18332,fork,reuseaddr", "SOCKS4A:tor:${BITCOIN_RPC_ONION:-}:8332,socksport=9050"]
+    command: ["socat", "TCP-LISTEN:18332,fork,reuseaddr,keepalive", "SOCKS4A:tor:${BITCOIN_RPC_ONION:-}:8332,socksport=9050"]
 
 networks:
   ts_net:

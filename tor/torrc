@@ -1,6 +1,10 @@
 # SOCKS proxy — used by the gateway container to reach onion LND endpoints.
 SocksPort 0.0.0.0:9050
 
+# A stream stuck on a dead rendezvous detaches and retries on a fresh
+# circuit instead of hanging (default schedule is minutes).
+CircuitStreamTimeout 15
+
 # Hidden service — exposes the gateway at a .onion address.
 # After first start, read the address with:
 #   docker compose exec tor cat /var/lib/tor/timestamp_gateway/hostname

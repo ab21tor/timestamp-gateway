@@ -5,6 +5,15 @@
 # YOUR_NODE_ONION: your Bitcoin node's RPC hidden service address
 # (Start9: Services > Bitcoin Core > Interfaces). Keep the real
 # address out of git.
+#
+# keepalive (in the listener address below) pairs with the tor-side
+# circuit-freshness setting (CircuitStreamTimeout 15 — shipped in tor/torrc
+# for the compose tor; apply the same line to the HOST tor's torrc on this
+# systemd path). Together they target the documented intro-point-rotation
+# wedge: the onion service rotates its introduction points, and a long-lived
+# forked socat child otherwise keeps forwarding into a rendezvous circuit Tor
+# has rotated out — accepting local connections that hang the full client
+# timeout — until a socat restart or a descriptor refresh.
 
 [Unit]
 Description=Socat bridge: localhost:18332 -> Bitcoin RPC over Tor
@@ -12,7 +21,7 @@ After=network.target tor.service
 
 [Service]
 User=gateway
-ExecStart=/usr/bin/socat TCP-LISTEN:18332,bind=127.0.0.1,fork,reuseaddr SOCKS4A:127.0.0.1:YOUR_NODE_ONION:8332,socksport=9050
+ExecStart=/usr/bin/socat TCP-LISTEN:18332,bind=127.0.0.1,fork,reuseaddr,keepalive SOCKS4A:127.0.0.1:YOUR_NODE_ONION:8332,socksport=9050
 Restart=always
 RestartSec=10
 
