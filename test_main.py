@@ -38,6 +38,12 @@ os.environ["OTS_SUBMIT_BACKOFF_SECONDS"] = "0"     # keep retry tests fast
 os.environ["OBLIGATIONS_DB_PATH"] = ":memory:"     # overridden per-test by fixture below
 os.environ["RATE_LIMIT_PER_MINUTE"] = "0"          # whole suite shares one client IP;
                                                    # rate-limit tests patch the global
+# Pin the pricing-floor RPC to unset: main's load_dotenv() reads the repo's
+# real .env at import, and an inherited BITCOIN_RPC_SERVICE_URL makes
+# quoted_price_sats() spend a (mocked) fetch on whichever test first sees an
+# empty feerate cache — an environment-dependent extra requests.post call.
+os.environ["PRICE_RPC_URL"] = ""
+os.environ["BITCOIN_RPC_SERVICE_URL"] = ""
 
 import main  # noqa: E402
 from fastapi import HTTPException  # noqa: E402
