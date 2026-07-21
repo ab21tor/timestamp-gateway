@@ -121,12 +121,15 @@ The arithmetic that matters is not the exact figures:
 
     received = invoiced − liquidity fee
 
-The fee can exceed the whole margin of a small first payment — or the payment itself. The gateway's verify_payment check requires the received amount to meet the mint-time price, so a first payment eaten by the liquidity fee is refused: the payer paid, got no proof, and sees another 402.
+The fee can exceed the whole margin of a small first payment — or the payment itself.
+
+What the gateway does about it (pinned by the H3 tests in test_main.py): verify_payment checks the invoice's FACE amount (requestedSat) against the mint-time price, never the credited amount — a settled bolt11 is atomic, so settlement proves the payer paid the face amount in full. A settled first payment gets its proof; the liquidity fee nets the OPERATOR's credit and logs a WARNING ("Liquidity fee observed: requested N sat, received M sat"). The customer is never refused over ACINQ's fee.
+
+The remaining failure mode is upstream of the gateway: a payment too small to carry the fee fails to settle at the Lightning layer — no sats move, the invoice stays unpaid, and a retry after pre-funding succeeds. (phoenixd liquidity-policy behaviour; not yet exercised on this deployment — unverified.)
 
 Mitigations:
 - Pre-fund the Phoenixd node by receiving a payment before going live — concrete walkthrough: operator guide, "First payment: pre-fund before going live"
-- Set GATEWAY_PRICE_SATS high enough to absorb the worst-case liquidity fee on first receive
-- Accept that the first proof on a fresh node may fail and require the client to retry
+- Price so the first-receive fee cannot dominate your margin — the fee is your cost, not the customer's shortfall
 
 Once a channel is open, subsequent payments arrive at full value with no deduction.
 

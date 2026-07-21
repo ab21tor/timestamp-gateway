@@ -18,8 +18,7 @@
 
 # Bounded container logs for every service: without this, the json-file
 # driver keeps every line until the container is recreated — an unbounded,
-# unrotated record (the otsd log includes per-request lines; see
-# reports/privacy-inventory.md).
+# unrotated record (the otsd log includes per-request lines).
 x-logging: &bounded-logging
   driver: json-file
   options:
@@ -106,7 +105,7 @@ services:
     # --btc-max-fee takes BTC (0.0002 BTC = 20,000 sats — never "fix" it to
     # 20000); cap semantics: operator guide, "Bitcoin transaction cost".
     # No -v: INFO is the production level — DEBUG ships commitment hexes and
-    # wallet outpoints into the container log (reports/privacy-inventory.md §5).
+    # wallet outpoints into the container log.
     command: ["python", "/app/otsd", "--rpc-address", "0.0.0.0", "--calendar", "/calendar", "--btc-conf-target", "12", "--btc-max-fee", "0.0002"]
     volumes:
       # Calendar state — the proof namespace. Destroying it strands every

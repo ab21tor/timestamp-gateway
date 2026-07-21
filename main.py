@@ -1042,7 +1042,7 @@ def verify_l402_token(macaroon_b64: str, digest: str) -> tuple[str, int]:
     Checks token integrity (signature), the digest binding, the capability
     binding, and the expiry. The price is read from the macaroon's own signed
     caveat rather than compared to the current configured price: a token minted
-    at price N validates at N forever, so repricing between challenge and
+    at price N validates at N for its whole validity window, so repricing between challenge and
     payment never strands an in-flight invoice. The HMAC prevents a client
     from lowering the caveat; what the mint-time price must buy is enforced
     against the settled invoice in verify_payment. On success returns
@@ -1399,7 +1399,7 @@ PAYMENT_BACKEND: PaymentBackend = _make_payment_backend(PAYMENT_BACKEND_TYPE)
 
 
 def create_invoice(memo: str, amount_sats: int) -> tuple[str, str]:
-    """Call LND REST API to create a Lightning invoice. Returns
+    """Create a Lightning invoice via the configured payment backend. Returns
     (payment_request, payment_hash_hex). Raises HTTPException 502 on any failure."""
     invoice = PAYMENT_BACKEND.create_invoice(memo, amount_sats)
     return invoice.bolt11, invoice.payment_hash

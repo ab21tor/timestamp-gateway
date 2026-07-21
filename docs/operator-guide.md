@@ -240,7 +240,7 @@ phoenixd is the live payment backend: a self-custodial Lightning node daemon by 
 
 ### First payment: pre-fund before going live
 
-A fresh phoenixd's first received payment triggers the automatic channel open, and ACINQ's liquidity fee is deducted **from that payment**. If the first payment is a customer's small stamp purchase, the fee can swallow it: the received amount lands below the invoiced amount, the gateway's own amount check refuses to hand over the proof, and the customer experience is "I paid and got another 402" (the arithmetic and current fee figures: `ops/OPERATOR-NOTES.md`, "Phoenixd first payment warning").
+A fresh phoenixd's first received payment triggers the automatic channel open, and ACINQ's liquidity fee is deducted **from that payment**. A settled first payment still gets its proof — verify_payment checks the invoice's face amount, so the fee nets the operator's credit, never the customer's proof (mechanics and the pinning tests: `ops/OPERATOR-NOTES.md`, "Phoenixd first payment warning"). The risk sits upstream: a first payment too small to carry the fee can fail to settle at all (phoenixd liquidity policy; unverified on this deployment), and either way the fee comes out of your margin.
 
 So make the first payment yourself, out of band, before the first real sale — one deliberately larger payment (~25,000–30,000 sats — see the README's budget table) that absorbs the channel-open fee and leaves the channel open for full-value payments afterwards:
 
@@ -270,7 +270,7 @@ After this, the channel exists and subsequent payments — the real sales — ar
 
 ## Pricing
 
-The 402 challenge quotes `max(GATEWAY_PRICE_SATS, floor)`. With a feerate available (`estimatesmartfee` over `PRICE_RPC_URL`, or the `BITCOIN_RPC_SERVICE_URL` fallback) the floor is the solvency floor — estimated anchor cost with bump reserve and margin, so the gateway is structurally unable to quote below what anchoring costs it. Without a feerate — no RPC URL configured, node down or timing out, no estimate for the target — the floor is `PRICE_BLIND_SATS` (default 5000). That is what the blind price is for: a blind gateway cannot tell a calm fee market from a spiking one, so it quotes a price the market cannot hurt it with — 5000 sats covers a 20 sat/vB anchor at cost with margin. It never quotes the bare static price on failure and it never refuses to quote; every blind quote is preceded by a logged warning. A token minted at any of these prices validates at its mint-time price forever.
+The 402 challenge quotes `max(GATEWAY_PRICE_SATS, floor)`. With a feerate available (`estimatesmartfee` over `PRICE_RPC_URL`, or the `BITCOIN_RPC_SERVICE_URL` fallback) the floor is the solvency floor — estimated anchor cost with bump reserve and margin, so the gateway is structurally unable to quote below what anchoring costs it. Without a feerate — no RPC URL configured, node down or timing out, no estimate for the target — the floor is `PRICE_BLIND_SATS` (default 5000). That is what the blind price is for: a blind gateway cannot tell a calm fee market from a spiking one, so it quotes a price the market cannot hurt it with — 5000 sats covers a 20 sat/vB anchor at cost with margin. It never quotes the bare static price on failure and it never refuses to quote; every blind quote is preceded by a logged warning. A token minted at any of these prices validates at its mint-time price for its whole validity window (L402_TOKEN_EXPIRY_SECONDS).
 
 ---
 

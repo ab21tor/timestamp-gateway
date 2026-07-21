@@ -123,7 +123,8 @@
     <div class="ok">Payment verified. Timestamp submitted.</div>
     <div class="note">
       Your .ots file download has started. The timestamp will be confirmed
-      once it is anchored in a Bitcoin block (~1 hour). Verify it later with
+      once it is anchored in a Bitcoin block — typically a few hours under
+      the shipped defaults. Verify it later with
       the OpenTimestamps client: <code>ots verify &lt;file&gt;.ots</code>
     </div>
     <button onclick="reset()">Timestamp another digest</button>
@@ -247,9 +248,14 @@
     } else if (resp.status === 402) {
       setError('payment-error', 'Payment not settled yet. Pay the invoice, then try again.');
     } else if (resp.status === 401) {
-      setError('payment-error', 'Invalid L402 preimage format. Enter the 64-character payment preimage.');
+      setError('payment-error', 'Token invalid, expired, or for a different digest. If it expired, submit the digest again for a new invoice.');
     } else {
-      setError('payment-error', 'Error ' + resp.status + '. Check server logs.');
+      let detail = '';
+      try {
+        const d = await resp.json();
+        if (d && d.detail) detail = ': ' + (typeof d.detail === 'string' ? d.detail : JSON.stringify(d.detail));
+      } catch (e) {}
+      setError('payment-error', 'Error ' + resp.status + detail);
     }
   }
 
