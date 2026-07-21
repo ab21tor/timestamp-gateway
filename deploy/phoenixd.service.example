@@ -1,0 +1,43 @@
+# phoenixd under systemd: the Lightning wallet holding the gateway's funds.
+# phoenixd stays OUTSIDE the compose stack by design; this unit runs it on
+# the Docker host, bound where the gateway container can reach it.
+# Copy to /etc/systemd/system/phoenixd.service, edit User= and the
+# /home/gateway path for your host, then:
+# systemctl daemon-reload && systemctl enable --now phoenixd
+#
+# FIRST RUN IS INTERACTIVE: run phoenixd once by hand as the service user
+# before enabling the unit — first run creates ~/.phoenix (the wallet seed,
+# and the API passwords in phoenix.conf). seed.dat in that directory IS the
+# money: back it up off-box before taking payments (the reference backup
+# set: ops/BACKUP-RECOVERY.md).
+#
+# WHY --http-bind-ip 172.17.0.1 (the docker0 bridge address): phoenixd
+# binds 127.0.0.1 by default, and on a Linux engine a container cannot
+# reach the host's loopback — host.docker.internal maps to a bridge IP
+# (compose sets it via host-gateway), where a loopback-bound phoenixd is
+# not listening. Binding the docker0 address pairs with
+# PHOENIXD_URL=http://host.docker.internal:9740 in .env: both name the
+# same bridge, so the gateway container reaches the API. (Docker Desktop
+# on macOS/Windows proxies loopback and does not need this bind; the
+# reachability matrix: operator guide, "Payment backend (phoenixd)".)
+#
+# NEVER --http-bind-ip 0.0.0.0 on a public VPS: the API would answer to
+# anyone who finds the port. Even the limited password must not be
+# internet-reachable.
+#
+# After=docker.service: the docker0 bridge must exist before phoenixd can
+# bind its address.
+
+[Unit]
+Description=phoenixd Lightning payment backend
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+User=gateway
+ExecStart=/home/gateway/phoenixd/phoenixd --http-bind-ip 172.17.0.1
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

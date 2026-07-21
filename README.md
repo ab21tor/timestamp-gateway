@@ -59,8 +59,22 @@ Public calendar mode (`OTS_BACKEND_MODE=public`) is retained as a compatibility/
 - Docker with Compose v2 (version floor and why: operator guide, "Prerequisites")
 - A running phoenixd instance (the live payment backend) — or an LND node with REST API and invoice macaroon if using the LND test-payer / alternative backend
 - An OpenTimestamps calendar backend (otsd) — bundled in the Compose stack or external
-- A Bitcoin Core node reachable by otsd, with a wallet loaded and funded for anchoring transactions
+- An **existing, already-synced** Bitcoin Core node reachable by otsd, with a wallet loaded and funded for anchoring transactions. This is the heaviest prerequisite, and these docs do not teach it: building a node from nothing is a multi-day project — on the order of 750 GB of initial-block-download ingress, days of sync time, and real money to fund the wallet. If you do not already run a node, start at [bitcoincore.org](https://bitcoincore.org) and come back.
 - Inbound Lightning liquidity on the payment backend node (see [Inbound liquidity](#inbound-liquidity))
+
+### What a first paid stamp costs
+
+Budget estimates for going from zero to one working paid stamp — sats only (fiat figures rot):
+
+| Item | Estimate (sats) |
+|---|---|
+| Anchoring wallet (`otsd-hot`) | 50,000–100,000 |
+| phoenixd pre-fund payment (operator guide, "Payment backend (phoenixd)") | ~25,000–30,000 |
+| End-to-end test payment | ~5,000 |
+| Payer-side overhead (funding the second wallet, routing fees) | ~5,000–10,000 |
+| **Total** | **≈ 90,000–140,000 sats, plus the VPS** |
+
+This is the full cost of a first working paid stamp, not an ongoing rate — the pre-fund and wallet balances keep working for you afterwards.
 
 ---
 
@@ -88,7 +102,10 @@ docker compose --profile calendar run --rm otsd sh -c \
    && head -c 32 /dev/urandom > /calendar/hmac-key \
    && echo "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4" > /calendar/donation_addr'
 
-docker compose --profile calendar up -d
+# First run: --build. After that, plain `docker compose --profile calendar
+# up -d` is enough — otsd code updates come from the fork checkout, not the
+# image (operator guide, "Updating").
+docker compose --profile calendar up -d --build
 ```
 
 Get your onion address:
@@ -355,6 +372,12 @@ pytest -q
 
 ---
 
+## The payer side
+
+The end-to-end test needs a **second, independently funded Lightning wallet**. You cannot pay the gateway's invoice from the gateway's own phoenixd — that would be the node paying itself. Any consumer Lightning wallet (Phoenix, Breez, Zeus, …) works as the payer; after paying, the payment **preimage** is shown on the wallet's payment-details screen for that payment — the L402 retry needs it (`Authorization: L402 <macaroon>:<preimage>`). The repo's own test payer, `ops/l402-paid-proof.sh`, presupposes an LND node with `lncli`; without one, a consumer wallet plus the two curl commands in [Quick start](#quick-start) is the manual path.
+
+---
+
 ## Verifying a proof
 
 After receiving a `.ots` file, the proof is pending calendar confirmation. Once the calendar's anchoring transaction is confirmed (timing: operator guide, "Proof lifecycle"), POST the pending proof (base64) with its digest to the gateway's `/upgrade` endpoint, which fetches the Bitcoin anchoring from the calendar and returns the anchored proof. (Plain `ots upgrade proof.ots` contacts the calendar URL inside the attestation directly, so it works only where the operator serves that URL publicly.) Then verify locally:
@@ -378,3 +401,24 @@ Both endpoints return HTTP 200 with a JSON body whose `status` field is one of:
 | `invalid` | The `ots` field is not decodable as an OTS proof (bad base64 or malformed bytes). |
 
 `verified` is `true` only for `anchored`.
+
+Both endpoints take the same JSON body: `digest` (64-char hex) and `ots` (the proof bytes, base64-encoded; the `tr` strips the line breaks GNU base64 inserts):
+
+```bash
+# Verify a proof against the digest it should attest:
+curl -X POST http://localhost:8000/verify \
+  -H "Content-Type: application/json" \
+  -d "{\"digest\":\"$DIGEST\",\"ots\":\"$(base64 < proof.ots | tr -d '\n')\"}"
+
+# Upgrade a pending proof once the calendar has anchored — the response's
+# `ots` field carries the anchored proof, base64-encoded:
+curl -X POST http://localhost:8000/upgrade \
+  -H "Content-Type: application/json" \
+  -d "{\"digest\":\"$DIGEST\",\"ots\":\"$(base64 < proof.ots | tr -d '\n')\"}" \
+  | python3 -c 'import sys,json,base64; sys.stdout.buffer.write(base64.b64decode(json.load(sys.stdin)["ots"]))' \
+  > proof-anchored.ots
+```
+
+**`/health`:** `"status":"ok"` (HTTP 200) requires `payment` = `ok`, `otsd` = `ok` or `n/a`, `wallet` and `proofs` = `ok` or `absent`, and `backup` = `ok`, `local_only`, or `absent` — anything else reports `degraded` with HTTP 503. The operator **PAUSED switch** is a file (default `/var/lib/timestamp-gateway/PAUSED`, path settable via `PAUSE_FILE`): while it exists, `/timestamp` returns 503 and `/health` reports `"status":"paused"` — create it to stop selling, delete it to resume.
+
+**Calendar URI note:** the `calendar_url` shown in pending attestations is the calendar's `uri` identity file, chosen at first run and baked into every attestation the calendar ever issues. For a private calendar, pick a stable identifier you control (a domain you own); it does not need to resolve — upgrades go through the gateway's `/upgrade`, not that URL.

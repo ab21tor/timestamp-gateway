@@ -1,4 +1,7 @@
 # Install: sudo cp ops/systemd/health-monitor.{service,timer} /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now health-monitor.timer
+# Before copying: edit User= and the two /home/gateway paths for your host.
+# A nonexistent User= fails silently — 217/USER in systemctl status — and
+# alarms simply never fire.
 [Unit]
 Description=timestamp-gateway health monitor (alarm push)
 After=network.target

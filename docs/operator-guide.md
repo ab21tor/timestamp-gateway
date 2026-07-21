@@ -24,7 +24,7 @@ The gateway cannot produce Bitcoin-anchored proofs on its own. It requires a run
 - A running phoenixd instance (the live payment backend — see "Payment backend (phoenixd)" below for how to get one) — or an LND node with REST API and invoice macaroon if using the LND test-payer / alternative backend
 - Inbound Lightning liquidity on the payment backend
 - An OTS calendar backend (otsd) — bundled via `--profile calendar` or external
-- A Bitcoin Core node reachable by otsd, with a wallet loaded and funded
+- An **existing, already-synced** Bitcoin Core node reachable by otsd, with a wallet loaded and funded. This is the heaviest prerequisite, and this guide does not teach it: standing up a node from nothing is a multi-day project — on the order of 750 GB of initial-block-download ingress, days of sync time, and real money to fund the wallet. If you do not already run a node, start at https://bitcoincore.org and come back.
 
 You do not need a VPS. You do not need a static IP. You do not need to expose any clearnet ports if you use Tor-only mode.
 
@@ -39,10 +39,10 @@ You do not need a VPS. You do not need a static IP. You do not need to expose an
 5. Set `OTS_BACKEND_MODE=calendar` and `OTS_CALENDAR_URL=http://otsd:14788`.
 6. Set `BITCOIN_RPC_SERVICE_URL` for otsd (full URL including credentials, in `.env` only — see `.env.example` for the LAN, onion-bridge, and systemd shapes).
 7. First run only: initialise the calendar identity (see "Deploying the calendar" below).
-8. Start the full stack: `docker compose --profile calendar up -d`.
+8. Start the full stack: `docker compose --profile calendar up -d --build` (first run; plain `up -d` thereafter — see "Deploying the calendar (otsd)").
 9. Check logs: `docker compose logs -f`.
 10. Retrieve onion address: `docker compose exec tor cat /var/lib/tor/timestamp_gateway/hostname`.
-11. Test the endpoint with `curl` (see README quick start).
+11. Test the endpoint with `curl` (see README quick start). The paid leg needs a second, independently funded Lightning wallet — you cannot pay the gateway from its own phoenixd; see the README, "The payer side".
 
 ---
 
@@ -109,6 +109,11 @@ BITCOIN_RPC_SERVICE_URL=http://rpcuser:rpcpassword@127.0.0.1:18332/wallet/otsd-h
 
 (`host.docker.internal` reaches a loopback-bound bitcoind on Docker Desktop only — on a Linux engine bind the node's RPC where the container can reach it, or address a LAN node by IP; the same caveat as `PHOENIXD_URL`, see "Payment backend (phoenixd)".)
 
+Two conventions in these examples to know about before copying one:
+
+- **Port:** mainnet Bitcoin Core answers RPC on **8332**. The `18332` in the examples is this repo's local-bridge convention — the socat/onion bridges listen on 18332 and forward to the node's 8332 — kept consistent across the shapes so the bridge and no-bridge URLs differ only in host. Talking to a mainnet node directly with no bridge, use 8332.
+- **Wallet name:** the `/wallet/<name>` path segment must name the wallet actually loaded in Bitcoin Core — the examples use `otsd-hot`, so either `bitcoin-cli createwallet otsd-hot` (then load and fund it) or change the segment to your wallet's name. A URL naming a wallet that is not loaded fails every call.
+
 On the systemd path otsd reads this URL from `/etc/systemd/system/otsd.env` instead of the repo `.env` — see `deploy/otsd.service.example`.
 
 For a directly reachable node, ensure the otsd host is allowed by `rpcbind`/`rpcallowip` in bitcoin.conf.
@@ -151,6 +156,8 @@ docker compose --profile calendar run --rm otsd sh -c \
    && echo "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4" > /calendar/donation_addr'
 
 # 4. Start it (add --profile onion-rpc if using the bundled bridge).
+#    First run: --build. Thereafter plain `up -d` is enough — code updates
+#    come from the fork checkout, not the image (see "Updating").
 docker compose --profile calendar up -d --build
 
 # 5. Verify: expect a Bitcoin RPC connection and no auth errors.
@@ -228,7 +235,36 @@ phoenixd is the live payment backend: a self-custodial Lightning node daemon by 
 - **Install:** download a release from https://github.com/ACINQ/phoenixd (or build from source) and run `phoenixd`. Upstream docs: https://phoenix.acinq.co/server. On first run it creates its data directory (`~/.phoenix`) including the wallet seed — back the seed up; it is the money.
 - **API password:** first run also generates two passwords in `~/.phoenix/phoenix.conf`. Use `http-password-limited-access` as `PHOENIXD_HTTP_PASSWORD_LIMITED` — it covers the gateway's entire phoenixd surface (`createinvoice`, `getinfo`, `payments/incoming`) and cannot reach `/payinvoice` or `/sendtoaddress` (verified against phoenixd 0.8.0). Never use the full `http-password` here: that hands an internet-facing process the authority to drain the wallet.
 - **URL:** the HTTP API listens on `127.0.0.1:9740` by default. For a host-run gateway (systemd path) `PHOENIXD_URL=http://127.0.0.1:9740` works as-is. For a container-run gateway (compose path) reachability is NOT automatic: `host.docker.internal` reaches a loopback-bound phoenixd only on Docker Desktop (macOS/Windows, via its VM proxy). On a Linux engine — VPS, Pi, Umbrel, Start9 — it maps to a bridge IP where a loopback-bound phoenixd is not listening, and the connection is refused. phoenixd must be bound where the container can reach it: `--http-bind-ip` on the docker0 bridge address, or a reverse proxy in front of it. phoenixd stays outside the compose stack — it is the wallet holding your funds.
+- **The recipe (Linux engine + compose):** the pair to configure is phoenixd started with `--http-bind-ip 172.17.0.1` (the docker0 bridge address) and `PHOENIXD_URL=http://host.docker.internal:9740` in `.env` — compose maps `host.docker.internal` to that same bridge via `host-gateway`, so the two settings meet. `deploy/phoenixd.service.example` is a minimal systemd unit with exactly this bind; run `phoenixd` once interactively first (first run creates `~/.phoenix`, including the wallet seed) before enabling the unit. Never bind `0.0.0.0` on a public VPS — the API answers to anyone who finds the port.
 - **Inbound liquidity:** a fresh phoenixd has no channels and cannot receive. It opens (and later extends) a channel from ACINQ automatically when a received payment needs one, at a fee deducted from that payment — see `ops/OPERATOR-NOTES.md` and the "Inbound liquidity" section below.
+
+### First payment: pre-fund before going live
+
+A fresh phoenixd's first received payment triggers the automatic channel open, and ACINQ's liquidity fee is deducted **from that payment**. If the first payment is a customer's small stamp purchase, the fee can swallow it: the received amount lands below the invoiced amount, the gateway's own amount check refuses to hand over the proof, and the customer experience is "I paid and got another 402" (the arithmetic and current fee figures: `ops/OPERATOR-NOTES.md`, "Phoenixd first payment warning").
+
+So make the first payment yourself, out of band, before the first real sale — one deliberately larger payment (~25,000–30,000 sats — see the README's budget table) that absorbs the channel-open fee and leaves the channel open for full-value payments afterwards:
+
+```bash
+# 1. On the gateway host: mint an invoice directly from phoenixd
+#    (the limited password may create and read invoices; it cannot spend).
+#    URL = where phoenixd is bound as seen from this host: 127.0.0.1:9740
+#    on the systemd path; 172.17.0.1:9740 with the
+#    deploy/phoenixd.service.example bind.
+curl -sS -u ":$PHOENIXD_HTTP_PASSWORD_LIMITED" \
+  -X POST http://127.0.0.1:9740/createinvoice \
+  -d amountSat=30000 \
+  -d description=prefund
+
+# 2. Pay the returned bolt11 ("serialized" field) from the payer wallet —
+#    the second, independently funded wallet (README, "The payer side").
+
+# 3. Confirm receipt: incoming payments listing shows it settled, minus
+#    the channel-open fee.
+curl -sS -u ":$PHOENIXD_HTTP_PASSWORD_LIMITED" \
+  http://127.0.0.1:9740/payments/incoming?limit=5
+```
+
+After this, the channel exists and subsequent payments — the real sales — arrive at full value.
 
 ---
 
@@ -388,6 +424,8 @@ docker compose logs -f otsd      # OTS calendar server
 
 The gateway runs without an access log (`--no-access-log` in both shipped launch paths) and logs warnings/errors for payment backend and OTS backend failures at `WARNING`/`ERROR` level. For the precise logging posture — what is never logged, payment-hash truncation, the traceback residual, and where digests do persist — see the README's "Privacy trade-offs" section.
 
+**If your Bitcoin node is still syncing (IBD), expect two false alarms.** A wallet on a syncing node reads balance 0 until the sync passes the funding transaction — the wallet alarm fires `low` and `/health` degrades to 503 on a perfectly healthy box — so install the monitoring timers below only after the node is synced. And `estimatesmartfee` returns no estimate during IBD, so quotes fall back to the blind floor: first 402 challenges quote `PRICE_BLIND_SATS` (5,000 sats by default), not `GATEWAY_PRICE_SATS` — expected behaviour, not a pricing bug (see "Pricing").
+
 ### What `otsd: error` in `/health` means (and what it does not)
 
 `/health` probes otsd's homepage and requires the `Best-block` line in the body, not just a 200. otsd commits its 200 status line before making any Bitcoin call, so with Bitcoin RPC dead it still answers 200 — with an empty page. `Best-block` renders only after otsd's `getbestblockhash`/`getblockcount` succeed, so its presence is the only external proof that otsd can reach Bitcoin. `otsd: error` therefore means one of two things: otsd is unreachable, or otsd is up but **Bitcoin-blind** — the gateway log distinguishes them (`otsd unreachable` vs `otsd HTTP up but Bitcoin-blind`).
@@ -422,6 +460,8 @@ sudo cp ops/systemd/wallet-balance-check.{service,timer} /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now wallet-balance-check.timer
 ```
+
+**Before copying any `ops/systemd/*` unit, edit `User=` and the two `/home/gateway` paths** (`WorkingDirectory=` and `ExecStart=`) to match your host — the shipped units assume the reference layout (user `gateway`, repo at `/home/gateway/timestamp-gateway`), the same way the `deploy/*.example` templates do. This applies to all four service units below as well. The failure mode is silent: a unit with a nonexistent `User=` dies with status `217/USER`, the status file it should write never appears, and `/health` reports that check `absent` — which does not degrade health, so nothing flags that the alarm you thought you installed is not running. (Exception: `backup-live-state.service` runs as root on purpose — edit only its paths.)
 
 **Under Docker Compose**, the timers run on the host but `/health` runs in the gateway container — they must share the status directory. Set `GATEWAY_STATE_DIR=/var/lib/timestamp-gateway` in `.env` (and create that directory) so the container mounts the same path the timers write to. Without it the gateway uses a private named volume and reports these checks as `absent`.
 

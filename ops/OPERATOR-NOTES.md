@@ -115,19 +115,16 @@ Do not confuse LND's presence with it being the active payment backend.
 
 On a fresh Phoenixd node with no open channel, the first received payment triggers an automatic channel open by ACINQ.
 
-ACINQ deducts a liquidity fee from the received amount:
+ACINQ deducts a liquidity fee from the received amount. The figures are ACINQ's, they change, and this file does not record them — current schedule: https://phoenix.acinq.co/server/liquidity (pointer recorded 2026-07-21). Shape of the fee: a mining-fee component plus a service percentage of the liquidity purchased, paid upfront out of the payment that triggers it.
 
-- mining fee: ~137-411 sats (depends on mempool)
-- service fee: ~1,000-21,000 sats (depends on amount received)
+The arithmetic that matters is not the exact figures:
 
-This means the first payment may arrive with less than the invoiced amount.
+    received = invoiced − liquidity fee
 
-The gateway verify_payment check requires amount_paid >= GATEWAY_PRICE_SATS.
-
-If the liquidity fee causes the received amount to fall below the price floor, the proof will be refused with 402.
+The fee can exceed the whole margin of a small first payment — or the payment itself. The gateway's verify_payment check requires the received amount to meet the mint-time price, so a first payment eaten by the liquidity fee is refused: the payer paid, got no proof, and sees another 402.
 
 Mitigations:
-- Pre-fund the Phoenixd node by receiving a payment before going live
+- Pre-fund the Phoenixd node by receiving a payment before going live — concrete walkthrough: operator guide, "First payment: pre-fund before going live"
 - Set GATEWAY_PRICE_SATS high enough to absorb the worst-case liquidity fee on first receive
 - Accept that the first proof on a fresh node may fail and require the client to retry
 

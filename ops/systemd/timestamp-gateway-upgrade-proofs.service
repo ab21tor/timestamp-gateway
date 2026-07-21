@@ -1,3 +1,8 @@
+# Install: sudo cp ops/systemd/timestamp-gateway-upgrade-proofs.{service,timer} /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now timestamp-gateway-upgrade-proofs.timer
+# Before copying: edit User= and the three /home/gateway paths for your host.
+# A nonexistent User= fails silently — 217/USER in systemctl status, the
+# status file never appears, and /health reports this check "absent"
+# (which does not degrade health).
 [Unit]
 Description=timestamp-gateway proof upgrade scan
 After=timestamp-gateway.service docker.service

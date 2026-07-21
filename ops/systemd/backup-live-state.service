@@ -1,4 +1,7 @@
 # Install: sudo cp ops/systemd/backup-live-state.{service,timer} /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now backup-live-state.timer
+# Before copying: edit the two /home/gateway paths for your host. Keep
+# User=root — it is deliberate (see below), so the 217/USER trap the other
+# units warn about does not apply here.
 [Unit]
 Description=timestamp-gateway live-state backup
 After=network.target
