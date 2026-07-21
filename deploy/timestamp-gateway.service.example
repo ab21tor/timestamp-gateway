@@ -16,9 +16,15 @@ After=network.target
 User=gateway
 WorkingDirectory=/home/gateway/timestamp-gateway
 EnvironmentFile=/home/gateway/timestamp-gateway/.env
-# Set --host to where the gateway should actually listen; 127.0.0.1 suits a
-# local Tor hidden service or reverse proxy. The health monitor's HEALTH_URL
-# must match this bind — see the operator guide's Monitoring section.
+# Set --host to where the gateway should actually listen. 127.0.0.1 suits a
+# box where a Tor hidden service or reverse proxy on this same host is the
+# only front door. The reference deployment instead binds a private
+# (tailnet) address, so monitoring and operator tooling on other machines
+# reach it without any public exposure — choose that shape when anything
+# off-box must hit the gateway directly. A public bind belongs behind the
+# operator guide's "Clearnet exposure" guidance. The health monitor's
+# HEALTH_URL must match this bind — see the operator guide's Monitoring
+# section.
 # --no-access-log: no per-request client-IP log — the gateway keeps no
 # client-identity records (README, "Privacy trade-offs").
 ExecStart=/home/gateway/timestamp-gateway/.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000 --no-access-log

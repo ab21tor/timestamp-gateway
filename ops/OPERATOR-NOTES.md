@@ -137,26 +137,31 @@ Once a channel is open, subsequent payments arrive at full value with no deducti
 
 The local calendar is your own `otsd`, not the public OpenTimestamps calendars.
 
-Current command (verified 2026-07-17, docker inspect; rotations are
-pull+restart and do not touch the installed unit):
+The live container's exact shape — image, mounts, network, env, command —
+is recorded once, in BACKUP-RECOVERY.md "Current Docker shape" (the
+restore record). Since 2026-07-21 the installed unit matches the repo
+template (`deploy/otsd.service.example`).
 
-`python3 otsd --calendar /calendar --btc-conf-target 12 -v`
+Policy on this box:
 
-Two committed changes are pending the next installed-unit update — the
-shipped run commands (docker-compose.yml, deploy/otsd.service.example)
-already carry both: `--btc-max-fee 0.0002` (fee cap) and the removal of
-`-v` (INFO as the production log level).
-
-Current policy:
-
-- batch up to 6 hours by default
-- when anchoring, aim for about 12-block Bitcoin confirmation
-- save the Bitcoin proof after 6 confirmations by default
-- fee cap (in the shipped run commands; NOT live on the VPS — a rotation is pull+restart and does not touch the installed unit, so it lands only when the unit is next updated): `--btc-max-fee 0.0002` — the flag takes BTC, 0.0002 BTC = 20,000 sats; never "fix" it to 20000, that would mean 20,000 BTC. Bounds one anchor cycle's total spend across its RBF bump ladder. At the cap otsd logs `Maximum txfee reached!` and waits — the last under-cap transaction stays pending until fees fall or it confirms; a sustained spike means proofs stay pending. Intended trade: wallet safety over anchor latency. Until the unit update, the live cap is otsd's default `--btc-max-fee 0.001` (100,000 sats).
-
-The 6-hour default comes from:
-
-`--btc-min-tx-interval default: 21600 seconds`
+- Fee cap LIVE since 2026-07-21: the installed unit was updated to the
+  shipped template — `--btc-max-fee 0.0002` in force and `-v` gone (INFO
+  is the production log level), verified by docker inspect. Credentials
+  ride `/etc/systemd/system/otsd.env`, owned by the service user, mode
+  600. When hand-editing the cap: the flag takes BTC, 0.0002 BTC =
+  20,000 sats — never "fix" 0.0002 to 20000, that would mean 20,000 BTC.
+- Rotation lesson (durable): a rotation is pull+restart and never touches
+  the installed unit — a unit change lands only through an explicit
+  install + daemon-reload, as on 2026-07-21.
+- Cap semantics (what one anchor cycle can spend across its RBF ladder):
+  operator guide, "Bitcoin transaction cost". The cap-stall signal —
+  `Maximum txfee reached!` in otsd's log while `/health` shows `otsd: ok`
+  and proofs stay pending — and how to tell it from a broken Bitcoin
+  path: operator guide, "Monitoring".
+- `--btc-conf-target 12` — anchors at a 12-block fee target (in the
+  shipped run commands; otsd's own default is 1008).
+- Batch interval and confirmation depth run at the shipped defaults:
+  operator guide, "Bitcoin transaction cost" and "Proof lifecycle".
 
 ## Proof states
 
@@ -167,6 +172,18 @@ Use simple states where possible:
 - `waiting_for_bitcoin`
 - `bitcoin_backed`
 - `needs_attention`
+
+These are the ops-side lifecycle states (what the ops scripts emit). The
+client-facing API vocabulary is different and lives in the README
+("`/verify` and `/upgrade` status vocabulary"). Mapping:
+
+| Ops state | API `/verify` / `/upgrade` status |
+|---|---|
+| `waiting_for_payment` | — (no proof exists yet; the client holds only a 402 challenge) |
+| `receipt_issued` | `pending` |
+| `waiting_for_bitcoin` | `pending` (the API cannot distinguish these two — the split is ops-side: receipt just issued vs. anchor transaction awaiting confirmations) |
+| `bitcoin_backed` | `anchored` |
+| `needs_attention` | `mismatch`, `no_attestations`, or `invalid` — or `pending` for longer than the anchoring policy explains |
 
 ## Product boundary
 

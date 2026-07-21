@@ -14,13 +14,13 @@ client
   → .ots                          (returned to client as pending receipt)
 ```
 
-The gateway cannot produce Bitcoin-anchored proofs on its own. It requires a running OTS calendar backend (otsd). The initial `.ots` returned to the client is a pending receipt. Once the anchoring transaction reaches 6 confirmations — typically a few hours end to end under the shipped defaults (see "Proof lifecycle") — the proof can be upgraded to a Bitcoin-anchored one.
+The gateway cannot produce Bitcoin-anchored proofs on its own. It requires a running OTS calendar backend (otsd). The initial `.ots` returned to the client is a pending receipt. Once the anchoring transaction confirms — timing in "Proof lifecycle" — the proof can be upgraded to a Bitcoin-anchored one.
 
 ---
 
 ## Prerequisites
 
-- Docker Engine 24+ and Docker Compose v2.17+ (BuildKit; needed for the calendar profile's named build context)
+- Docker Engine 24+ and Docker Compose v2.17+ — quoted as the earliest releases with the BuildKit named-context support the calendar profile's build uses; not tested further back
 - A running phoenixd instance (the live payment backend — see "Payment backend (phoenixd)" below for how to get one) — or an LND node with REST API and invoice macaroon if using the LND test-payer / alternative backend
 - Inbound Lightning liquidity on the payment backend
 - An OTS calendar backend (otsd) — bundled via `--profile calendar` or external
@@ -32,9 +32,9 @@ You do not need a VPS. You do not need a static IP. You do not need to expose an
 
 ## First-run checklist
 
-1. Clone this repository, clone the calendar fork next to it (`git clone -b calendar-ops https://github.com/ab21tor/opentimestamps-server`), and copy `.env.example` to `.env`.
+1. Clone this repository, clone the calendar fork next to it (clone command: "Deploying the calendar (otsd)" below), and copy `.env.example` to `.env`.
 2. Generate the L402 signing key and set `L402_SECRET_HEX` in `.env`: `python3 -c 'import secrets; print(secrets.token_hex(32))'`. The gateway refuses to start without it.
-3. Set `PAYMENT_BACKEND_TYPE=phoenixd` (the default) and fill in `PHOENIXD_URL` (`http://host.docker.internal:9740` for a phoenixd on this host) and `PHOENIXD_HTTP_PASSWORD_LIMITED`. Only fill in `LND_*` if using the LND test-payer / alternative backend.
+3. Set `PAYMENT_BACKEND_TYPE=phoenixd` (the default) and fill in `PHOENIXD_URL` (`http://host.docker.internal:9740` for a phoenixd on this host — Docker Desktop only; on a Linux engine phoenixd must be bound where the container can reach it, see "Payment backend (phoenixd)") and `PHOENIXD_HTTP_PASSWORD_LIMITED`. Only fill in `LND_*` if using the LND test-payer / alternative backend.
 4. (lnd test-payer backend only) Set `TOR_PROXY=tor:9050` if `LND_HOST` is a `.onion` address; leave blank otherwise.
 5. Set `OTS_BACKEND_MODE=calendar` and `OTS_CALENDAR_URL=http://otsd:14788`.
 6. Set `BITCOIN_RPC_SERVICE_URL` for otsd (full URL including credentials, in `.env` only — see `.env.example` for the LAN, onion-bridge, and systemd shapes).
@@ -56,9 +56,9 @@ OTS_CALENDAR_URL=http://otsd:14788      # bundled compose profile
 # OTS_CALENDAR_URL=http://127.0.0.1:14788  # systemd path (host-networked otsd)
 ```
 
-The gateway forwards paid digests to the operator's own otsd instance. otsd aggregates submissions and anchors the Merkle root in Bitcoin when commitments are pending, at most once per `--btc-min-tx-interval` (default 6 hours). This is the only production mode.
+The gateway forwards paid digests to the operator's own otsd instance. otsd aggregates submissions and anchors the Merkle root in Bitcoin when commitments are pending, batched on the anchoring interval (see "Bitcoin transaction cost"). This is the only production mode.
 
-**There is no silent fallback.** If the calendar backend fails, the gateway returns 502. It does not retry against the public OpenTimestamps aggregators.
+**There is no silent fallback.** Calendar failure means 502, never a retry against public aggregators — the failure behavior and the strict mode validation are pinned in the README ("OTS backend modes").
 
 ### public (compatibility/testing only — not for production)
 
@@ -69,7 +69,7 @@ OTS_BACKEND_MODE=public
 
 The gateway forwards paid digests to the four public OpenTimestamps aggregators (`a.pool.opentimestamps.org`, etc.). This mode is provided so you can test the payment flow without running otsd. It is not the real target.
 
-**Do not use `public` mode in production.** In public mode, the gateway is a paid relay to other operators' infrastructure — not an independent calendar node. This was the original architectural mistake; calendar mode is the correction.
+**Do not use `public` mode in production.** In public mode, the gateway is a paid relay to other operators' infrastructure — not an independent calendar node (the README's "What we corrected" section records why that matters).
 
 ---
 
@@ -77,18 +77,18 @@ The gateway forwards paid digests to the four public OpenTimestamps aggregators 
 
 ### What otsd is
 
-otsd is the OpenTimestamps calendar server. It accepts raw digest bytes over HTTP (`POST /digest`), aggregates them into a Merkle tree, and — when commitments are pending — submits a Bitcoin transaction containing an OP_RETURN output with the Merkle root, at most one per `--btc-min-tx-interval` (default 6 hours). The resulting proof links any submitted digest to the block height of that Bitcoin transaction.
+otsd is the OpenTimestamps calendar server. It accepts raw digest bytes over HTTP (`POST /digest`), aggregates them into a Merkle tree, and — when commitments are pending — submits a Bitcoin transaction containing an OP_RETURN output with the Merkle root, at most one per anchoring interval (see "Bitcoin transaction cost"). The resulting proof links any submitted digest to the block height of that Bitcoin transaction.
 
 ### What otsd needs
 
 - A Bitcoin Core node reachable via JSON-RPC.
 - A wallet loaded in Bitcoin Core (use `bitcoin-cli loadwallet` or `createwallet`).
-- Enough BTC in the wallet to pay for OP_RETURN transaction fees. A small wallet (50k–100k sats) is sufficient for extended low-volume operation. otsd does not spend to the wallet — it only draws from it to fund transactions.
+- Enough BTC in the wallet to pay for OP_RETURN transaction fees (sizing estimate under "Bitcoin transaction cost" below). otsd does not spend to the wallet — it only draws from it to fund transactions.
 - A persistent data directory for the calendar state (`/calendar` in the container — the `otsd_calendar` volume under compose).
 
 ### Bitcoin transaction cost
 
-otsd submits an anchoring transaction only when commitments are pending, and at most one per `--btc-min-tx-interval` (default 6 hours) — at most 4 per day, and none while idle. Each transaction contains a single OP_RETURN output. Cost depends on prevailing on-chain fee rates: at 5–20 sat/vbyte a single anchoring transaction costs roughly 500–2000 sats, and the fork fee-bumps a stuck transaction, which can raise the per-anchor cost. At the default cadence a 100,000-sat wallet covers weeks of continuous anchoring, and far longer at low volume where most intervals see no pending commitments.
+otsd submits an anchoring transaction only when commitments are pending, and at most one per `--btc-min-tx-interval` (default 6 hours = 21600 seconds) — at most 4 per day, and none while idle. Each transaction contains a single OP_RETURN output. Cost depends on prevailing on-chain fee rates: at 5–20 sat/vbyte a single anchoring transaction costs roughly 500–2000 sats, and the fork fee-bumps a stuck transaction, which can raise the per-anchor cost. Wallet sizing is an estimate, not a measured figure — no consumption record is committed yet: at the default cadence a 100,000-sat wallet should cover weeks of continuous anchoring, far longer at low volume where most intervals see no pending commitments, and 50k–100k sats is a reasonable floor for extended low-volume operation.
 
 The bump ladder is capped: the shipped run commands set `--btc-max-fee 0.0002` (the flag takes BTC; 0.0002 BTC = 20,000 sats), bounding what one anchor cycle can spend in total — an RBF replacement pays its own whole fee and only one transaction of the ladder confirms, so the cap is the most one anchor can cost. When the cap binds, otsd logs `Maximum txfee reached!` and stops bumping; the last under-cap transaction stays pending until fees fall or it confirms. A sustained fee spike above the cap means proofs stay pending longer — that is the intended trade: wallet safety over anchor latency.
 
@@ -106,6 +106,8 @@ BITCOIN_RPC_SERVICE_URL=http://rpcuser:rpcpassword@rpc-bridge:18332/wallet/otsd-
 # systemd path (host socat bridge, deploy/socat-bitcoin-rpc.service.example):
 BITCOIN_RPC_SERVICE_URL=http://rpcuser:rpcpassword@127.0.0.1:18332/wallet/otsd-hot
 ```
+
+(`host.docker.internal` reaches a loopback-bound bitcoind on Docker Desktop only — on a Linux engine bind the node's RPC where the container can reach it, or address a LAN node by IP; the same caveat as `PHOENIXD_URL`, see "Payment backend (phoenixd)".)
 
 On the systemd path otsd reads this URL from `/etc/systemd/system/otsd.env` instead of the repo `.env` — see `deploy/otsd.service.example`.
 
@@ -176,7 +178,7 @@ Do not expose otsd on a public port. It has no authentication. Access should be 
 ### Proof lifecycle
 
 1. **Immediate:** The gateway submits the digest to otsd and receives a receipt with a `PendingAttestation` pointing to the calendar URL. This is the `.ots` file returned to the client. It is not yet Bitcoin-anchored.
-2. **Within hours:** otsd submits a Bitcoin transaction anchoring the Merkle root of the pending digests — at most one transaction per `--btc-min-tx-interval` (default 6 hours) — then waits for `--btc-min-confirmations` (default 6) before writing the Bitcoin attestation. Best case is about an hour; the default worst case is the 6-hour interval plus confirmations.
+2. **Within hours:** otsd submits a Bitcoin transaction anchoring the Merkle root of the pending digests — at most one transaction per anchoring interval ("Bitcoin transaction cost") — then waits for `--btc-min-confirmations` (default 6) before writing the Bitcoin attestation. Typically a few hours end to end: best case about an hour, worst case the full anchoring interval plus confirmation time. (An expectation derived from the defaults — no timing record is committed.)
 3. **Upgrade:** The client POSTs the pending proof (base64) with its digest to the gateway's `/upgrade` endpoint, which fetches the Bitcoin anchoring from the operator's calendar and returns the anchored proof (see the README's `/verify` and `/upgrade` status vocabulary). Plain `ots upgrade proof.ots` reaches the calendar URL inside the pending attestation directly, so it works only if the operator serves that URL publicly — with the calendar private, as this guide recommends, the gateway endpoint is the client path.
 4. **Verify:** The client runs `ots verify proof.ots` to verify the proof against the Bitcoin blockchain independently.
 
@@ -274,7 +276,7 @@ xxd -p -c 256 ~/.lnd/data/chain/bitcoin/mainnet/invoice.macaroon
 ~/umbrel/app-data/lightning/data/lnd/data/chain/bitcoin/mainnet/invoice.macaroon
 ```
 
-LND REST host: `umbrel.local`, port `8080`.
+LND REST host: `umbrel.local` resolves via mDNS from LAN machines only — inside the gateway container it does not resolve; use the Umbrel host's LAN IP instead. Port `8080`.
 
 ### RaspiBlitz
 
@@ -337,12 +339,7 @@ Submarine swap via Terminal to move sats from your local channel balance to the 
 
 ### Tor-only routing difficulty (self-hosted LND-style nodes)
 
-If your Lightning node is Tor-only, nodes that have disabled Tor routing cannot route payments to you. This reduces the routing path count significantly.
-
-Options:
-- **Accept lower reliability.** Suitable for low-volume personal or testing use.
-- **Hybrid node.** Advertise both a Tor and a clearnet address. Better routing at the cost of linking your pubkey to a clearnet IP permanently.
-- **VPS payment node.** Run the Lightning payment node on a VPS for reliable clearnet routing. Run the gateway anywhere.
+Tor-only Lightning nodes see fewer routing paths. The trade-off, its permanence on the clearnet side, and the options (accept lower reliability, hybrid node, VPS payment node) are in the README — "Inbound liquidity" and "Privacy trade-offs".
 
 ---
 
@@ -537,5 +534,5 @@ sudo cat /var/lib/tor/timestamp_gateway/hostname
 - [ ] Tor hidden service private key is backed up.
 - [ ] `docker compose logs -f otsd` shows otsd starting without errors.
 - [ ] A test payment has been completed end-to-end: invoice issued → paid → `.ots` returned.
-- [ ] A test proof upgrades (gateway `/upgrade`, or the ops sweep) and `ots verify` passes once anchored — typically a few hours under the default 6-hour transaction interval.
+- [ ] A test proof upgrades (gateway `/upgrade`, or the ops sweep) and `ots verify` passes once anchored (timing: "Proof lifecycle").
 - [ ] I understand that Lightning graph exposure (clearnet Lightning node IP) is permanent once published.

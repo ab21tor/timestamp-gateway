@@ -2,12 +2,15 @@
 # docker run. Copy to /etc/systemd/system/otsd.service, adjust the paths,
 # then: systemctl daemon-reload && systemctl enable --now otsd
 #
-# Companion file /etc/systemd/system/otsd.env (root-owned, mode 600) holds
-# BITCOIN_RPC_SERVICE_URL — the full RPC URL including credentials. Docker
-# reads that file directly (--env-file below), so the URL never appears on a
-# command line (ps/argv) and never in tracked files. Residual: `docker
-# inspect otsd` still shows the container's env to local root — unavoidable
-# for container env, and why backup archives must stay encrypted.
+# Companion file /etc/systemd/system/otsd.env holds BITCOIN_RPC_SERVICE_URL
+# — the full RPC URL including credentials. It must be owned by the SERVICE
+# USER below (User=gateway), mode 600 — NOT root: --env-file is read by the
+# docker client, which runs as that user, so a root-owned 600 file fails
+# with EACCES (hit live on the reference box, 2026-07-21). Docker reads the
+# file directly (--env-file below), so the URL never appears on a command
+# line (ps/argv) and never in tracked files. Residual: `docker inspect
+# otsd` still shows the container's env to local root — unavoidable for
+# container env, and why backup archives must stay encrypted.
 #
 # The otsd-local image is built per otsd/Dockerfile with the
 # opentimestamps-server fork checkout as the named "fork" build context
@@ -17,12 +20,10 @@
 #
 # First run only: /var/lib/otsd/calendar needs the three identity files
 # (uri, hmac-key, donation_addr) or otsd exits at startup — see the operator
-# guide, "Deploying the calendar (otsd)". --btc-conf-target 12 matches the
-# deployed fee policy. --btc-max-fee caps what ONE anchor can cost across
-# its whole RBF bump ladder — chosen so a bad fee market cannot drain a
-# small wallet in a single transaction. The flag takes BTC:
-# 0.0002 BTC = 20,000 sats. Never "fix" 0.0002 to 20000 — that would mean
-# 20,000 BTC.
+# guide, "Deploying the calendar (otsd)". Fee policy: --btc-conf-target 12
+# matches the deployed policy; --btc-max-fee takes BTC (0.0002 BTC = 20,000
+# sats — never "fix" 0.0002 to 20000, that would mean 20,000 BTC). Cap
+# semantics: operator guide, "Bitcoin transaction cost".
 
 [Unit]
 Description=otsd OpenTimestamps calendar (docker)

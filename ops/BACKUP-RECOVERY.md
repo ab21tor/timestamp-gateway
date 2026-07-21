@@ -32,7 +32,7 @@ Durable state directory:
 
 `/var/lib/timestamp-gateway`
 
-This is critical. It holds the durable obligation log — the record of settled payments that must still be stamped — and the operator `PAUSED` switch. If it is lost, a payment that settled but was not yet anchored can no longer be recovered.
+This is critical. It holds the durable obligation log — the record of settled payments that must still be stamped — and the operator `PAUSED` switch. If it is lost, a payment that settled but was not yet anchored can no longer be recovered. (What the obligation log is and how it is configured: operator guide, "Durable obligation log".)
 
 Critical files (the DB runs in SQLite WAL mode, so back up all three sidecars together):
 
@@ -60,30 +60,17 @@ Phoenixd home/state directory:
 
 `/home/gateway/phoenixd/home/.phoenix`
 
-Critical files:
-
-- `phoenix.conf`
-- `seed.dat`
-- `phoenix.mainnet.*.db`
-- `phoenix.mainnet.*.db-wal`
-- `phoenix.mainnet.*.db-shm`
+Back up the whole directory. The critical-file list lives in
+OPERATOR-NOTES.md, "Phoenixd boundary" — `seed.dat` in particular is
+wallet material; treat it as secret.
 
 Log files are useful but less critical:
 
 - `phoenix.log`
 - `/home/gateway/phoenixd/phoenixd-systemd.log`
 
-`seed.dat` is wallet material. Treat it as secret.
-
-Phoenixd listens only on:
-
-`127.0.0.1:9740`
-
-Phoenixd service:
-
-`phoenixd.service`
-
-It is enabled on boot.
+Service boundary (localhost-only bind, systemd management): see
+OPERATOR-NOTES.md, "Phoenixd boundary".
 
 ### Local otsd calendar
 
@@ -105,20 +92,19 @@ The running Docker container is:
 
 `otsd`
 
-Current Docker shape:
+Current Docker shape (verified 2026-07-21, docker inspect — the installed
+unit matches `deploy/otsd.service.example` since 2026-07-21):
 
 - image: `otsd-local`
 - network: `host`
 - working dir: `/app`
 - app mount: `/home/gateway/opentimestamps-server:/app`
 - calendar mount: `/var/lib/otsd/calendar:/calendar`
-- command: `python3 otsd --calendar /calendar --btc-conf-target 12 -v` (verified 2026-07-17, docker inspect. The shipped run commands add `--btc-max-fee 0.0002` and drop `-v`; both land when the installed unit is next updated — see OPERATOR-NOTES "otsd boundary".)
+- env: via `--env-file /etc/systemd/system/otsd.env` (holds `BITCOIN_RPC_SERVICE_URL`; owned by the service user, mode 600 — a root-owned file fails EACCES, see the template header)
+- command: `python3 otsd --calendar /calendar --btc-conf-target 12 --btc-max-fee 0.0002` (no `-v`: INFO log level)
 
-Current plain anchoring policy:
-
-- batch up to 6 hours by default
-- when anchoring, target about 12-block Bitcoin confirmation
-- save Bitcoin proof after 6 confirmations by default
+Anchoring policy: see OPERATOR-NOTES.md, "otsd boundary" (this box vs. the
+shipped defaults).
 
 ### Bitcoin RPC bridge
 
@@ -173,7 +159,7 @@ On a replacement box:
 6. Restore `phoenixd.service`.
 7. Restore `/var/lib/otsd/calendar`.
 8. Re-clone `/home/gateway/opentimestamps-server`: `git clone -b calendar-ops https://github.com/ab21tor/opentimestamps-server /home/gateway/opentimestamps-server`.
-9. Recreate the `otsd` Docker container with the same mounts and command.
+9. Install `otsd.service` from `deploy/otsd.service.example` and recreate its companion `/etc/systemd/system/otsd.env` (owned by the service user, mode 600; it holds `BITCOIN_RPC_SERVICE_URL` and is NOT part of the automated backup archive — recreate it from the restored `.env`'s value). Enable the unit; it recreates the `otsd` container with the shape recorded above.
 10. Restore `socat-bitcoin-rpc.service` from the backup archive (the installed unit carries the substituted node onion; the repo ships only the template) and enable it — without it otsd has no Bitcoin path.
 11. Restore proof artifacts if needed.
 12. Reinstall the timers and their services from `ops/systemd/` (install commands in each unit's header): `wallet-balance-check`, `health-monitor`, `timestamp-gateway-upgrade-proofs`, `backup-live-state`. Without them the restored box has no wallet alarm, no health alarms, no proof sweeper, and no backups.

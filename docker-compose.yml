@@ -79,18 +79,13 @@ services:
   # profile.
   #
   # The image is Python + dependencies ONLY. The calendar CODE is the
-  # opentimestamps-server fork (https://github.com/ab21tor/opentimestamps-server,
-  # branch calendar-ops) mounted at /app: clone it and set OTSD_FORK_PATH in
-  # .env (default: a checkout next to this repo).
+  # opentimestamps-server fork mounted at /app: clone it and set
+  # OTSD_FORK_PATH in .env (default: a checkout next to this repo). Clone
+  # command and branch: operator guide, "Deploying the calendar (otsd)".
   #
   # First run only — otsd refuses to start until its calendar identity
-  # exists: the URI callers see in pending attestations, the HMAC key, and
-  # a donation address its web page displays. Replace both example values
-  # with your own; see "Deploying the calendar" in the operator guide:
-  #   docker compose --profile calendar run --rm otsd sh -c \
-  #     'echo "https://calendar.example.com/" > /calendar/uri \
-  #      && head -c 32 /dev/urandom > /calendar/hmac-key \
-  #      && echo "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4" > /calendar/donation_addr'
+  # exists (three files: uri, hmac-key, donation_addr). Creation command:
+  # operator guide, "Deploying the calendar (otsd)".
   #
   # otsd is NOT publicly exposed: no published port; the gateway reaches it
   # at http://otsd:14788 on the compose network (OTS_CALENDAR_URL).
@@ -108,7 +103,8 @@ services:
       - "host.docker.internal:host-gateway"
     # --rpc-address 0.0.0.0: reachable on the compose network (unpublished);
     # the image default binds localhost for non-compose runs.
-    # --btc-max-fee takes BTC: 0.0002 BTC = 20,000 sats. Never "fix" it to 20000.
+    # --btc-max-fee takes BTC (0.0002 BTC = 20,000 sats — never "fix" it to
+    # 20000); cap semantics: operator guide, "Bitcoin transaction cost".
     # No -v: INFO is the production level — DEBUG ships commitment hexes and
     # wallet outpoints into the container log (reports/privacy-inventory.md §5).
     command: ["python", "/app/otsd", "--rpc-address", "0.0.0.0", "--calendar", "/calendar", "--btc-conf-target", "12", "--btc-max-fee", "0.0002"]

@@ -26,7 +26,7 @@ floor (stubs.py: ThreadingHTTPServer x3 on 18401-18403, modes switched via small
 ## Launch
 
 - A real `.env` exists at the repo root. Run uvicorn with **cwd outside the repo** and
-  `--app-dir /Users/operator/timestamp-gateway` so `load_dotenv()` finds nothing,
+  `--app-dir <absolute path to this repo>` so `load_dotenv()` finds nothing,
   and pass config via `env -i ... VAR=...` explicitly.
 - Minimum env: `GATEWAY_PRICE_SATS`, `OTS_BACKEND_MODE=calendar`, `OTS_CALENDAR_URL`,
   `L402_SECRET_HEX` (64 hex), `PAYMENT_BACKEND_TYPE=phoenixd`, `PHOENIXD_URL`,
@@ -51,8 +51,8 @@ Mac): stubs on host 0.0.0.0 ports, containers reach them via
 `host.docker.internal` (works under colima). Copy the working tree to a dir
 under $HOME (colima only mounts $HOME; never touch the repo's real .env), write
 a test .env there (`OTS_CALENDAR_URL=http://otsd:14788`,
-`OTSD_FORK_PATH=/Users/operator/opentimestamps-server`, stub URLs via
-host.docker.internal), then `docker compose --profile calendar up -d --build`.
+`OTSD_FORK_PATH=<absolute path to the opentimestamps-server checkout, under $HOME>`,
+stub URLs via host.docker.internal), then `docker compose --profile calendar up -d --build`.
 
 - Calendar first-run identity is THREE files or otsd exits: `/calendar/uri`,
   `/calendar/hmac-key`, `/calendar/donation_addr` (must parse as a real
