@@ -67,7 +67,14 @@ echo
 echo
 
 echo "=== phoenixd ==="
-pgrep -af phoenixd || echo "phoenixd: not running"
+# Count only — pgrep -af would echo phoenixd's argv (paths, flags) into
+# status output, and status.sh output lands in backup snapshots
+# (phoenixd-status.sh pattern).
+if pgrep -fc phoenixd >/dev/null 2>&1; then
+  echo "phoenixd: running"
+else
+  echo "phoenixd: not running"
+fi
 echo
 
 echo "=== otsd docker ==="
