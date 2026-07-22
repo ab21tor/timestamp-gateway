@@ -20,6 +20,7 @@ from typing import Protocol
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
 from pymacaroons import Macaroon, Verifier
@@ -668,10 +669,20 @@ def _sweep_obligations_once() -> None:
         logging.info("Sweeper: recovered obligation %s", _hash8(payment_hash))
 
 
+def _sweeper_tick() -> None:
+    """One sweeper cycle, pause-aware. Full-stop ruling (2026-07-22): PAUSED
+    silences the sweeper too. Nothing is dropped: 'needs_stamp' rows keep and
+    wait for unpause, like the rest of the machine."""
+    if is_paused():
+        logging.info("Sweeper: gateway paused; skipping sweep")
+        return
+    _sweep_obligations_once()
+
+
 def _sweeper_loop(stop_event: threading.Event) -> None:
     while not stop_event.is_set():
         try:
-            _sweep_obligations_once()
+            _sweeper_tick()
         except Exception:
             logging.exception("Obligation sweep failed; will retry next interval")
         stop_event.wait(OBLIGATION_SWEEP_INTERVAL)
@@ -702,6 +713,18 @@ app.mount("/ui", StaticFiles(directory=Path(__file__).parent / "static", html=Tr
 
 def is_paused() -> bool:
     return bool(PAUSE_FILE and Path(PAUSE_FILE).exists())
+
+
+@app.middleware("http")
+async def _pause_gate(request, call_next):
+    # Full-stop ruling (2026-07-22): PAUSED means the gateway answers /health
+    # and nothing else. Bitcoin has no partial liveness — a node is either in
+    # consensus or absent, and absence takes nothing because state is durable.
+    # Ruling 1 (settlement outranks expiry) makes that guarantee here: paid
+    # tokens redeem after unpause; recorded obligations wait in the log.
+    if request.url.path != "/health" and is_paused():
+        return JSONResponse(status_code=503, content={"detail": "Gateway is paused by operator"})
+    return await call_next(request)
 
 
 def _wallet_status() -> str:
@@ -1649,12 +1672,7 @@ def upgrade(body: VerifyRequest, request: Request):
 
 @app.post("/timestamp")
 def timestamp(body: TimestampRequest, request: Request):
-    if is_paused():
-        raise HTTPException(
-            status_code=503,
-            detail="Gateway is paused by operator",
-        )
-
+    # PAUSED is enforced app-wide by _pause_gate (full-stop, ruled 2026-07-22).
     auth = request.headers.get("Authorization", "")
 
     if auth:

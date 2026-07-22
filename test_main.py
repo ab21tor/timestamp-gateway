@@ -1592,6 +1592,59 @@ def test_paused_timestamp_returns_503(tmp_path):
     assert resp.json()["detail"] == "Gateway is paused by operator"
 
 
+def test_paused_blocks_paid_redemption_and_unpause_serves_it(tmp_path):
+    """Full-stop ruling (2026-07-22): PAUSED refuses even a settled token —
+    and ruling 1 guarantees the pause takes nothing: the same token redeems
+    after unpause."""
+    pause_file = tmp_path / "PAUSED"
+    pause_file.write_text("paused\n")
+    token = valid_token()
+
+    with patch("main.PAUSE_FILE", str(pause_file)):
+        with patch("main.requests.get", return_value=_settled_get()):
+            paused_resp = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+    assert paused_resp.status_code == 503
+
+    pause_file.unlink()
+    with patch("main.PAUSE_FILE", str(pause_file)):
+        with patch("main.requests.get", return_value=_settled_get()):
+            with patch("main.stamp_digest", return_value=FAKE_OTS):
+                resp = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+    assert resp.status_code == 200
+    assert resp.content == FAKE_OTS
+
+
+def test_paused_blocks_verify_and_upgrade(tmp_path):
+    """PAUSED means the gateway answers /health and nothing else — the gate
+    sits before routing, so even malformed bodies get the pause answer."""
+    pause_file = tmp_path / "PAUSED"
+    pause_file.write_text("paused\n")
+
+    with patch("main.PAUSE_FILE", str(pause_file)):
+        v = client.post("/verify", json={})
+        u = client.post("/upgrade", json={})
+    assert v.status_code == 503
+    assert u.status_code == 503
+
+
+def test_sweeper_skips_while_paused(tmp_path):
+    """Full-stop: no stamping while PAUSED; rows wait. Control: the same tick
+    sweeps once the file is gone."""
+    pause_file = tmp_path / "PAUSED"
+    pause_file.write_text("paused\n")
+
+    with patch("main.PAUSE_FILE", str(pause_file)):
+        with patch("main._sweep_obligations_once") as sweep:
+            main._sweeper_tick()
+    sweep.assert_not_called()
+
+    pause_file.unlink()
+    with patch("main.PAUSE_FILE", str(pause_file)):
+        with patch("main._sweep_obligations_once") as sweep:
+            main._sweeper_tick()
+    sweep.assert_called_once()
+
+
 # ══ 12. Durable obligation log ═════════════════════════════════════════════════
 # The obligation store guarantees a settled payment is never lost if calendar
 # submission fails. It coexists with _proof_cache: the cache is the instant
