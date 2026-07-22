@@ -1019,13 +1019,12 @@ def _caveat_value(m: Macaroon, key: str) -> str | None:
 
 
 def _expiry_satisfier(caveat_id) -> bool:
-    text = _caveat_text(caveat_id)
-    if not text.startswith("expiry="):
-        return False
-    try:
-        return time.time() < int(text[len("expiry="):])
-    except ValueError:
-        return False
+    # Ruled 2026-07-22: settlement outranks expiry. A client who already paid
+    # is owed the proof (the machine's own pinned promise). The expiry caveat
+    # is advisory: it mirrors the unpaid invoice's own Lightning lifetime.
+    # Redemption is gated by the settlement check, never this clock.
+    # Format-only, like _payment_hash_satisfier.
+    return re.fullmatch(r"expiry=[0-9]+", _caveat_text(caveat_id)) is not None
 
 
 def _payment_hash_satisfier(caveat_id) -> bool:
@@ -1042,11 +1041,11 @@ def verify_l402_token(macaroon_b64: str, digest: str) -> tuple[str, int]:
     Checks token integrity (signature), the digest binding, the capability
     binding, and the expiry. The price is read from the macaroon's own signed
     caveat rather than compared to the current configured price: a token minted
-    at price N validates at N for its whole validity window, so repricing between challenge and
+    at price N validates at N whenever its settled invoice backs it, so repricing between challenge and
     payment never strands an in-flight invoice. The HMAC prevents a client
     from lowering the caveat; what the mint-time price must buy is enforced
     against the settled invoice in verify_payment. On success returns
-    (payment_hash, mint_time_price_sats). Any invalid, expired, tampered, or
+    (payment_hash, mint_time_price_sats). Any invalid, tampered, or
     wrong-digest token raises HTTPException 401 — an authorization failure,
     not a payment one."""
     try:
@@ -1073,7 +1072,7 @@ def verify_l402_token(macaroon_b64: str, digest: str) -> tuple[str, int]:
     try:
         verifier.verify(m, L402_SECRET)
     except MacaroonException:
-        raise HTTPException(status_code=401, detail="Invalid, expired, or wrong-digest L402 token")
+        raise HTTPException(status_code=401, detail="Invalid or wrong-digest L402 token")
     except Exception:
         logging.exception("L402 verification raised unexpectedly")
         raise HTTPException(status_code=401, detail="Invalid L402 token")

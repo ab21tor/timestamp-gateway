@@ -541,11 +541,34 @@ def test_verify_token_rejects_wrong_digest():
     assert ei.value.status_code == 401
 
 
-def test_verify_token_rejects_expired():
+def test_expired_token_still_verifies():
+    """Ruled 2026-07-22: settlement outranks expiry. An expired token passes
+    token verification (the expiry caveat is format-checked only); whether it
+    redeems is decided by the settlement check, not the clock."""
     token = valid_token(expiry_ts=int(time.time()) - 10)
-    with pytest.raises(HTTPException) as ei:
-        main.verify_l402_token(token, DIGEST)
-    assert ei.value.status_code == 401
+    assert main.verify_l402_token(token, DIGEST) == (PAYMENT_HASH, 21)
+
+
+def test_settled_but_expired_token_redeems():
+    """The economic edge, now pinned as chosen: pay, come back after expiry,
+    still get the proof. A client who already paid is owed the proof."""
+    token = valid_token(expiry_ts=int(time.time()) - 10)
+    with patch("main.requests.get", return_value=_settled_get()):
+        with patch("main.stamp_digest", return_value=FAKE_OTS):
+            resp = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+    assert resp.status_code == 200
+    assert resp.content == FAKE_OTS
+    assert _obligation_row() is not None
+
+
+def test_expired_unsettled_token_still_pays_nothing():
+    """Expiry's remaining meaning: an expired UNPAID token earns nothing.
+    The settlement gate refuses it (402), and the invoice itself expired at
+    the Lightning layer long ago."""
+    token = valid_token(expiry_ts=int(time.time()) - 10)
+    with patch("main.requests.get", return_value=_get_mock(False, DIGEST, 0)):
+        resp = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+    assert resp.status_code == 402
 
 
 def test_verify_token_accepts_any_genuinely_signed_price():
