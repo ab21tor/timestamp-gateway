@@ -38,7 +38,7 @@ You do not need a VPS. You do not need a static IP. You do not need to expose an
 ## First-run checklist
 
 1. Clone this repository, clone the calendar fork next to it (clone command: "Deploying the calendar (otsd)" below), and copy `.env.example` to `.env`.
-2. Generate the L402 signing key and set `L402_SECRET_HEX` in `.env`: `python3 -c 'import secrets; print(secrets.token_hex(32))'`. The gateway refuses to start without it.
+2. Generate the L402 signing key and set `L402_SECRET_HEX` in `.env`: `python3 -c 'import secrets; print(secrets.token_hex(32))'`. The gateway refuses to start without it — likewise `PRICE_PER_PROOF_SATS`, the flat price every hash pays (sizing arithmetic: "Pricing" below). Set both before first start.
 3. Set `PAYMENT_BACKEND_TYPE=phoenixd` (the default) and fill in `PHOENIXD_URL` (`http://host.docker.internal:9740` for a phoenixd on this host — Docker Desktop only; on a Linux engine phoenixd must be bound where the container can reach it, see "Payment backend (phoenixd)") and `PHOENIXD_HTTP_PASSWORD_LIMITED`. Only fill in `LND_*` if using the LND test-payer / alternative backend.
 4. (lnd test-payer backend only) Set `TOR_PROXY=tor:9050` if `LND_HOST` is a `.onion` address; leave blank otherwise.
 5. Set `OTS_BACKEND_MODE=calendar` and `OTS_CALENDAR_URL=http://otsd:14788`.
@@ -351,7 +351,32 @@ This can be a deliberate choice rather than a surprise — operators may set `--
 
 ## Pricing
 
-The 402 challenge quotes `max(GATEWAY_PRICE_SATS, floor)`. With a feerate available (`estimatesmartfee` over `PRICE_RPC_URL`, or the `BITCOIN_RPC_SERVICE_URL` fallback) the floor is the solvency floor — estimated anchor cost with bump reserve and margin, so the gateway is structurally unable to quote below what anchoring costs it. Without a feerate — no RPC URL configured, node down or timing out, no estimate for the target — the floor is `PRICE_BLIND_SATS` (default 5000). That is what the blind price is for: a blind gateway cannot tell a calm fee market from a spiking one, so it quotes a price the market cannot hurt it with — 5000 sats covers a 20 sat/vB anchor at cost with margin. It never quotes the bare static price on failure and it never refuses to quote; every blind quote is preceded by a logged warning. A token minted at any of these prices validates at its mint-time price for as long as its settled invoice backs it: settlement, not the clock, gates redemption (the expiry in the challenge is advisory).
+Pricing is a two-part model. **Only part one exists today.**
+
+**Part one — the flat per-proof rate (live).** Every hash pays `PRICE_PER_PROOF_SATS` at submission. That is the whole quote: no feerate, no estimator, no floor logic — the gateway makes no Bitcoin RPC calls. The variable is required with no default (startup fails without it, the same pattern as `L402_SECRET_HEX`); `0` is allowed and boots with a warning — the shop earns nothing per proof. A token minted at N validates at N for as long as its settled invoice backs it: settlement, not the clock, gates redemption (the expiry in the challenge is advisory), so repricing never strands an in-flight invoice.
+
+**Part two — anchor billing (not built).** The model's second part bills each anchor's actual cost, times a markup, to a configured standing payer wallet when the anchor occurs. It does not exist yet. Until it ships, anchor costs are the operator's side of the ledger, and the flat rate is where they are recovered — or deliberately not.
+
+### Sizing the flat rate
+
+Measured constants (2026-07): a calm anchor cost 153–308 sats (153 amortized, 308 with one fee bump); the worst case per anchor cycle is bounded by the stamper's fee cap — `--btc-max-fee 0.0002` = 20,000 sats; and one anchor carries the whole batch, every proof aggregated since the last anchor sharing that one cost (measured: five proofs on one 153-sat anchor, 30.6 sats/proof).
+
+Two deployments, two answers:
+
+- **No standing payer — anchoring comes out of the flat rate.** Size in the hundreds of sats. At the measured constants, a 500-sat rate carries a calm 308-sat anchor from the first sale of each batch; a sustained run of cap-priced anchors (20,000 sats each) needs the batch to hold 20,000 ÷ rate sales (40 at 500 sats) or the difference comes out of the float — which is what the float and the cap are for. Storm risk belongs to the float and the cap, not the price.
+- **Standing payer will carry anchor costs (once anchor billing ships).** The flat rate is a pure service premium: single digits to tens of sats.
+
+### The float backstop
+
+The anchor wallet (`otsd-hot`) is the machine's float. The gateway watches it through the same file-mediated wallet status the liquidity alarm uses (no RPC, no credential — see "Wallet liquidity alarm"). Thresholds derive from `STAMPER_FEE_CAP_SATS` (default 20,000 — keep it equal to the otsd `--btc-max-fee` flag; the flag takes BTC, 0.0002 BTC = 20,000 sats, never "fix" one to the other's unit):
+
+- **Below 5 × cap (100,000 sats):** `/health` reports `float: alarm` and degrades to 503. Sales continue. Refill.
+- **Below 1 × cap (20,000 sats):** the machine cannot be sure of affording its next anchor cycle, so it full-stops itself: everything returns 503 except `/health` (overall `auto_paused`), and the sweeper skips its cycles — the PAUSED semantics, but as the machine's OWN state, distinct from your PAUSED file. It never touches operator intent and clears itself when a newer balance reading shows recovery (lag bounded by the 30-minute timer). Settlement outranks expiry throughout: paid tokens redeem after recovery.
+- **No balance reading** — the ops timers not installed (the compose path today), or the status file carries no balance: the backstop is **inactive**, reported honestly in `/health` (`float: inactive`) without degrading. A stale file's last reading stands (ruled 2026-07-27); staleness itself alarms through the `wallet` field.
+
+### Retired pricing variables
+
+`GATEWAY_PRICE_SATS`, `MIN_GATEWAY_PRICE_SATS`, `PRICE_BLIND_SATS`, `PRICE_BUMP_RESERVE`, `PRICE_MARGIN`, `PRICE_TX_VSIZE_ESTIMATE`, `PRICE_CONF_TARGET`, and `PRICE_RPC_URL` are no longer read. Any of them present in the environment logs one startup warning naming it, then is ignored — never a startup failure.
 
 ---
 
@@ -507,7 +532,7 @@ docker compose logs -f otsd      # OTS calendar server
 
 The gateway runs without an access log (`--no-access-log` in both shipped launch paths) and logs warnings/errors for payment backend and OTS backend failures at `WARNING`/`ERROR` level. For the precise logging posture — what is never logged, payment-hash truncation, the traceback residual, and where digests do persist — see the README's "Privacy trade-offs" section.
 
-**If your Bitcoin node is still syncing (IBD), expect two false alarms.** A wallet on a syncing node reads balance 0 until the sync passes the funding transaction — the wallet alarm fires `low` and `/health` degrades to 503 on a perfectly healthy box — so install the monitoring timers below only after the node is synced. And `estimatesmartfee` returns no estimate during IBD, so quotes fall back to the blind floor: first 402 challenges quote `PRICE_BLIND_SATS` (5,000 sats by default), not `GATEWAY_PRICE_SATS` — expected behaviour, not a pricing bug (see "Pricing").
+**If your Bitcoin node is still syncing (IBD), expect a false alarm with teeth.** A wallet on a syncing node reads balance 0 until the sync passes the funding transaction. That reading does not just fire the wallet alarm (`low`, 503 degraded) — a balance below `STAMPER_FEE_CAP_SATS` trips the float backstop and full-stops the machine (`auto_paused`; see "Pricing") on a perfectly healthy box. So install the monitoring timers below only after the node is synced. Quotes are unaffected by IBD: the flat `PRICE_PER_PROOF_SATS` consults no feerate, so 402 challenges quote the same price from the first request.
 
 ### What `otsd: error` in `/health` means (and what it does not)
 
@@ -524,7 +549,7 @@ Two different "anchoring isn't happening" signals, and how to tell them apart:
 
 The otsd-hot wallet funds anchoring transactions. If it drains, anchoring silently stops — so its balance is checked unattended and surfaced through `/health`.
 
-**How it works:** `ops/wallet-balance-check.sh` (run by a systemd timer every 30 minutes) reads the wallet balance over Bitcoin JSON-RPC (`getbalances`, via `BITCOIN_RPC_SERVICE_URL` from `.env`), compares it against `WALLET_MIN_SATS` (default 50000), and atomically writes a one-line JSON status file (`WALLET_STATUS_PATH`, default `/var/lib/timestamp-gateway/wallet-status`). `/health` reads only that file — the wallet field never comes from the gateway talking to Bitcoin RPC, and the gateway holds no wallet credential for it. (The gateway's one Bitcoin RPC use is fee estimation for the pricing floor: `PRICE_RPC_URL` — which, honest caveat, falls back to the wallet-scoped `BITCOIN_RPC_SERVICE_URL` when unset. Set a dedicated node-level `PRICE_RPC_URL` if you can; see `.env.example`.)
+**How it works:** `ops/wallet-balance-check.sh` (run by a systemd timer every 30 minutes) reads the wallet balance over Bitcoin JSON-RPC (`getbalances`, via `BITCOIN_RPC_SERVICE_URL` from `.env`), compares it against `WALLET_MIN_SATS` (default 50000), and atomically writes a one-line JSON status file (`WALLET_STATUS_PATH`, default `/var/lib/timestamp-gateway/wallet-status`). `/health` reads only that file — the wallet field never comes from the gateway talking to Bitcoin RPC, and the gateway holds no wallet credential for it. (The gateway makes no Bitcoin RPC calls at all: the balance-check timer holds the only read credential, and the gateway reads only the file it leaves behind.) The float backstop reads `balance_sats` from this same file — thresholds and the auto-pause semantics are under "Pricing".
 
 **Install the timer:**
 

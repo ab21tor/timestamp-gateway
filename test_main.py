@@ -24,11 +24,7 @@ os.environ["LND_HOST"] = "test.onion"
 os.environ["LND_PORT"] = "8080"
 os.environ["LND_MACAROON_HEX"] = "deadbeef" * 8
 os.environ["TOR_PROXY"] = "127.0.0.1:9050"
-os.environ["GATEWAY_PRICE_SATS"] = "21"
-os.environ["MIN_GATEWAY_PRICE_SATS"] = "1"
-# Pinned to the static price so quote assertions stay 21 (the suite runs with
-# no feerate); blind-price behavior is tested by patching main.PRICE_BLIND_SATS.
-os.environ["PRICE_BLIND_SATS"] = "21"
+os.environ["PRICE_PER_PROOF_SATS"] = "500"  # the suite-wide deterministic quote
 os.environ["PAYMENT_BACKEND_TYPE"] = "lnd"  # explicit: suite mocks LND REST (the test payer)
 os.environ["OTS_BACKEND_MODE"] = "calendar"
 os.environ["OTS_CALENDAR_URL"] = "http://test-calendar:14788"
@@ -38,12 +34,15 @@ os.environ["OTS_SUBMIT_BACKOFF_SECONDS"] = "0"     # keep retry tests fast
 os.environ["OBLIGATIONS_DB_PATH"] = ":memory:"     # overridden per-test by fixture below
 os.environ["RATE_LIMIT_PER_MINUTE"] = "0"          # whole suite shares one client IP;
                                                    # rate-limit tests patch the global
-# Pin the pricing-floor RPC to unset: main's load_dotenv() reads the repo's
-# real .env at import, and an inherited BITCOIN_RPC_SERVICE_URL makes
-# quoted_price_sats() spend a (mocked) fetch on whichever test first sees an
-# empty feerate cache — an environment-dependent extra requests.post call.
-os.environ["PRICE_RPC_URL"] = ""
-os.environ["BITCOIN_RPC_SERVICE_URL"] = ""
+# Retired pricing names: pin them empty so a developer's real .env (read by
+# main's load_dotenv() at import) cannot fire the legacy startup warning
+# mid-suite; the legacy-warning tests set them explicitly.
+for _retired in (
+    "GATEWAY_PRICE_SATS", "MIN_GATEWAY_PRICE_SATS", "PRICE_BLIND_SATS",
+    "PRICE_BUMP_RESERVE", "PRICE_MARGIN", "PRICE_TX_VSIZE_ESTIMATE",
+    "PRICE_CONF_TARGET", "PRICE_RPC_URL",
+):
+    os.environ[_retired] = ""
 
 import main  # noqa: E402
 from fastapi import HTTPException  # noqa: E402
@@ -252,22 +251,32 @@ def test_missing_required_env_var_fails_at_startup():
             main._parse_config()
 
 
-def test_non_integer_gateway_price_fails():
-    with patch.dict(os.environ, {"GATEWAY_PRICE_SATS": "abc"}):
-        with pytest.raises(RuntimeError, match="GATEWAY_PRICE_SATS must be an integer"):
+def test_price_per_proof_missing_fails_with_teaching_message():
+    # Required with no default, same pattern as L402_SECRET_HEX; the error
+    # points the operator at the sizing arithmetic instead of guessing one.
+    with patch.dict(os.environ, {"PRICE_PER_PROOF_SATS": ""}):
+        with pytest.raises(RuntimeError, match=r"PRICE_PER_PROOF_SATS is required.*operator guide"):
             main._parse_config()
 
 
-def test_zero_gateway_price_fails():
-    with patch.dict(os.environ, {"GATEWAY_PRICE_SATS": "0"}):
-        with pytest.raises(RuntimeError, match="positive integer"):
+def test_price_per_proof_non_integer_fails():
+    with patch.dict(os.environ, {"PRICE_PER_PROOF_SATS": "abc"}):
+        with pytest.raises(RuntimeError, match="PRICE_PER_PROOF_SATS must be an integer"):
             main._parse_config()
 
 
-def test_negative_gateway_price_fails():
-    with patch.dict(os.environ, {"GATEWAY_PRICE_SATS": "-5"}):
-        with pytest.raises(RuntimeError, match="positive integer"):
+def test_price_per_proof_negative_fails():
+    with patch.dict(os.environ, {"PRICE_PER_PROOF_SATS": "-5"}):
+        with pytest.raises(RuntimeError, match="PRICE_PER_PROOF_SATS must be >= 0"):
             main._parse_config()
+
+
+def test_price_per_proof_zero_boots_with_warning(caplog):
+    with patch.dict(os.environ, {"PRICE_PER_PROOF_SATS": "0"}):
+        with caplog.at_level(logging.WARNING):
+            cfg = main._parse_config()
+    assert cfg.price_per_proof_sats == 0
+    assert any("earns nothing per proof" in r.getMessage() for r in caplog.records)
 
 
 def test_invalid_ots_backend_mode_fails():
@@ -442,7 +451,7 @@ def test_402_json_body_has_status_price_invoice_macaroon_expiry():
         resp = client.post("/timestamp", json={"digest": DIGEST})
     body = resp.json()["detail"]
     assert body["status"] == "payment_required"
-    assert body["price_sats"] == 21          # no feerate in test env; blind floor pinned to 21 here
+    assert body["price_sats"] == 500         # the flat PRICE_PER_PROOF_SATS
     assert body["invoice"] == FAKE_INVOICE
     assert isinstance(body["macaroon"], str) and body["macaroon"]
     assert isinstance(body["expiry"], int) and body["expiry"] > int(time.time())
@@ -454,67 +463,59 @@ def test_402_creates_invoice_with_digest_memo_and_configured_price():
     assert resp.status_code == 402
     sent = p.call_args.kwargs["json"]
     assert sent["memo"] == DIGEST
-    assert sent["value"] == 21               # configured GATEWAY_PRICE_SATS
+    assert sent["value"] == 500              # configured PRICE_PER_PROOF_SATS
     assert sent["private"] is True
 
 
-def test_402_quotes_solvency_floor_when_above_static():
-    # Fee market at 10 sat/vB: floor = ceil(150 x 10 x 1.5 x 5) = 11250 > 21.
-    # Body, invoice amount, and macaroon caveat must all carry the same quote.
-    main._feerate_cache = (10.0, time.monotonic())
-    try:
+def test_402_quotes_flat_per_proof_rate():
+    # The quote is PRICE_PER_PROOF_SATS and nothing else. Body, invoice
+    # amount, and macaroon caveat must all carry the same quote.
+    assert main.quoted_price_sats() == 500
+    with patch("main.PRICE_PER_PROOF_SATS", 7):
+        assert main.quoted_price_sats() == 7
         with patch("main.requests.post", return_value=_post_mock()) as p:
             resp = client.post("/timestamp", json={"digest": DIGEST})
         assert resp.status_code == 402
         body = resp.json()["detail"]
-        assert body["price_sats"] == 11250
-        assert p.call_args.kwargs["json"]["value"] == 11250
-        token = body["macaroon"]
-        assert main.verify_l402_token(token, DIGEST) == (PAYMENT_HASH, 11250)
-    finally:
-        main._feerate_cache = None
+        assert body["price_sats"] == 7
+        assert p.call_args.kwargs["json"]["value"] == 7
+        assert main.verify_l402_token(body["macaroon"], DIGEST) == (PAYMENT_HASH, 7)
 
 
-def test_402_challenge_never_refuses_on_feerate_failure():
-    # A dead fee-estimation RPC degrades the quote to static; the challenge
-    # path itself must stay up.
-    main._feerate_cache = None
-    try:
-        with patch("main.PRICE_RPC_URL", PRICE_TEST_URL):
-            with patch(
-                "main.requests.post",
-                side_effect=[main.requests.exceptions.Timeout(), _post_mock()],
-            ):
-                resp = client.post("/timestamp", json={"digest": DIGEST})
-        assert resp.status_code == 402
-        assert resp.json()["detail"]["price_sats"] == 21
-    finally:
-        main._feerate_cache = None
+def test_quote_path_is_feerate_independent():
+    # Provably no RPC on the quote path: the whole requests module is
+    # replaced, so ANY network call would be visible — none occurs. And the
+    # feerate machinery itself is gone from the module, not merely bypassed.
+    sentinel = MagicMock()
+    with patch("main.requests", sentinel):
+        assert main.quoted_price_sats() == 500
+    assert sentinel.post.call_count == 0
+    assert sentinel.get.call_count == 0
+    for gone in ("_fetch_feerate_sat_per_vb", "_cached_feerate_sat_per_vb",
+                 "_feerate_cache", "_btc_per_kvb_to_sat_per_vb"):
+        assert not hasattr(main, gone)
 
 
-def test_floated_challenge_redeems_after_repricing_down():
-    # Full circle: challenge quoted at the 11250 floor, fee market then falls
-    # (cache now empty → static 21). The 11250 invoice paid in full must
-    # still redeem — mint-time binding end to end through the real challenge.
-    main._feerate_cache = (10.0, time.monotonic())
-    try:
+def test_challenge_redeems_after_repricing_down():
+    # Full circle: challenge minted while the flat rate was 11250, the
+    # operator then reprices to the suite's 500. The 11250 invoice paid in
+    # full must still redeem — mint-time binding end to end through the real
+    # challenge.
+    with patch("main.PRICE_PER_PROOF_SATS", 11250):
         with patch("main.requests.post", return_value=_post_mock()):
             challenge = client.post("/timestamp", json={"digest": DIGEST})
-        token = challenge.json()["detail"]["macaroon"]
-        main._feerate_cache = (None, time.monotonic())  # repriced: static again
-        with patch("main.requests.get", return_value=_get_mock(True, DIGEST, 11250)):
-            with patch("main.stamp_digest", return_value=FAKE_OTS):
-                resp = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
-        assert resp.status_code == 200
-        assert resp.content == FAKE_OTS
-        # And the same token paid only 21 (the static price) must not redeem:
-        # payment verification runs before the proof cache, so underpayment
-        # against the mint-time amount still fails even after a redemption.
-        with patch("main.requests.get", return_value=_get_mock(True, DIGEST, 21)):
+    token = challenge.json()["detail"]["macaroon"]
+    with patch("main.requests.get", return_value=_get_mock(True, DIGEST, 11250)):
+        with patch("main.stamp_digest", return_value=FAKE_OTS):
             resp = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
-        assert resp.status_code == 402
-    finally:
-        main._feerate_cache = None
+    assert resp.status_code == 200
+    assert resp.content == FAKE_OTS
+    # And the same token paid only 500 (today's flat rate) must not redeem:
+    # payment verification runs before the proof cache, so underpayment
+    # against the mint-time amount still fails even after a redemption.
+    with patch("main.requests.get", return_value=_get_mock(True, DIGEST, 500)):
+        resp = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+    assert resp.status_code == 402
 
 
 def test_minted_token_verifies_and_carries_mint_time_price():
@@ -522,11 +523,11 @@ def test_minted_token_verifies_and_carries_mint_time_price():
         resp = client.post("/timestamp", json={"digest": DIGEST})
     token = resp.json()["detail"]["macaroon"]
     # Bound to this digest: verifies and returns the payment hash + mint price.
-    assert main.verify_l402_token(token, DIGEST) == (PAYMENT_HASH, 21)
+    assert main.verify_l402_token(token, DIGEST) == (PAYMENT_HASH, 500)
     # NOT bound to the live configured price: a token minted at N validates at N
     # forever, so repricing never strands an in-flight invoice.
-    with patch("main.GATEWAY_PRICE_SATS", 99):
-        assert main.verify_l402_token(token, DIGEST) == (PAYMENT_HASH, 21)
+    with patch("main.PRICE_PER_PROOF_SATS", 99):
+        assert main.verify_l402_token(token, DIGEST) == (PAYMENT_HASH, 500)
 
 
 # ══ 5. L402 token verification ═════════════════════════════════════════════════
@@ -699,13 +700,13 @@ def test_verify_payment_false_when_underpaid():
 
 def test_verify_payment_enforces_mint_time_price_not_static_config():
     # Face amount 21 against a token minted at 30: insufficient even though
-    # the static price says 21 is enough.
+    # the configured price would say less is enough.
     with patch("main.requests.get", return_value=_get_mock(True, DIGEST, 21)):
         assert main.verify_payment(PAYMENT_HASH, DIGEST, 30) is False
     # Face amount 900 against a token minted at 900: settles even if the
-    # static price has since moved — the binding is to the mint-time amount
-    # alone.
-    with patch("main.GATEWAY_PRICE_SATS", 21):
+    # configured price has since moved — the binding is to the mint-time
+    # amount alone.
+    with patch("main.PRICE_PER_PROOF_SATS", 21):
         with patch("main.requests.get", return_value=_get_mock(True, DIGEST, 900)):
             assert main.verify_payment(PAYMENT_HASH, DIGEST, 900) is True
 
@@ -764,7 +765,7 @@ def test_endpoint_settled_underpaid_returns_402():
 
 
 def test_endpoint_honors_in_flight_invoice_after_repricing():
-    # Challenge quoted 900; by redemption the live price is back at 21. The
+    # Challenge quoted 900; by redemption the flat rate has moved on. The
     # invoice paid in full at its mint-time amount must still redeem.
     token = valid_token(price=900)
     with patch("main.requests.get", return_value=_get_mock(True, DIGEST, 900)):
@@ -975,6 +976,7 @@ def test_health_both_ok_returns_200():
         "payment_backend": main.PAYMENT_BACKEND_TYPE,
         "otsd": "ok",
         "wallet": "absent",
+        "float": "inactive",
         "proofs": "absent",
         "backup": "absent",
     }
@@ -1031,6 +1033,7 @@ def test_health_otsd_na_in_public_mode():
         "payment_backend": main.PAYMENT_BACKEND_TYPE,
         "otsd": "n/a",
         "wallet": "absent",
+        "float": "inactive",
         "proofs": "absent",
         "backup": "absent",
     }
@@ -1369,7 +1372,7 @@ def test_payment_backend_default_is_phoenixd():
     """With PAYMENT_BACKEND_TYPE unset, the default is phoenixd (the live
     backend) — and a bare config must parse without any LND vars."""
     env = {
-        "GATEWAY_PRICE_SATS": "500",
+        "PRICE_PER_PROOF_SATS": "500",
         "OTS_BACKEND_MODE": "calendar",
         "OTS_CALENDAR_URL": "http://127.0.0.1:14788",
         "L402_SECRET_HEX": "ab" * 16,
@@ -1432,8 +1435,7 @@ def test_phoenixd_backend_does_not_require_lnd_vars():
     """PAYMENT_BACKEND_TYPE=phoenixd must not require LND_HOST/PORT/MACAROON."""
     env = {
         "PAYMENT_BACKEND_TYPE": "phoenixd",
-        "GATEWAY_PRICE_SATS": "500",
-        "MIN_GATEWAY_PRICE_SATS": "500",
+        "PRICE_PER_PROOF_SATS": "500",
         "OTS_BACKEND_MODE": "calendar",
         "OTS_CALENDAR_URL": "http://127.0.0.1:14788",
         "L402_SECRET_HEX": "ab" * 16,
@@ -1448,8 +1450,7 @@ def test_phoenixd_password_pre_rename_alias():
     """The pre-rename PHOENIXD_HTTP_PASSWORD still fills the limited field."""
     env = {
         "PAYMENT_BACKEND_TYPE": "phoenixd",
-        "GATEWAY_PRICE_SATS": "500",
-        "MIN_GATEWAY_PRICE_SATS": "500",
+        "PRICE_PER_PROOF_SATS": "500",
         "OTS_BACKEND_MODE": "calendar",
         "OTS_CALENDAR_URL": "http://127.0.0.1:14788",
         "L402_SECRET_HEX": "ab" * 16,
@@ -1554,18 +1555,6 @@ def test_phoenixd_password_not_logged(caplog):
             with patch("main.requests.post", return_value=resp):
                 backend.create_invoice(DIGEST, 21)
     assert secret not in caplog.text
-
-
-def test_gateway_price_below_minimum_fails():
-    with patch.dict(os.environ, {"GATEWAY_PRICE_SATS": "20", "MIN_GATEWAY_PRICE_SATS": "21"}):
-        with pytest.raises(RuntimeError, match="GATEWAY_PRICE_SATS must be >= MIN_GATEWAY_PRICE_SATS"):
-            main._parse_config()
-
-
-def test_non_integer_min_gateway_price_fails():
-    with patch.dict(os.environ, {"MIN_GATEWAY_PRICE_SATS": "abc"}):
-        with pytest.raises(RuntimeError, match="MIN_GATEWAY_PRICE_SATS must be an integer"):
-            main._parse_config()
 
 
 def test_paused_health_returns_503(tmp_path):
@@ -1803,7 +1792,10 @@ def test_health_wallet_ok_returns_200(wallet_status_file):
 
 
 def test_health_wallet_low_returns_503(wallet_status_file):
-    _write_wallet_status(wallet_status_file, status="low", balance_sats=1000)
+    # 30,000: low per the script's WALLET_MIN_SATS (50,000) and a float alarm,
+    # but above the 20,000 stop — this test pins the wallet field, not the
+    # backstop (section 16 covers the stop).
+    _write_wallet_status(wallet_status_file, status="low", balance_sats=30000)
     with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
         resp = client.get("/health")
     assert resp.status_code == 503
@@ -2001,292 +1993,217 @@ def test_health_backup_malformed_returns_503_unknown(backup_status_file):
     assert body["status"] == "degraded" and body["backup"] == "unknown"
 
 
-# ══ 15. Pricing solvency floor ═══════════════════════════════════════════════════
-
-PRICE_TEST_URL = "http://feeuser:feepass@127.0.0.1:18332/"
-
-
-def _feerate_post_mock(result):
-    """Mock Bitcoin JSON-RPC estimatesmartfee response."""
-    m = MagicMock()
-    m.raise_for_status.return_value = None
-    m.json.return_value = {"result": result, "error": None, "id": "gateway-price-floor"}
-    return m
+# ══ 15. Pricing (flat per-proof rate) ════════════════════════════════════════
+# The quote is PRICE_PER_PROOF_SATS, full stop. The retired floor/feerate
+# model warns once at startup and is ignored; STAMPER_FEE_CAP_SATS remains
+# only to derive the float backstop thresholds (section 16).
 
 
-@pytest.fixture
-def fresh_feerate_cache():
-    main._feerate_cache = None
-    yield
-    main._feerate_cache = None
+def test_legacy_pricing_vars_warn_once_and_are_ignored(caplog):
+    retired = {
+        "GATEWAY_PRICE_SATS": "21",
+        "MIN_GATEWAY_PRICE_SATS": "1",
+        "PRICE_BLIND_SATS": "5000",
+        "PRICE_BUMP_RESERVE": "1.5",
+        "PRICE_MARGIN": "5",
+        "PRICE_TX_VSIZE_ESTIMATE": "150",
+        "PRICE_CONF_TARGET": "6",
+        "PRICE_RPC_URL": "http://feeuser:feepass@127.0.0.1:18332/",
+    }
+    with patch.dict(os.environ, retired):
+        with caplog.at_level(logging.WARNING):
+            cfg = main._parse_config()  # boots — legacy vars never fail startup
+    assert cfg.price_per_proof_sats == 500
+    warnings = [r.getMessage() for r in caplog.records
+                if "Retired pricing variables" in r.getMessage()]
+    assert len(warnings) == 1
+    for name in retired:
+        assert name in warnings[0]
 
 
-# ── Config validation ──
+def test_legacy_warning_absent_when_env_clean(caplog):
+    with caplog.at_level(logging.WARNING):
+        main._parse_config()
+    assert not any("Retired pricing variables" in r.getMessage() for r in caplog.records)
 
 
-def test_price_rpc_url_falls_back_to_bitcoin_rpc_service_url():
-    env = {"PRICE_RPC_URL": "", "BITCOIN_RPC_SERVICE_URL": PRICE_TEST_URL}
+def test_price_rpc_url_never_warns_on_bitcoin_rpc_service_url(caplog):
+    # BITCOIN_RPC_SERVICE_URL remains legitimately set for otsd; only an
+    # explicitly present PRICE_RPC_URL is named (ruled 2026-07-27).
+    env = {"BITCOIN_RPC_SERVICE_URL": "http://u:p@127.0.0.1:8332/wallet/otsd-hot"}
     with patch.dict(os.environ, env):
-        assert main._parse_config().price_rpc_url == PRICE_TEST_URL
+        with caplog.at_level(logging.WARNING):
+            main._parse_config()
+    assert not any("PRICE_RPC_URL" in r.getMessage() for r in caplog.records)
 
 
-def test_price_rpc_url_wins_over_fallback():
-    env = {"PRICE_RPC_URL": PRICE_TEST_URL, "BITCOIN_RPC_SERVICE_URL": "http://other:18332/"}
-    with patch.dict(os.environ, env):
-        assert main._parse_config().price_rpc_url == PRICE_TEST_URL
+def test_stamper_fee_cap_default_is_20000():
+    with patch.dict(os.environ):
+        os.environ.pop("STAMPER_FEE_CAP_SATS", None)
+        assert main._parse_config().stamper_fee_cap_sats == 20000
 
 
-def test_price_rpc_url_unset_is_none_and_boots():
-    with patch.dict(os.environ, {"PRICE_RPC_URL": "", "BITCOIN_RPC_SERVICE_URL": ""}):
-        assert main._parse_config().price_rpc_url is None
-
-
-def test_price_floor_defaults():
-    cfg = main._parse_config()
-    assert cfg.price_tx_vsize_estimate == 150
-    assert cfg.price_bump_reserve == 1.5
-    assert cfg.price_margin == 5.0
-    assert cfg.price_conf_target == 6
-
-
-def test_non_integer_price_tx_vsize_fails():
-    with patch.dict(os.environ, {"PRICE_TX_VSIZE_ESTIMATE": "abc"}):
-        with pytest.raises(RuntimeError, match="PRICE_TX_VSIZE_ESTIMATE must be an integer"):
+def test_non_integer_stamper_fee_cap_fails():
+    with patch.dict(os.environ, {"STAMPER_FEE_CAP_SATS": "abc"}):
+        with pytest.raises(RuntimeError, match="STAMPER_FEE_CAP_SATS must be an integer"):
             main._parse_config()
 
 
-def test_zero_price_tx_vsize_fails():
-    with patch.dict(os.environ, {"PRICE_TX_VSIZE_ESTIMATE": "0"}):
-        with pytest.raises(RuntimeError, match="PRICE_TX_VSIZE_ESTIMATE must be a positive"):
-            main._parse_config()
-
-
-def test_non_numeric_price_bump_reserve_fails():
-    with patch.dict(os.environ, {"PRICE_BUMP_RESERVE": "abc"}):
-        with pytest.raises(RuntimeError, match="PRICE_BUMP_RESERVE must be a number"):
-            main._parse_config()
-
-
-def test_sub_one_price_bump_reserve_fails():
-    with patch.dict(os.environ, {"PRICE_BUMP_RESERVE": "0.9"}):
-        with pytest.raises(RuntimeError, match="PRICE_BUMP_RESERVE must be >= 1"):
-            main._parse_config()
-
-
-def test_non_numeric_price_margin_fails():
-    with patch.dict(os.environ, {"PRICE_MARGIN": "abc"}):
-        with pytest.raises(RuntimeError, match="PRICE_MARGIN must be a number"):
-            main._parse_config()
-
-
-def test_sub_one_price_margin_fails():
-    with patch.dict(os.environ, {"PRICE_MARGIN": "0.5"}):
-        with pytest.raises(RuntimeError, match="PRICE_MARGIN must be >= 1"):
-            main._parse_config()
-
-
-def test_non_integer_price_conf_target_fails():
-    with patch.dict(os.environ, {"PRICE_CONF_TARGET": "abc"}):
-        with pytest.raises(RuntimeError, match="PRICE_CONF_TARGET must be an integer"):
-            main._parse_config()
-
-
-def test_out_of_range_price_conf_target_fails():
-    for bad in ("0", "1009"):
-        with patch.dict(os.environ, {"PRICE_CONF_TARGET": bad}):
-            with pytest.raises(RuntimeError, match="1-1008"):
+def test_non_positive_stamper_fee_cap_fails():
+    for bad in ("0", "-1"):
+        with patch.dict(os.environ, {"STAMPER_FEE_CAP_SATS": bad}):
+            with pytest.raises(RuntimeError, match="STAMPER_FEE_CAP_SATS must be a positive"):
                 main._parse_config()
 
 
-# ── BTC/kvB → sat/vB conversion (explicit, per spec) ──
+# ══ 16. Float backstop ═══════════════════════════════════════════════════════
+# The anchor wallet is the machine's float, read from the SAME wallet-status
+# file as the liquidity alarm — no RPC, no credential. Below
+# 5 × STAMPER_FEE_CAP_SATS: alarm, sales continue, /health degrades. Below
+# 1 × cap: automatic full stop with PAUSED semantics as its OWN state,
+# clearing itself on recovery. No balance reading: inactive, honestly
+# reported, never degrading.
 
 
-def test_btc_per_kvb_to_sat_per_vb_conversion():
-    # 0.00001 BTC/kvB = 1000 sat / 1000 vB = exactly 1 sat/vB. Exact equality
-    # is deliberate: binary-float noise here would leak through ceil() and
-    # inflate the quoted floor by a sat.
-    assert main._btc_per_kvb_to_sat_per_vb(0.00001) == 1.0
-    assert main._btc_per_kvb_to_sat_per_vb(0.0001) == 10.0
-    assert main._btc_per_kvb_to_sat_per_vb(0.00012345) == 12.345
+def test_float_ok_at_or_above_five_caps(wallet_status_file):
+    _write_wallet_status(wallet_status_file, status="ok", balance_sats=100000)  # exactly 5 × cap
+    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+        resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json()["float"] == "ok"
 
 
-def test_conversion_noise_does_not_inflate_floor(fresh_feerate_cache):
-    # A 1 sat/vB estimate must price ceil(150 x 1.0 x 1.5 x 5) = 1125, not the
-    # 1126 that raw float conversion (1.0000000000000002 sat/vB) would give.
-    main._feerate_cache = (main._btc_per_kvb_to_sat_per_vb(0.00001), time.monotonic())
-    assert main.quoted_price_sats() == 1125
+def test_float_alarm_below_five_caps_degrades_sales_continue(wallet_status_file):
+    _write_wallet_status(wallet_status_file, status="ok", balance_sats=60000)
+    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+        resp = client.get("/health")
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["status"] == "degraded" and body["float"] == "alarm"
+    # Sales continue: the unauthenticated mint path still answers 402.
+    with patch("main.requests.post", return_value=_post_mock()):
+        resp = client.post("/timestamp", json={"digest": DIGEST})
+    assert resp.status_code == 402
 
 
-# ── Feerate fetch: success and every fallback path ──
+def test_float_stop_below_one_cap_full_stops(wallet_status_file):
+    _write_wallet_status(wallet_status_file, status="low", balance_sats=10000)
+    # /health still answers: overall auto_paused — the machine's own state,
+    # not the operator's (paused stays false).
+    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+        resp = client.get("/health")
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["status"] == "auto_paused" and body["float"] == "stop"
+    assert body["paused"] is False
+    # Everything else is 503 with the auto-pause reason, not the operator's.
+    resp = client.post("/timestamp", json={"digest": DIGEST})
+    assert resp.status_code == 503
+    assert "auto-paused" in resp.json()["detail"]
+    assert "operator" not in resp.json()["detail"]
+    resp = client.post("/verify", json={"digest": DIGEST, "ots": "aGk="})
+    assert resp.status_code == 503
 
 
-def test_fetch_feerate_success_calls_rpc_and_converts(fresh_feerate_cache):
-    mock_post = MagicMock(return_value=_feerate_post_mock({"feerate": 0.0001, "blocks": 6}))
-    with patch("main.PRICE_RPC_URL", PRICE_TEST_URL):
-        with patch("main.requests.post", mock_post):
-            assert main._fetch_feerate_sat_per_vb() == 10.0
-    args, kwargs = mock_post.call_args
-    assert args[0] == PRICE_TEST_URL
-    assert kwargs["json"]["method"] == "estimatesmartfee"
-    assert kwargs["json"]["params"] == [main.PRICE_CONF_TARGET]
-    assert kwargs["timeout"] == 5  # hard timeout: Tor path can hang for seconds
+def test_float_stop_own_state_distinct_from_operator_pause(tmp_path, wallet_status_file):
+    # Both hold: the operator label wins everywhere; the machine never
+    # touches the operator's file, and lifting the manual pause leaves the
+    # machine's own stop standing.
+    _write_wallet_status(wallet_status_file, status="low", balance_sats=10000)
+    pause_file = tmp_path / "PAUSED"
+    pause_file.write_text("manual\n")
+    with patch("main.PAUSE_FILE", str(pause_file)):
+        with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+            resp = client.get("/health")
+        body = resp.json()
+        assert body["status"] == "paused" and body["float"] == "stop"
+        resp = client.post("/timestamp", json={"digest": DIGEST})
+        assert "operator" in resp.json()["detail"]
+        assert pause_file.exists()
+        pause_file.unlink()
+        resp = client.post("/timestamp", json={"digest": DIGEST})
+        assert resp.status_code == 503
+        assert "auto-paused" in resp.json()["detail"]
 
 
-def test_fetch_feerate_none_without_url_warns(caplog):
-    with patch("main.PRICE_RPC_URL", None):
-        with caplog.at_level(logging.WARNING):
-            assert main._fetch_feerate_sat_per_vb() is None
-    assert any("quoting the static price" in r.message for r in caplog.records)
+def test_float_stop_sweeper_skips(wallet_status_file):
+    _write_wallet_status(wallet_status_file, status="low", balance_sats=10000)
+    with patch("main._sweep_obligations_once") as sweep:
+        main._sweeper_tick()
+    sweep.assert_not_called()
 
 
-def test_fetch_feerate_timeout_falls_back_and_never_logs_credentials(caplog):
-    # The exception message deliberately echoes the URL — the log must not.
-    boom = main.requests.exceptions.ConnectionError(f"{PRICE_TEST_URL} refused")
-    with patch("main.PRICE_RPC_URL", PRICE_TEST_URL):
-        with patch("main.requests.post", side_effect=boom):
-            with caplog.at_level(logging.WARNING):
-                assert main._fetch_feerate_sat_per_vb() is None
-    messages = [r.getMessage() for r in caplog.records]
-    assert any("estimatesmartfee failed (ConnectionError)" in m for m in messages)
-    assert all("feepass" not in m for m in messages)
+def test_float_recovery_clears_itself(wallet_status_file):
+    _write_wallet_status(wallet_status_file, status="low", balance_sats=10000)
+    resp = client.post("/timestamp", json={"digest": DIGEST})
+    assert resp.status_code == 503
+    # The timer writes a recovered balance: no operator action, no restart.
+    _write_wallet_status(wallet_status_file, status="ok", balance_sats=150000)
+    with patch("main.requests.post", return_value=_post_mock()):
+        resp = client.post("/timestamp", json={"digest": DIGEST})
+    assert resp.status_code == 402
+    with patch("main._sweep_obligations_once") as sweep:
+        main._sweeper_tick()
+    sweep.assert_called_once()
 
 
-def test_fetch_feerate_no_estimate_falls_back(caplog):
-    # Fresh node: estimatesmartfee returns errors and no feerate key.
-    mock_post = MagicMock(
-        return_value=_feerate_post_mock({"errors": ["Insufficient data"], "blocks": 0})
-    )
-    with patch("main.PRICE_RPC_URL", PRICE_TEST_URL):
-        with patch("main.requests.post", mock_post):
-            with caplog.at_level(logging.WARNING):
-                assert main._fetch_feerate_sat_per_vb() is None
-    assert any("no feerate estimate" in r.message for r in caplog.records)
+def test_float_stop_blocks_paid_redemption_and_recovery_serves_it(wallet_status_file, obligations_db):
+    # R1 (settlement outranks expiry) across an auto-pause: a paid token
+    # blocked by the machine's stop redeems after recovery.
+    with patch("main.requests.post", return_value=_post_mock()):
+        challenge = client.post("/timestamp", json={"digest": DIGEST})
+    token = challenge.json()["detail"]["macaroon"]
+    _write_wallet_status(wallet_status_file, status="low", balance_sats=5000)
+    resp = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+    assert resp.status_code == 503
+    _write_wallet_status(wallet_status_file, status="ok", balance_sats=150000)
+    with patch("main.requests.get", return_value=_get_mock(True, DIGEST, 500)):
+        with patch("main.stamp_digest", return_value=FAKE_OTS):
+            resp = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+    assert resp.status_code == 200
+    assert resp.content == FAKE_OTS
 
 
-# ── Cache: one fetch per TTL, failures cached too ──
+def test_float_stale_last_reading_stands(wallet_status_file):
+    # Ruled 2026-07-27: freshness is not consulted — a stale low reading
+    # keeps the stop, a stale healthy reading keeps sales; staleness itself
+    # alarms through the wallet field.
+    old = int(time.time()) - 7200
+    _write_wallet_status(wallet_status_file, status="low", balance_sats=10000, checked_at=old)
+    resp = client.post("/timestamp", json={"digest": DIGEST})
+    assert resp.status_code == 503
+    _write_wallet_status(wallet_status_file, status="ok", balance_sats=150000, checked_at=old)
+    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+        resp = client.get("/health")
+    body = resp.json()
+    assert body["float"] == "ok" and body["wallet"] == "stale"
+    assert body["status"] == "degraded"
+    with patch("main.requests.post", return_value=_post_mock()):
+        resp = client.post("/timestamp", json={"digest": DIGEST})
+    assert resp.status_code == 402
 
 
-def test_feerate_cache_serves_within_ttl_and_refetches_after(fresh_feerate_cache):
-    mock_post = MagicMock(return_value=_feerate_post_mock({"feerate": 0.0001, "blocks": 6}))
-    with patch("main.PRICE_RPC_URL", PRICE_TEST_URL):
-        with patch("main.requests.post", mock_post):
-            assert main._cached_feerate_sat_per_vb() == 10.0
-            assert main._cached_feerate_sat_per_vb() == 10.0
-            assert mock_post.call_count == 1
-            # Age the entry past the TTL; the next call must refetch.
-            main._feerate_cache = (10.0, time.monotonic() - 61)
-            assert main._cached_feerate_sat_per_vb() == 10.0
-            assert mock_post.call_count == 2
+def test_float_absent_inactive_backstop_off(wallet_status_file):
+    # No file: the backstop is off and says so; nothing degrades, sales run.
+    assert not wallet_status_file.exists()
+    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+        resp = client.get("/health")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["float"] == "inactive" and body["wallet"] == "absent"
+    with patch("main.requests.post", return_value=_post_mock()):
+        resp = client.post("/timestamp", json={"digest": DIGEST})
+    assert resp.status_code == 402
 
 
-def test_feerate_cache_caches_failures_too(fresh_feerate_cache):
-    mock_post = MagicMock(side_effect=main.requests.exceptions.Timeout())
-    with patch("main.PRICE_RPC_URL", PRICE_TEST_URL):
-        with patch("main.requests.post", mock_post):
-            assert main._cached_feerate_sat_per_vb() is None
-            assert main._cached_feerate_sat_per_vb() is None
-    assert mock_post.call_count == 1  # a dead node is hit once per TTL, not per request
-
-
-# ── Quote: max(static, floor), ceil, fallback ──
-
-
-def test_quoted_price_uses_floor_when_above_static(fresh_feerate_cache):
-    # ceil(150 vB x 10 sat/vB x 1.5 x 5) = 11250 > static 21.
-    main._feerate_cache = (10.0, time.monotonic())
-    assert main.quoted_price_sats() == 11250
-
-
-def test_quoted_price_stays_static_when_floor_below(fresh_feerate_cache):
-    # ceil(150 x 0.001 x 1.5 x 5) = 2 < static 21.
-    main._feerate_cache = (0.001, time.monotonic())
-    assert main.quoted_price_sats() == 21
-
-
-def test_quoted_price_floor_rounds_up(fresh_feerate_cache):
-    # 150 x 1.234 x 1.5 x 5 = 1388.25 → ceil → 1389, never rounded down.
-    main._feerate_cache = (1.234, time.monotonic())
-    assert main.quoted_price_sats() == 1389
-
-
-def test_quoted_price_blind_floor_on_feerate_fallback(fresh_feerate_cache):
-    # Was test_quoted_price_static_on_feerate_fallback: blind now quotes
-    # max(static, PRICE_BLIND_SATS), never the bare static price.
-    main._feerate_cache = (None, time.monotonic())
-    with patch("main.PRICE_BLIND_SATS", 5000):
-        assert main.quoted_price_sats() == 5000
-
-
-def test_blind_price_when_rpc_url_unset(fresh_feerate_cache):
-    with patch("main.PRICE_BLIND_SATS", 5000):
-        with patch("main.PRICE_RPC_URL", None):
-            assert main.quoted_price_sats() == 5000
-
-
-def test_blind_price_on_rpc_timeout(fresh_feerate_cache):
-    with patch("main.PRICE_BLIND_SATS", 5000):
-        with patch("main.PRICE_RPC_URL", PRICE_TEST_URL):
-            with patch("main.requests.post", MagicMock(side_effect=main.requests.exceptions.Timeout())):
-                assert main.quoted_price_sats() == 5000
-
-
-def test_blind_price_on_rpc_error(fresh_feerate_cache):
-    with patch("main.PRICE_BLIND_SATS", 5000):
-        with patch("main.PRICE_RPC_URL", PRICE_TEST_URL):
-            with patch("main.requests.post", MagicMock(side_effect=main.requests.exceptions.ConnectionError())):
-                assert main.quoted_price_sats() == 5000
-
-
-def test_blind_price_when_node_has_no_estimate(fresh_feerate_cache):
-    no_estimate = _feerate_post_mock({"errors": ["Insufficient data or no feerate found"], "blocks": 0})
-    with patch("main.PRICE_BLIND_SATS", 5000):
-        with patch("main.PRICE_RPC_URL", PRICE_TEST_URL):
-            with patch("main.requests.post", MagicMock(return_value=no_estimate)):
-                assert main.quoted_price_sats() == 5000
-
-
-def test_blind_floor_below_static_keeps_static(fresh_feerate_cache):
-    # max() holds: a blind floor below the static price never lowers the quote.
-    main._feerate_cache = (None, time.monotonic())
-    with patch("main.PRICE_BLIND_SATS", 5):
-        assert main.quoted_price_sats() == 21
-
-
-def test_price_blind_sats_default_is_5000():
-    with patch.dict(os.environ):
-        os.environ.pop("PRICE_BLIND_SATS", None)
-        assert main._parse_config().price_blind_sats == 5000
-
-
-def test_non_integer_price_blind_sats_fails():
-    with patch.dict(os.environ, {"PRICE_BLIND_SATS": "abc"}):
-        with pytest.raises(RuntimeError, match="PRICE_BLIND_SATS must be an integer"):
-            main._parse_config()
-
-
-def test_zero_price_blind_sats_fails():
-    with patch.dict(os.environ, {"PRICE_BLIND_SATS": "0"}):
-        with pytest.raises(RuntimeError, match="PRICE_BLIND_SATS must be a positive"):
-            main._parse_config()
-
-
-def test_negative_price_blind_sats_fails():
-    with patch.dict(os.environ, {"PRICE_BLIND_SATS": "-5"}):
-        with pytest.raises(RuntimeError, match="PRICE_BLIND_SATS must be a positive"):
-            main._parse_config()
-
-
-def test_token_minted_at_blind_price_validates_at_blind_price(fresh_feerate_cache):
-    # Mint-time binding invariant, blind edition: a token minted while blind
-    # carries the blind price and validates at it even after the market
-    # becomes visible again and the floor moves.
-    main._feerate_cache = (None, time.monotonic())
-    with patch("main.PRICE_BLIND_SATS", 5000):
-        price = main.quoted_price_sats()
-        assert price == 5000
-        token = valid_token(price=price)
-    main._feerate_cache = (10.0, time.monotonic())  # market back; floor now 11250
-    assert main.verify_l402_token(token, DIGEST) == (PAYMENT_HASH, 5000)
+def test_float_null_balance_reads_inactive(wallet_status_file):
+    # The balance-check script writes balance null when its RPC fails — no
+    # reading, no stop; the wallet field alarms that state separately.
+    wallet_status_file.write_text(json.dumps({
+        "balance_sats": None, "min_sats": 50000, "status": "unknown",
+        "checked_at": int(time.time()),
+    }))
+    assert main._float_state() == "inactive"
 
 
 # ══ 16. Invoice-mint rate limit ══════════════════════════════════════════════════

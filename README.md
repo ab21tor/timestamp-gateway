@@ -94,7 +94,9 @@ cp .env.example .env
 # Edit .env — set L402_SECRET_HEX (required, the gateway refuses to start
 # without it; generate with:
 #   python3 -c 'import secrets; print(secrets.token_hex(32))'
-# ), PHOENIXD_HTTP_PASSWORD_LIMITED (live default backend;
+# ), PRICE_PER_PROOF_SATS (required — the flat price every hash pays;
+# sizing arithmetic: operator guide, "Pricing"),
+# PHOENIXD_HTTP_PASSWORD_LIMITED (live default backend;
 # LND_* only if using the lnd test payer / alternative backend) and
 # BITCOIN_RPC_SERVICE_URL for otsd (see .env.example for the three shapes).
 
@@ -153,8 +155,8 @@ curl -X POST http://localhost:8000/timestamp \
 | `LND_HOST` | When `lnd` | — | Hostname, IP, or `.onion` address of your LND REST API (test payer / alternative) |
 | `LND_PORT` | When `lnd` | — | LND REST port, typically `8080` (test payer / alternative) |
 | `LND_MACAROON_HEX` | When `lnd` | — | Hex-encoded invoice macaroon (test payer / alternative) |
-| `GATEWAY_PRICE_SATS` | Yes | — | Satoshis charged per timestamp |
-| `PRICE_BLIND_SATS` | No | `5000` | Quote floor when no feerate is available (RPC unset, down, or no estimate): the 402 quotes max(`GATEWAY_PRICE_SATS`, this). Rationale and the full floor model: operator guide, "Pricing". |
+| `PRICE_PER_PROOF_SATS` | Yes | — | The flat price in sats every hash pays at submission — the whole quote; the gateway reads no feerates. No default (startup fails without it); `0` allowed, boots with a warning. Sizing arithmetic: operator guide, "Pricing". Retired pricing vars (`GATEWAY_PRICE_SATS`, `PRICE_BLIND_SATS`, and the rest of the old floor model) are named in one startup warning and ignored — never a failure. |
+| `STAMPER_FEE_CAP_SATS` | No | `20000` | Mirror of otsd's `--btc-max-fee` flag in sats (the flag takes BTC; 0.0002 BTC = 20,000 sats — keep the two in sync). Used only to derive the float backstop thresholds (operator guide, "Pricing"). |
 | `RATE_LIMIT_PER_MINUTE` | No | `10` | Per-IP cap per minute on unauthenticated invoice minting (402 challenges). Every anonymous request makes phoenixd sign and store an invoice; this bounds what a spammer gets for free. `0` disables. Over-limit requests get 429 with Retry-After. |
 | `VERIFY_RATE_LIMIT_PER_MINUTE` | No | `30` | Per-IP cap per minute on the free proof endpoints — one bucket shared by `/verify` and `/upgrade`. Separate from the mint limit so proof polling can never starve the paid path. `0` disables. |
 | `L402_SECRET_HEX` | Yes | — | L402 macaroon root signing key (hex, at least 16 bytes; 32 recommended). Generate with `python3 -c 'import secrets; print(secrets.token_hex(32))'`. The gateway refuses to start without it (dev-only escape: `L402_ALLOW_EPHEMERAL_SECRET=true`). |
@@ -426,6 +428,6 @@ curl -X POST http://localhost:8000/upgrade \
   > proof-anchored.ots
 ```
 
-**`/health`:** `"status":"ok"` (HTTP 200) requires `payment` = `ok`, `otsd` = `ok` or `n/a`, `wallet` and `proofs` = `ok` or `absent`, and `backup` = `ok`, `local_only`, or `absent` — anything else reports `degraded` with HTTP 503. The operator **PAUSED switch** is a file (default `/var/lib/timestamp-gateway/PAUSED`, path settable via `PAUSE_FILE`): while it exists the gateway answers `/health` (`"status":"paused"`, HTTP 503) and nothing else — every other endpoint returns 503 and the obligation sweeper skips its cycles (full-stop, ruled 2026-07-22). A pause takes nothing: settlement outranks expiry, so paid tokens redeem after unpause and recorded obligations wait in the log. Create it to stop the machine, delete it to resume.
+**`/health`:** `"status":"ok"` (HTTP 200) requires `payment` = `ok`, `otsd` = `ok` or `n/a`, `wallet` and `proofs` = `ok` or `absent`, `backup` = `ok`, `local_only`, or `absent`, and `float` = `ok` or `inactive` — anything else reports `degraded` with HTTP 503. The operator **PAUSED switch** is a file (default `/var/lib/timestamp-gateway/PAUSED`, path settable via `PAUSE_FILE`): while it exists the gateway answers `/health` (`"status":"paused"`, HTTP 503) and nothing else — every other endpoint returns 503 and the obligation sweeper skips its cycles (full-stop, ruled 2026-07-22). A pause takes nothing: settlement outranks expiry, so paid tokens redeem after unpause and recorded obligations wait in the log. Create it to stop the machine, delete it to resume. The **float backstop** is the machine's own second stop: `float` classifies the anchor-wallet balance read from the wallet-status file — `alarm` below 5 × `STAMPER_FEE_CAP_SATS` (degrades, sales continue), and below 1 × the cap the gateway auto-pauses with the same full-stop semantics as its own state (`"status":"auto_paused"`), clearing itself when the balance recovers; the operator's PAUSED label wins when both hold. Where the balance-check timers don't run, `float` is `inactive` — the backstop is off, reported honestly, never degrading (operator guide, "Pricing").
 
 **Calendar URI note:** the `calendar_url` shown in pending attestations is the calendar's `uri` identity file, chosen once at first run and baked into every attestation the calendar ever issues — treat it as permanent. Pick a stable identifier you control; it does not need to resolve — upgrades go through the gateway's `/upgrade`, not that URL. For a domainless island the natural choice is the gateway's own onion address (`http://<your-onion>.onion/`): it costs nothing, it is already yours, and it stays yours for as long as the Tor key exists. With the onion as the uri, the `tor_keys` backup (operator guide, "Tor hidden service keys") protects the island's identity in both senses: lose that key and you lose not only the front door but the name written inside every attestation the calendar has ever issued.

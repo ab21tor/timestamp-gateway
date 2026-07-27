@@ -46,8 +46,8 @@ class GatewayConfig:
     lnd_port: str | None
     lnd_macaroon_hex: str | None
     tor_proxy: str | None
-    gateway_price_sats: int
-    min_gateway_price_sats: int
+    price_per_proof_sats: int
+    stamper_fee_cap_sats: int
     pause_file: str
     lnd_tls_verify: bool
     ots_backend_mode: str
@@ -68,12 +68,6 @@ class GatewayConfig:
     proofs_status_max_age_seconds: int
     backup_status_path: str
     backup_status_max_age_seconds: int
-    price_rpc_url: str | None
-    price_tx_vsize_estimate: int
-    price_bump_reserve: float
-    price_margin: float
-    price_conf_target: int
-    price_blind_sats: int
     rate_limit_per_minute: int
     verify_rate_limit_per_minute: int
     gateway_behind_proxy: bool
@@ -86,7 +80,6 @@ def _parse_config() -> GatewayConfig:
     payment_backend_type_early = os.getenv("PAYMENT_BACKEND_TYPE", "phoenixd").lower()
 
     required = {
-        "GATEWAY_PRICE_SATS": os.getenv("GATEWAY_PRICE_SATS"),
         "OTS_BACKEND_MODE": os.getenv("OTS_BACKEND_MODE"),
     }
     if payment_backend_type_early == "lnd":
@@ -98,26 +91,53 @@ def _parse_config() -> GatewayConfig:
     if missing:
         raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
 
-    try:
-        price = int(os.getenv("GATEWAY_PRICE_SATS"))
-    except ValueError:
-        raise RuntimeError("GATEWAY_PRICE_SATS must be an integer")
-    if price <= 0:
-        raise RuntimeError(f"GATEWAY_PRICE_SATS must be a positive integer, got {price}")
+    # ── Retired pricing model (one warning, never a failure) ─────────────────
+    # The quote is the flat PRICE_PER_PROOF_SATS; the gateway reads no
+    # feerates for any purpose. Old-model variables found in the environment
+    # are named once and ignored, so no operator's env goes silently inert.
+    # PRICE_RPC_URL fires only when itself explicitly set — never on
+    # BITCOIN_RPC_SERVICE_URL, which remains legitimately set for otsd.
+    retired_present = [
+        name
+        for name in (
+            "GATEWAY_PRICE_SATS",
+            "MIN_GATEWAY_PRICE_SATS",
+            "PRICE_BLIND_SATS",
+            "PRICE_BUMP_RESERVE",
+            "PRICE_MARGIN",
+            "PRICE_TX_VSIZE_ESTIMATE",
+            "PRICE_CONF_TARGET",
+            "PRICE_RPC_URL",
+        )
+        if os.getenv(name) not in (None, "")
+    ]
+    if retired_present:
+        logging.warning(
+            "Retired pricing variables present and ignored: %s. The quote is "
+            "now the flat PRICE_PER_PROOF_SATS; the gateway reads no feerates.",
+            ", ".join(retired_present),
+        )
 
+    # ── Flat per-proof price ─────────────────────────────────────────────────
+    # Required with no default, like L402_SECRET_HEX: the price is an operator
+    # decision, and a silently defaulted one would misprice the shop.
+    price_per_proof_raw = os.getenv("PRICE_PER_PROOF_SATS")
+    if price_per_proof_raw is None or price_per_proof_raw == "":
+        raise RuntimeError(
+            "PRICE_PER_PROOF_SATS is required — the flat price in sats every "
+            "hash pays at submission. Size it with the operator guide's "
+            '"Pricing" arithmetic.'
+        )
     try:
-        min_price = int(os.getenv("MIN_GATEWAY_PRICE_SATS", "1"))
+        price_per_proof = int(price_per_proof_raw)
     except ValueError:
-        raise RuntimeError("MIN_GATEWAY_PRICE_SATS must be an integer")
-    if min_price <= 0:
+        raise RuntimeError("PRICE_PER_PROOF_SATS must be an integer")
+    if price_per_proof < 0:
         raise RuntimeError(
-            f"MIN_GATEWAY_PRICE_SATS must be a positive integer, got {min_price}"
+            f"PRICE_PER_PROOF_SATS must be >= 0, got {price_per_proof}"
         )
-    if price < min_price:
-        raise RuntimeError(
-            f"GATEWAY_PRICE_SATS must be >= MIN_GATEWAY_PRICE_SATS "
-            f"({price} < {min_price})"
-        )
+    if price_per_proof == 0:
+        logging.warning("PRICE_PER_PROOF_SATS=0: the shop earns nothing per proof.")
 
     pause_file = os.getenv("PAUSE_FILE", "/var/lib/timestamp-gateway/PAUSED")
 
@@ -217,14 +237,12 @@ def _parse_config() -> GatewayConfig:
 
     # ── Wallet liquidity alarm (file-mediated; NO Bitcoin RPC from the gateway)
     # /health reads the status file written by ops/wallet-balance-check.sh.
-    # The gateway never holds a SPENDING credential — the rails stay separate.
-    # It holds two scoped ones: PHOENIXD_HTTP_PASSWORD_LIMITED (old name
-    # PHOENIXD_HTTP_PASSWORD read as a fallback), which must be phoenixd's
-    # http-password-limited-access key — the gateway calls only createinvoice,
-    # payments/incoming, and getinfo (PhoenixdPaymentBackend), all covered by
-    # the limited key, which cannot reach /payinvoice — and, for the pricing
-    # floor, a fee-estimation credential (PRICE_RPC_URL, node-level), never a
-    # spending one.
+    # The gateway never holds a wallet credential and makes no Bitcoin RPC
+    # calls at all. Its one scoped credential is PHOENIXD_HTTP_PASSWORD_LIMITED
+    # (old name PHOENIXD_HTTP_PASSWORD read as a fallback), which must be
+    # phoenixd's http-password-limited-access key — the gateway calls only
+    # createinvoice, payments/incoming, and getinfo (PhoenixdPaymentBackend),
+    # all covered by the limited key, which cannot reach /payinvoice.
     wallet_status_path = os.getenv(
         "WALLET_STATUS_PATH", "/var/lib/timestamp-gateway/wallet-status"
     )
@@ -260,64 +278,18 @@ def _parse_config() -> GatewayConfig:
     if backup_status_max_age <= 0:
         raise RuntimeError("BACKUP_STATUS_MAX_AGE_SECONDS must be a positive integer")
 
-    # ── Pricing solvency floor (fee-estimation RPC — see the wallet note above)
-    # The 402 quote is max(GATEWAY_PRICE_SATS, floor); the floor prices one
-    # anchoring transaction at the live fee market. PRICE_RPC_URL should carry
-    # a node-level (wallet-less) credential; it falls back to
-    # BITCOIN_RPC_SERVICE_URL so a single-credential deployment floats prices
-    # without new setup. Unset entirely: the gateway quotes the static price
-    # and warns — degraded pricing must never take payments down.
-    price_rpc_url = (
-        os.getenv("PRICE_RPC_URL") or os.getenv("BITCOIN_RPC_SERVICE_URL") or None
-    )
-
+    # ── Stamper fee cap (float backstop thresholds only) ─────────────────────
+    # Mirrors otsd's --btc-max-fee flag: the most one anchor cycle can spend.
+    # The flag takes BTC and this takes sats (0.0002 BTC = 20,000 sats — keep
+    # the two in sync; never "fix" 0.0002 to 20000). The gateway uses it only
+    # to derive the float backstop thresholds; it makes no Bitcoin RPC calls.
     try:
-        price_tx_vsize = int(os.getenv("PRICE_TX_VSIZE_ESTIMATE", "150"))
+        stamper_fee_cap = int(os.getenv("STAMPER_FEE_CAP_SATS", "20000"))
     except ValueError:
-        raise RuntimeError("PRICE_TX_VSIZE_ESTIMATE must be an integer")
-    if price_tx_vsize <= 0:
+        raise RuntimeError("STAMPER_FEE_CAP_SATS must be an integer")
+    if stamper_fee_cap <= 0:
         raise RuntimeError(
-            f"PRICE_TX_VSIZE_ESTIMATE must be a positive integer, got {price_tx_vsize}"
-        )
-
-    try:
-        price_bump_reserve = float(os.getenv("PRICE_BUMP_RESERVE", "1.5"))
-    except ValueError:
-        raise RuntimeError("PRICE_BUMP_RESERVE must be a number")
-    if price_bump_reserve < 1:
-        raise RuntimeError(
-            f"PRICE_BUMP_RESERVE must be >= 1 (a reserve below the unbumped fee "
-            f"underprices anchoring), got {price_bump_reserve}"
-        )
-
-    try:
-        price_margin = float(os.getenv("PRICE_MARGIN", "5"))
-    except ValueError:
-        raise RuntimeError("PRICE_MARGIN must be a number")
-    if price_margin < 1:
-        raise RuntimeError(
-            f"PRICE_MARGIN must be >= 1 (below 1 quotes anchoring at a loss), "
-            f"got {price_margin}"
-        )
-
-    try:
-        price_conf_target = int(os.getenv("PRICE_CONF_TARGET", "6"))
-    except ValueError:
-        raise RuntimeError("PRICE_CONF_TARGET must be an integer")
-    if not 1 <= price_conf_target <= 1008:
-        raise RuntimeError(
-            f"PRICE_CONF_TARGET must be within estimatesmartfee's accepted range "
-            f"1-1008, got {price_conf_target}"
-        )
-
-    try:
-        price_blind_sats = int(os.getenv("PRICE_BLIND_SATS", "5000"))
-    except ValueError:
-        raise RuntimeError("PRICE_BLIND_SATS must be an integer")
-    if price_blind_sats <= 0:
-        raise RuntimeError(
-            f"PRICE_BLIND_SATS must be a positive integer (it is the quote "
-            f"floor when no feerate is available), got {price_blind_sats}"
+            f"STAMPER_FEE_CAP_SATS must be a positive integer, got {stamper_fee_cap}"
         )
 
     # ── Invoice-mint rate limit ───────────────────────────────────────────────
@@ -365,8 +337,8 @@ def _parse_config() -> GatewayConfig:
         lnd_port=os.getenv("LND_PORT"),
         lnd_macaroon_hex=os.getenv("LND_MACAROON_HEX"),
         tor_proxy=os.getenv("TOR_PROXY") or None,  # optional; None = direct connection
-        gateway_price_sats=price,
-        min_gateway_price_sats=min_price,
+        price_per_proof_sats=price_per_proof,
+        stamper_fee_cap_sats=stamper_fee_cap,
         pause_file=pause_file,
         lnd_tls_verify=os.getenv("LND_TLS_VERIFY", "false").lower() == "true",
         ots_backend_mode=mode,
@@ -388,12 +360,6 @@ def _parse_config() -> GatewayConfig:
         proofs_status_max_age_seconds=proofs_status_max_age,
         backup_status_path=backup_status_path,
         backup_status_max_age_seconds=backup_status_max_age,
-        price_rpc_url=price_rpc_url,
-        price_tx_vsize_estimate=price_tx_vsize,
-        price_bump_reserve=price_bump_reserve,
-        price_margin=price_margin,
-        price_conf_target=price_conf_target,
-        price_blind_sats=price_blind_sats,
         rate_limit_per_minute=rate_limit_per_minute,
         verify_rate_limit_per_minute=verify_rate_limit_per_minute,
         gateway_behind_proxy=gateway_behind_proxy,
@@ -410,8 +376,8 @@ LND_HOST = _CONFIG.lnd_host
 LND_PORT = _CONFIG.lnd_port
 LND_MACAROON_HEX = _CONFIG.lnd_macaroon_hex
 TOR_PROXY = _CONFIG.tor_proxy
-GATEWAY_PRICE_SATS = _CONFIG.gateway_price_sats
-MIN_GATEWAY_PRICE_SATS = _CONFIG.min_gateway_price_sats
+PRICE_PER_PROOF_SATS = _CONFIG.price_per_proof_sats
+STAMPER_FEE_CAP_SATS = _CONFIG.stamper_fee_cap_sats
 PAUSE_FILE = _CONFIG.pause_file
 LND_TLS_VERIFY = _CONFIG.lnd_tls_verify
 OTS_BACKEND_MODE = _CONFIG.ots_backend_mode
@@ -432,12 +398,6 @@ PROOFS_STATUS_PATH = _CONFIG.proofs_status_path
 PROOFS_STATUS_MAX_AGE_SECONDS = _CONFIG.proofs_status_max_age_seconds
 BACKUP_STATUS_PATH = _CONFIG.backup_status_path
 BACKUP_STATUS_MAX_AGE_SECONDS = _CONFIG.backup_status_max_age_seconds
-PRICE_RPC_URL = _CONFIG.price_rpc_url
-PRICE_TX_VSIZE_ESTIMATE = _CONFIG.price_tx_vsize_estimate
-PRICE_BUMP_RESERVE = _CONFIG.price_bump_reserve
-PRICE_MARGIN = _CONFIG.price_margin
-PRICE_CONF_TARGET = _CONFIG.price_conf_target
-PRICE_BLIND_SATS = _CONFIG.price_blind_sats
 RATE_LIMIT_PER_MINUTE = _CONFIG.rate_limit_per_minute
 VERIFY_RATE_LIMIT_PER_MINUTE = _CONFIG.verify_rate_limit_per_minute
 GATEWAY_BEHIND_PROXY = _CONFIG.gateway_behind_proxy
@@ -671,10 +631,14 @@ def _sweep_obligations_once() -> None:
 
 def _sweeper_tick() -> None:
     """One sweeper cycle, pause-aware. Full-stop ruling (2026-07-22): PAUSED
-    silences the sweeper too. Nothing is dropped: 'needs_stamp' rows keep and
-    wait for unpause, like the rest of the machine."""
+    silences the sweeper too — and the float backstop's auto-pause borrows
+    the same semantics. Nothing is dropped: 'needs_stamp' rows keep and wait
+    for unpause or recovery, like the rest of the machine."""
     if is_paused():
         logging.info("Sweeper: gateway paused; skipping sweep")
+        return
+    if is_float_stopped():
+        logging.info("Sweeper: float backstop auto-pause; skipping sweep")
         return
     _sweep_obligations_once()
 
@@ -722,8 +686,20 @@ async def _pause_gate(request, call_next):
     # consensus or absent, and absence takes nothing because state is durable.
     # Ruling 1 (settlement outranks expiry) makes that guarantee here: paid
     # tokens redeem after unpause; recorded obligations wait in the log.
-    if request.url.path != "/health" and is_paused():
-        return JSONResponse(status_code=503, content={"detail": "Gateway is paused by operator"})
+    #
+    # The float backstop borrows the same full-stop semantics as its OWN
+    # state: the machine never touches the operator's PAUSED file, and the
+    # auto-pause clears itself when the wallet-status file shows the balance
+    # recovered — machine protection and operator intent never overwrite
+    # each other.
+    if request.url.path != "/health":
+        if is_paused():
+            return JSONResponse(status_code=503, content={"detail": "Gateway is paused by operator"})
+        if is_float_stopped():
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "Gateway auto-paused: anchor wallet below the stamper fee cap"},
+            )
     return await call_next(request)
 
 
@@ -758,6 +734,57 @@ def _wallet_status() -> str:
     if time.time() - checked_at > WALLET_STATUS_MAX_AGE_SECONDS:
         return "stale"
     return status
+
+
+# ── Float backstop ───────────────────────────────────────────────────────────
+# The anchor wallet is the machine's float. Its balance is read from the SAME
+# wallet-status file the liquidity alarm uses (ops/wallet-balance-check.sh) —
+# the gateway holds no wallet credential and makes no Bitcoin RPC calls.
+# Thresholds derive from STAMPER_FEE_CAP_SATS (the most one anchor cycle can
+# spend): below 5 × cap the float is an alarm; below 1 × cap the machine
+# cannot be sure of affording its next anchor cycle, so it full-stops itself.
+
+_FLOAT_ALARM_CAP_MULTIPLE = 5
+_FLOAT_STOP_CAP_MULTIPLE = 1
+
+
+def _wallet_balance_sats() -> int | None:
+    """The last balance reading from the wallet-status file, or None when no
+    reading is available (file absent, unreadable, or balance null — the
+    script writes null when its RPC fails). Freshness is deliberately not
+    consulted: the last reading stands until replaced (ruled 2026-07-27);
+    staleness alarms separately through the wallet field."""
+    try:
+        data = json.loads(Path(WALLET_STATUS_PATH).read_text())
+    except Exception:
+        return None
+    balance = data.get("balance_sats") if isinstance(data, dict) else None
+    if isinstance(balance, bool) or not isinstance(balance, int):
+        return None
+    return balance
+
+
+def _float_state() -> str:
+    """Float backstop classification:
+      ok       — balance at or above 5 × STAMPER_FEE_CAP_SATS
+      alarm    — below 5 × cap: refill; sales continue, /health degrades
+      stop     — below 1 × cap: automatic full stop (own state, distinct from
+                 the operator's PAUSED file; clears itself on recovery)
+      inactive — no balance reading available (e.g. the ops timers are not
+                 installed): backstop off, reported honestly, never degrades
+    """
+    balance = _wallet_balance_sats()
+    if balance is None:
+        return "inactive"
+    if balance < _FLOAT_STOP_CAP_MULTIPLE * STAMPER_FEE_CAP_SATS:
+        return "stop"
+    if balance < _FLOAT_ALARM_CAP_MULTIPLE * STAMPER_FEE_CAP_SATS:
+        return "alarm"
+    return "ok"
+
+
+def is_float_stopped() -> bool:
+    return _float_state() == "stop"
 
 
 def _proofs_status() -> str:
@@ -1112,102 +1139,17 @@ def parse_l402_auth(auth: str) -> tuple[str, str] | None:
     return m.group(1), m.group(2).lower()
 
 
-# ── Pricing solvency floor ───────────────────────────────────────────────────
-# The 402 challenge quotes max(GATEWAY_PRICE_SATS, floor): the floor prices one
-# anchoring transaction at the live fee market times the bump reserve and the
-# margin, so the gateway is structurally unable to quote below anchoring cost.
-# Any missing feerate (no RPC URL, timeout, RPC error, fresh node with no
-# estimate yet) falls back to the static price with a warning — degraded
-# pricing must never take payments down, and must never be silent. The RPC
-# round-trip crosses socat→Tor→a remote node and can take seconds, so results
-# (including failures) are cached and the hard timeout keeps a dead node from
-# stalling the challenge path.
-
-_PRICE_RPC_TIMEOUT_SECONDS = 5
-_FEERATE_CACHE_TTL_SECONDS = 60
-
-# Single-entry module-level cache, same simplicity as _proof_cache:
-# (feerate in sat/vB, or None if the last fetch failed; monotonic fetch time).
-_feerate_cache: tuple[float | None, float] | None = None
-
-
-def _btc_per_kvb_to_sat_per_vb(btc_per_kvb: float) -> float:
-    """estimatesmartfee quotes BTC/kvB; sat/vB = BTC/kvB × 1e8 sat/BTC ÷ 1000 vB/kvB.
-    bitcoind serializes BTC to 8 decimals, so sat/vB has exactly 3 meaningful
-    decimals; rounding there is lossless and stops binary-float noise
-    (0.00001 × 1e8 ÷ 1000 = 1.0000000000000002) from inflating ceil() by a sat."""
-    return round(btc_per_kvb * 1e8 / 1000, 3)
-
-
-def _fetch_feerate_sat_per_vb() -> float | None:
-    """estimatesmartfee(PRICE_CONF_TARGET) against PRICE_RPC_URL, in sat/vB.
-    Returns None — always with a warning — when no URL is configured, the call
-    fails or exceeds the timeout, or the node has no estimate. Exceptions are
-    reduced to their class name: requests errors can echo the URL, which
-    carries credentials."""
-    if not PRICE_RPC_URL:
-        logging.warning(
-            "Pricing floor: neither PRICE_RPC_URL nor BITCOIN_RPC_SERVICE_URL "
-            "is set; quoting the static price"
-        )
-        return None
-    try:
-        resp = requests.post(
-            PRICE_RPC_URL,
-            json={
-                "jsonrpc": "1.0",
-                "id": "gateway-price-floor",
-                "method": "estimatesmartfee",
-                "params": [PRICE_CONF_TARGET],
-            },
-            timeout=_PRICE_RPC_TIMEOUT_SECONDS,
-        )
-        resp.raise_for_status()
-        result = resp.json().get("result") or {}
-        feerate_btc_kvb = result.get("feerate")
-    except Exception as exc:
-        logging.warning(
-            "Pricing floor: estimatesmartfee failed (%s); quoting the static price",
-            type(exc).__name__,
-        )
-        return None
-    if not isinstance(feerate_btc_kvb, (int, float)) or feerate_btc_kvb <= 0:
-        logging.warning(
-            "Pricing floor: node has no feerate estimate for conf target %d; "
-            "quoting the static price",
-            PRICE_CONF_TARGET,
-        )
-        return None
-    return _btc_per_kvb_to_sat_per_vb(feerate_btc_kvb)
-
-
-def _cached_feerate_sat_per_vb() -> float | None:
-    """The fetched feerate, refreshed at most once per TTL. Failures are cached
-    too: a dead node costs one timed-out call per TTL, not one per request."""
-    global _feerate_cache
-    now = time.monotonic()
-    if _feerate_cache is not None and now - _feerate_cache[1] < _FEERATE_CACHE_TTL_SECONDS:
-        return _feerate_cache[0]
-    feerate = _fetch_feerate_sat_per_vb()
-    _feerate_cache = (feerate, now)
-    return feerate
+# ── Pricing ──────────────────────────────────────────────────────────────────
+# Flat rate: every hash pays PRICE_PER_PROOF_SATS at submission. The quote
+# consults nothing else — no feerate, no estimator, no floor logic; the
+# gateway makes no Bitcoin RPC calls. Anchoring costs are the operator's side
+# of the ledger; the operator guide's "Pricing" section carries the sizing
+# arithmetic.
 
 
 def quoted_price_sats() -> int:
-    """The price the 402 challenge quotes: the static price or the floor,
-    whichever is higher. Floats with the fee market; never refuses.
-    The floor is the computed solvency floor when a feerate is available
-    and PRICE_BLIND_SATS when it is not: blind, the gateway cannot tell a
-    calm market from a spiking one, so it quotes a price the market cannot
-    hurt — the default 5000 covers a 20 sat/vB anchor at cost with margin."""
-    feerate = _cached_feerate_sat_per_vb()
-    if feerate is None:
-        floor = PRICE_BLIND_SATS
-    else:
-        floor = math.ceil(
-            PRICE_TX_VSIZE_ESTIMATE * feerate * PRICE_BUMP_RESERVE * PRICE_MARGIN
-        )
-    return max(GATEWAY_PRICE_SATS, floor)
+    """The price the 402 challenge quotes: the flat per-proof rate."""
+    return PRICE_PER_PROOF_SATS
 
 
 # ── Payment backend abstraction ──────────────────────────────────────────────
@@ -1521,6 +1463,11 @@ def root():
 @app.get("/health")
 def health():
     paused = is_paused()
+    # Float backstop: ok / alarm / stop / inactive. "stop" is the machine's
+    # own full stop (overall "auto_paused"); the operator's PAUSED file wins
+    # the label when both hold. "inactive" (no balance reading — e.g. the ops
+    # timers are not installed) reports honestly and never degrades.
+    float_state = _float_state()
     payment_status = "ok" if PAYMENT_BACKEND.health() else "error"
 
     if OTS_CALENDAR_URL:
@@ -1577,6 +1524,8 @@ def health():
 
     if paused:
         overall = "paused"
+    elif float_state == "stop":
+        overall = "auto_paused"
     else:
         overall = (
             "ok"
@@ -1585,6 +1534,7 @@ def health():
             and wallet_status in ("ok", "absent")
             and proofs_status in ("ok", "absent")
             and backup_status in ("ok", "local_only", "absent")
+            and float_state in ("ok", "inactive")
             else "degraded"
         )
 
@@ -1597,6 +1547,7 @@ def health():
             "payment_backend": PAYMENT_BACKEND_TYPE,
             "otsd": otsd_status,
             "wallet": wallet_status,
+            "float": float_state,
             "proofs": proofs_status,
             "backup": backup_status,
         },
@@ -1727,10 +1678,9 @@ def timestamp(body: TimestampRequest, request: Request):
         )
 
     # No authorization — mint an invoice and an L402 token bound to it. The
-    # quote floats with the solvency floor; invoice, macaroon, and body all
-    # carry the same mint-time amount, which is what redemption later enforces.
-    # Rate-limit before touching any backend: a 429 costs neither phoenixd nor
-    # the fee-estimation RPC anything.
+    # quote is the flat per-proof rate; invoice, macaroon, and body all carry
+    # the same mint-time amount, which is what redemption later enforces.
+    # Rate-limit before touching any backend: a 429 costs phoenixd nothing.
     retry_after = _rate_limit_retry_after(_client_ip(request))
     if retry_after is not None:
         raise HTTPException(
