@@ -20,7 +20,12 @@ The gateway cannot produce Bitcoin-anchored proofs on its own. It requires a run
 
 ## Prerequisites
 
-- Docker Engine 24+ and Docker Compose v2.17+ — quoted as the earliest releases with the BuildKit named-context support the calendar profile's build uses; not tested further back
+- Git — the first-run checklist starts with two `git clone`s (`apt install git` on a fresh Ubuntu box)
+- Docker Engine 24+ and Docker Compose v2.17+ — quoted as the earliest releases with the BuildKit named-context support the calendar profile's build uses; not tested further back. On a fresh Ubuntu box, install both from Docker's official repository — https://docs.docker.com/engine/install/ubuntu/ — which ships current Engine plus the Compose plugin; distro packages can trail these floors. Compose v2 ships two ways — the `docker compose` plugin or a standalone `docker-compose` binary. Detect which this box has, and read `docker compose` in every command in these docs as `$C`:
+
+  ```bash
+  docker compose version >/dev/null 2>&1 && C="docker compose" || C="docker-compose"
+  ```
 - A running phoenixd instance (the live payment backend — see "Payment backend (phoenixd)" below for how to get one) — or an LND node with REST API and invoice macaroon if using the LND test-payer / alternative backend
 - Inbound Lightning liquidity on the payment backend
 - An OTS calendar backend (otsd) — bundled via `--profile calendar` or external
@@ -41,7 +46,16 @@ You do not need a VPS. You do not need a static IP. You do not need to expose an
 7. First run only: initialise the calendar identity (see "Deploying the calendar" below).
 8. Start the full stack: `docker compose --profile calendar up -d --build` (first run; plain `up -d` thereafter — see "Deploying the calendar (otsd)").
 9. Check logs: `docker compose logs -f`.
-10. Retrieve onion address: `docker compose exec tor cat /var/lib/tor/timestamp_gateway/hostname`.
+10. Retrieve onion address: `docker compose exec tor cat /var/lib/tor/timestamp_gateway/hostname`. Then verify the onion answers, from the box itself, through the stack's own Tor client:
+
+    ```bash
+    # The network is <project>_ts_net; <project> defaults to this repo's
+    # directory name (`docker network ls` shows the real name).
+    docker run --rm --network timestamp-gateway_ts_net curlimages/curl -s \
+      --socks5-hostname tor:9050 http://<your-onion>.onion/health
+    ```
+
+    Expected output: the same health JSON as the direct check against `http://127.0.0.1:8000/health`.
 11. Test the endpoint with `curl` (see README quick start). The paid leg needs a second, independently funded Lightning wallet — you cannot pay the gateway from its own phoenixd; see the README, "The payer side".
 
 ---
@@ -119,6 +133,43 @@ On the systemd path otsd reads this URL from `/etc/systemd/system/otsd.env` inst
 For a directly reachable node, ensure the otsd host is allowed by `rpcbind`/`rpcallowip` in bitcoin.conf.
 
 **Pruned nodes:** A pruned Bitcoin Core node is acceptable for otsd's transaction submission role. otsd does not need to download the full chain — it only submits transactions and reads the current tip.
+
+### Same-host bitcoind under compose
+
+Running bitcoind on the same box as the compose stack needs three things lined up: where bitcoind listens, whom it allows, and whether the wallet survives a bitcoind restart.
+
+**Bind and allow.** The otsd container reaches the host at `host.docker.internal`, which compose maps to the docker0 bridge address (`172.17.0.1` on a default Linux engine); the connection arrives with a source address on the compose network's subnet. So bitcoind must bind the bridge address and allow the compose subnet — credentials go in `bitcoin.conf` (and in the `.env` URL — nowhere else):
+
+```
+# bitcoin.conf
+rpcbind=127.0.0.1
+rpcbind=172.17.0.1
+rpcallowip=127.0.0.1
+rpcallowip=172.18.0.0/16    # the compose subnet — read the real one, below
+rpcuser=<rpc-user>
+rpcpassword=<rpc-password>
+```
+
+Docker assigns the compose subnet — read it rather than guessing:
+
+```bash
+docker network inspect timestamp-gateway_ts_net \
+  --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}'
+```
+
+(The network is `<project>_ts_net`; `<project>` defaults to this repo's directory name.) The RPC URL is then the direct-node shape on mainnet's own port — no bridge, so 8332:
+
+```
+BITCOIN_RPC_SERVICE_URL=http://<rpc-user>:<rpc-password>@host.docker.internal:8332/wallet/otsd-hot
+```
+
+**Wallet load persistence.** A wallet loaded with plain `loadwallet` does not survive a bitcoind restart; the failure arrives later and quietly: `/health` shows `otsd: error`, the gateway log says `otsd HTTP up but Bitcoin-blind` (see "Monitoring"), and otsd's own log shows `JSONRPCError -18: Requested wallet does not exist or is not loaded`. Make the load persistent:
+
+```bash
+bitcoin-cli loadwallet otsd-hot true    # second argument = load_on_startup
+# or at creation:
+bitcoin-cli -named createwallet wallet_name=otsd-hot load_on_startup=true
+```
 
 ### Starting with the bundled otsd profile
 
@@ -242,14 +293,36 @@ phoenixd is the live payment backend: a self-custodial Lightning node daemon by 
 
 A fresh phoenixd's first received payment triggers the automatic channel open, and ACINQ's liquidity fee is deducted **from that payment**. A settled first payment still gets its proof — verify_payment checks the invoice's face amount, so the fee nets the operator's credit, never the customer's proof (mechanics and the pinning tests: `ops/OPERATOR-NOTES.md`, "Phoenixd first payment warning"). The risk sits upstream: a first payment too small to carry the fee can fail to settle at all (phoenixd liquidity policy; unverified on this deployment), and either way the fee comes out of your margin.
 
-So make the first payment yourself, out of band, before the first real sale — one deliberately larger payment (~25,000–30,000 sats — see the README's budget table) that absorbs the channel-open fee and leaves the channel open for full-value payments afterwards:
+So provision the channel yourself, before the first real sale. Two rails end in the same purchase; only one is proven from these docs.
+
+**Primary — on-chain swap-in deposit (measured working).** Deposit on-chain to phoenixd's swap-in address and let auto-liquidity make the purchase; no Lightning sender is involved:
+
+```bash
+# 1. Read the swap-in address from phoenixd (the limited password may
+#    read it; it cannot spend). Endpoint exists from phoenixd 0.9
+#    (absent in 0.8.0); on older versions the address appears in
+#    phoenix.log — grep "setting current swap-in address".
+#    URL = where phoenixd is bound as seen from this host:
+#    127.0.0.1:9740 on the systemd path; 172.17.0.1:9740 with the
+#    deploy/phoenixd.service.example bind.
+curl -sS -u ":$PHOENIXD_HTTP_PASSWORD_LIMITED" \
+  http://127.0.0.1:9740/getswapinaddress
+
+# 2. Send ~25,000–30,000 sats on-chain to that address, from any wallet.
+
+# 3. Wait for 3 confirmations. phoenixd's auto-liquidity then purchases
+#    a ~2M-sat inbound channel itself (the default --auto-liquidity 2m),
+#    the fees deducted from the deposit.
+```
+
+Measured (stranger run, 2026-07): 31,232 sats deposited → 21,561 sats total toll → 9,671 sats remaining, buying a channel of 2,046,082 sats capacity with 2,035,087 sats inbound. The toll is the price of the inbound channel; what remains is the node's starting balance.
+
+**Alternative — Lightning pre-fund (caveated).** The original walkthrough: mint an invoice directly from phoenixd and pay it from the payer wallet — one deliberately larger payment (~25,000–30,000 sats — see the README's budget table) that absorbs the channel-open fee:
 
 ```bash
 # 1. On the gateway host: mint an invoice directly from phoenixd
 #    (the limited password may create and read invoices; it cannot spend).
-#    URL = where phoenixd is bound as seen from this host: 127.0.0.1:9740
-#    on the systemd path; 172.17.0.1:9740 with the
-#    deploy/phoenixd.service.example bind.
+#    URL: same as above.
 curl -sS -u ":$PHOENIXD_HTTP_PASSWORD_LIMITED" \
   -X POST http://127.0.0.1:9740/createinvoice \
   -d amountSat=30000 \
@@ -264,7 +337,15 @@ curl -sS -u ":$PHOENIXD_HTTP_PASSWORD_LIMITED" \
   http://127.0.0.1:9740/payments/incoming?limit=5
 ```
 
-After this, the channel exists and subsequent payments — the real sales — arrive at full value.
+Caveat from live testing (2026-07): three attempts to pay such a pre-fund invoice from a Phoenix mobile sender were refused upstream — ACINQ returned `UpdateFailHtlc` within ~1 second, without ever contacting the receiving phoenixd. The walkthrough's prescribed sender (the payer wallet) remains untested on this rail. If the payment is refused, use the on-chain deposit above; it needs no Lightning sender at all.
+
+After either rail, the channel exists and subsequent payments — the real sales — arrive at full value.
+
+### Funding the payer side (phoenixd as payer)
+
+The end-to-end test needs a second, independently funded wallet (README, "The payer side"). If that payer is itself a phoenixd, do not budget mining fees only for its on-chain funding: under the default `--auto-liquidity 2m`, a phoenixd used purely as a payer pays the full auto-liquidity toll on first funding, exactly as the shop's node does. Measured (stranger run, 2026-07): 81,736 sats deposited on-chain → toll 21,561 sats, identical to the shop's → 60,175 sats spendable. The mining-fees-only assumption for on-chain payer funding is false under defaults.
+
+This can be a deliberate choice rather than a surprise — operators may set `--auto-liquidity` for payer roles on purpose; the deposited funds are spendable once the deposit has 3 confirmations and the splice completes. Budget the toll either way.
 
 ---
 
@@ -350,7 +431,9 @@ To receive Lightning payments, the payment backend must have inbound capacity �
 
 ### phoenixd (live default backend)
 
-phoenixd manages its own liquidity. It opens — and later extends — a channel from ACINQ automatically when a received payment needs one, at a fee deducted from that payment (see `ops/OPERATOR-NOTES.md`). There is nothing to pre-provision: the first real payment simply nets less. Third-party channel-open services do not apply — phoenixd peers only with ACINQ.
+phoenixd manages its own liquidity: it purchases inbound capacity from ACINQ automatically, either when an on-chain swap-in deposit confirms or when a received Lightning payment needs a channel, the fee deducted from that deposit or payment (see `ops/OPERATOR-NOTES.md`). Pre-provision it with the on-chain deposit before going live — the walkthrough is "First payment: pre-fund before going live". Do not leave the channel purchase to the first real payment: in live testing (2026-07) three pre-fund payment attempts from a Phoenix mobile sender were refused upstream, ACINQ returning `UpdateFailHtlc` within ~1 second without ever contacting the receiving phoenixd — and even when that rail works, the first payment simply nets less.
+
+Both funding rails — the on-chain deposit and a received Lightning payment — purchase inbound liquidity from ACINQ, phoenixd's only peer. That is a deliberate single-provider dependency of the phoenixd backend; third-party channel-open services do not apply. Operators who require peer choice need the alternative backend (LND, below), where inbound capacity is arranged manually.
 
 ### LND (test payer / alternative backend only)
 

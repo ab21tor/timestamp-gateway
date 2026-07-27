@@ -56,7 +56,12 @@ Public calendar mode (`OTS_BACKEND_MODE=public`) is retained as a compatibility/
 
 ## What you need
 
-- Docker with Compose v2 (version floor and why: operator guide, "Prerequisites")
+- Git — the Quick start clones two repositories with it
+- Docker with Compose v2 (version floor, install route, and why: operator guide, "Prerequisites"). Compose v2 ships two ways — the `docker compose` plugin or a standalone `docker-compose` binary. Detect which this box has, and read `docker compose` in every command in these docs as `$C`:
+
+  ```bash
+  docker compose version >/dev/null 2>&1 && C="docker compose" || C="docker-compose"
+  ```
 - A running phoenixd instance (the live payment backend) — or an LND node with REST API and invoice macaroon if using the LND test-payer / alternative backend
 - An OpenTimestamps calendar backend (otsd) — bundled in the Compose stack or external
 - An **existing, already-synced** Bitcoin Core node reachable by otsd, with a wallet loaded and funded for anchoring transactions. This is the heaviest prerequisite, and these docs do not teach it: building a node from nothing is a multi-day project — on the order of 750 GB of initial-block-download ingress, days of sync time, and real money to fund the wallet. If you do not already run a node, start at [bitcoincore.org](https://bitcoincore.org) and come back.
@@ -341,6 +346,7 @@ keeps digests only in its obligation log.
 | Platform | Proof |
 |---|---|
 | VPS, systemd path — gateway under systemd, otsd as a Docker unit, phoenixd host-run | Live mainnet proofs issued and anchored: [LIVE_PROOF.md](LIVE_PROOF.md) (2026-06-16 and 2026-06-17). |
+| VPS, Docker Compose path — docs-only stranger install, no operator assistance | Live mainnet proofs issued, anchored, and sold unattended: [LIVE_PROOF.md](LIVE_PROOF.md) (2026-07-27). |
 
 ### Untested — should work, not proven
 
@@ -348,7 +354,7 @@ Reasoned expectations, not test results. A row moves up to Verified when a dated
 
 | Platform | What is reasoned vs. proven |
 |---|---|
-| Home Linux / mini PC (Docker Compose) | The compose stack has been driven end to end only against stub backends so far (2026-07-14, macOS/colima); no live compose deployment is on record. |
+| Home Linux / mini PC (Docker Compose) | A live compose deployment is on record on a VPS ([LIVE_PROOF.md](LIVE_PROOF.md), 2026-07-27); on home hardware itself the stack has been driven end to end only against stub backends (2026-07-14, macOS/colima). |
 | Raspberry Pi / ARM64 | The base images are multi-arch, so they should pull and run on arm64 — but multi-arch base images are not a test; no ARM build or run is on record. |
 | Umbrel | A Linux Docker host, so the compose stack should run beside Umbrel's own apps. Untested. `umbrel.local` is mDNS and does not resolve inside containers — use the Umbrel host's LAN IP in `.env`. |
 | Start9 | Running this stack as a plain docker compose project is not a supported StartOS flow, and no StartOS run is on record. (A Start9 box does serve as the Bitcoin Core backend of the verified deployment, over Tor — that half is proven; see LIVE_PROOF.md.) |
@@ -364,9 +370,10 @@ cp .env.example .env   # fill in payment backend vars and set OTS_BACKEND_MODE
 uvicorn main:app --reload
 ```
 
-Run the test suite (no payment backend, Tor, or otsd required — all network calls are mocked):
+Run the test suite (no payment backend, Tor, or otsd required — all network calls are mocked). `requirements.txt` is runtime-only, so install the two test-only packages first:
 
 ```bash
+pip install pytest httpx
 pytest -q
 ```
 
@@ -374,7 +381,7 @@ pytest -q
 
 ## The payer side
 
-The end-to-end test needs a **second, independently funded Lightning wallet**. You cannot pay the gateway's invoice from the gateway's own phoenixd — that would be the node paying itself. Any consumer Lightning wallet (Phoenix, Breez, Zeus, …) works as the payer; after paying, the payment **preimage** is shown on the wallet's payment-details screen for that payment — the L402 retry needs it (`Authorization: L402 <macaroon>:<preimage>`). The repo's own test payer, `ops/l402-paid-proof.sh`, presupposes an LND node with `lncli`; without one, a consumer wallet plus the two curl commands in [Quick start](#quick-start) is the manual path.
+The end-to-end test needs a **second, independently funded Lightning wallet**. You cannot pay the gateway's invoice from the gateway's own phoenixd — that would be the node paying itself. Any consumer Lightning wallet (Phoenix, Breez, Zeus, …) works as the payer; after paying, the payment **preimage** is shown on the wallet's payment-details screen for that payment — the L402 retry needs it (`Authorization: L402 <macaroon>:<preimage>`). The repo's own test payer, `ops/l402-paid-proof.sh`, presupposes an LND node with `lncli`; without one, a consumer wallet plus the two curl commands in [Quick start](#quick-start) is the manual path. If the payer is itself a phoenixd, do not budget mining fees only for its on-chain funding — under defaults it pays the same auto-liquidity toll as the receiving node (measured figures: operator guide, "Funding the payer side (phoenixd as payer)").
 
 ---
 
@@ -421,4 +428,4 @@ curl -X POST http://localhost:8000/upgrade \
 
 **`/health`:** `"status":"ok"` (HTTP 200) requires `payment` = `ok`, `otsd` = `ok` or `n/a`, `wallet` and `proofs` = `ok` or `absent`, and `backup` = `ok`, `local_only`, or `absent` — anything else reports `degraded` with HTTP 503. The operator **PAUSED switch** is a file (default `/var/lib/timestamp-gateway/PAUSED`, path settable via `PAUSE_FILE`): while it exists the gateway answers `/health` (`"status":"paused"`, HTTP 503) and nothing else — every other endpoint returns 503 and the obligation sweeper skips its cycles (full-stop, ruled 2026-07-22). A pause takes nothing: settlement outranks expiry, so paid tokens redeem after unpause and recorded obligations wait in the log. Create it to stop the machine, delete it to resume.
 
-**Calendar URI note:** the `calendar_url` shown in pending attestations is the calendar's `uri` identity file, chosen at first run and baked into every attestation the calendar ever issues. For a private calendar, pick a stable identifier you control (a domain you own); it does not need to resolve — upgrades go through the gateway's `/upgrade`, not that URL.
+**Calendar URI note:** the `calendar_url` shown in pending attestations is the calendar's `uri` identity file, chosen once at first run and baked into every attestation the calendar ever issues — treat it as permanent. Pick a stable identifier you control; it does not need to resolve — upgrades go through the gateway's `/upgrade`, not that URL. For a domainless island the natural choice is the gateway's own onion address (`http://<your-onion>.onion/`): it costs nothing, it is already yours, and it stays yours for as long as the Tor key exists. With the onion as the uri, the `tor_keys` backup (operator guide, "Tor hidden service keys") protects the island's identity in both senses: lose that key and you lose not only the front door but the name written inside every attestation the calendar has ever issued.
