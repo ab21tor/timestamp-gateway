@@ -351,11 +351,11 @@ This can be a deliberate choice rather than a surprise — operators may set `--
 
 ## Pricing
 
-Pricing is a two-part model. **Only part one exists today.**
+Pricing is a two-part model. **Both parts are live.**
 
 **Part one — the flat per-proof rate (live).** Every hash pays `PRICE_PER_PROOF_SATS` at submission. That is the whole quote: no feerate, no estimator, no floor logic — the gateway makes no Bitcoin RPC calls. The variable is required with no default (startup fails without it, the same pattern as `L402_SECRET_HEX`); `0` is allowed and boots with a warning — the shop earns nothing per proof. A token minted at N validates at N for as long as its settled invoice backs it: settlement, not the clock, gates redemption (the expiry in the challenge is advisory), so repricing never strands an in-flight invoice.
 
-**Part two — anchor billing (not built).** The model's second part bills each anchor's actual cost, times a markup, to a configured standing payer wallet when the anchor occurs. It does not exist yet. Until it ships, anchor costs are the operator's side of the ledger, and the flat rate is where they are recovered — or deliberately not.
+**Part two — anchor billing (live).** Each anchor's actual cost, times `PRICE_MARKUP`, is billed to a standing payer wallet: the calendar fork records what every confirmed anchor really cost in an append-only receipts file, and the gateway turns those receipts into Lightning bills served on `GET /anchor-bills`. Off by default; a gateway with `ANCHOR_BILLING_ENABLED=false` behaves exactly as before it existed. With billing on, anchor costs move from the operator's side of the ledger to the standing payer's — the flat rate becomes a pure service premium. Everything about it: "Anchor billing" below.
 
 ### Sizing the flat rate
 
@@ -364,7 +364,7 @@ Measured constants (2026-07): a calm anchor cost 153–308 sats (153 amortized, 
 Two deployments, two answers:
 
 - **No standing payer — anchoring comes out of the flat rate.** Size in the hundreds of sats. At the measured constants, a 500-sat rate carries a calm 308-sat anchor from the first sale of each batch; a sustained run of cap-priced anchors (20,000 sats each) needs the batch to hold 20,000 ÷ rate sales (40 at 500 sats) or the difference comes out of the float — which is what the float and the cap are for. Storm risk belongs to the float and the cap, not the price.
-- **Standing payer will carry anchor costs (once anchor billing ships).** The flat rate is a pure service premium: single digits to tens of sats.
+- **Standing payer carries anchor costs (anchor billing on).** The flat rate is a pure service premium: single digits to tens of sats. The anchors are recovered — with margin — through the bills below.
 
 ### The float backstop
 
@@ -377,6 +377,86 @@ The anchor wallet (`otsd-hot`) is the machine's float. The gateway watches it th
 ### Retired pricing variables
 
 `GATEWAY_PRICE_SATS`, `MIN_GATEWAY_PRICE_SATS`, `PRICE_BLIND_SATS`, `PRICE_BUMP_RESERVE`, `PRICE_MARGIN`, `PRICE_TX_VSIZE_ESTIMATE`, `PRICE_CONF_TARGET`, and `PRICE_RPC_URL` are no longer read. Any of them present in the environment logs one startup warning naming it, then is ignored — never a startup failure.
+
+---
+
+## Anchor billing
+
+Part two of the pricing model ("Pricing" above), off by default. The calendar fork records what each confirmed anchor actually cost in an append-only JSONL receipts file — one line per confirmed anchor, at the path its `OTSD_ANCHOR_RECEIPTS` environment variable names, written before the calendar save so a crash produces at worst a duplicate line, never a missing one. With billing on, the gateway ingests those receipts into an `anchor_bills` table (`INSERT OR IGNORE` keyed on txid — the fork's crash-preferred duplicates dedupe for free) and bills a standing payer `ceil(fee_sats × PRICE_MARKUP)` sats per anchor. The amount is computed exactly once, at ingestion, and is immutable: changing the markup later never reprices an existing bill — the same law as the quote.
+
+Billing gates nothing. Sales, stamping, and redemption never consult billing state — an unpaid bill degrades `/health` (below), and that is the whole mechanism. The standing payer is a customer with a ledger, not a dependency the machine waits on.
+
+### Configuration
+
+`ANCHOR_BILLING_ENABLED` is a strict `true`/`false` (anything else fails startup) and defaults to `false`, which means the feature is entirely absent: the three variables below are never read, `GET /anchor-bills` returns the same 404 as an unregistered route, and `/health` reports `billing: off` without ever degrading. With `true`, all three are required with no defaults — startup fails, naming every missing one in a single error:
+
+- **`PRICE_MARKUP`** — the ratio applied to each anchor's actual fee: a finite float ≥ 1.0 (`1.5` bills the standing payer 150% of the fee). Below 1.0 the shop sells anchors at a loss, so startup refuses it.
+- **`ANCHOR_RECEIPTS_PATH`** — the receipts file as the gateway sees it (wiring below). An absent file is healthy — billing on, no anchors yet. Present but unreadable is `billing: error`.
+- **`ANCHOR_BILLS_TOKEN`** — the opaque bearer token guarding `GET /anchor-bills`: operational history (anchor timing, fees, payment state) is not public. Generate it like `L402_SECRET_HEX` (`python3 -c 'import secrets; print(secrets.token_hex(32))'`).
+
+### The endpoint
+
+`GET /anchor-bills` with `Authorization: Bearer <ANCHOR_BILLS_TOKEN>`. 404 when billing is off, 401 on a missing or wrong token (constant-time compare), and rate-limited from the `/verify` bucket (`VERIFY_RATE_LIMIT_PER_MINUTE`) — the limiter runs before the token compare, so it also throttles guessing.
+
+Everything happens on the poll; ingestion never mints. A bill without a live invoice — none yet, or the previous one expired — gets a fresh **plain bolt11** (memo `anchor-bill <txid>`) on the poll that finds it: anchor bills are not L402, and none of the macaroon machinery is involved. A settled invoice marks the bill `paid`, and paid is terminal — it never re-mints, and the bill stays in the response for a reconciliation week (7 days) with `paid_at` in place of the bolt11. The response is every unpaid bill plus that week of paid ones, oldest anchor first:
+
+```json
+{
+  "bills": [
+    {
+      "txid": "3b1f0c…dd6e",
+      "fee_sats": 308,
+      "commitments": 5,
+      "confirmed_height": 955211,
+      "confirmed_at": 1753574400,
+      "amount_sats": 462,
+      "status": "unpaid",
+      "payment_hash": "9f86d0…a08",
+      "bolt11": "lnbc4620n1…",
+      "invoice_created_at": 1753660800
+    }
+  ],
+  "summary": { "unpaid_count": 1, "unpaid_sats": 462 }
+}
+```
+
+(`amount_sats` 462 = ceil(308 × 1.5) at `PRICE_MARKUP=1.5`.) The payer's whole loop is: poll, pay every `bolt11`, poll again and watch the bills flip to `paid`.
+
+### The 24-hour bookkeeping alarm
+
+`/health` carries a `billing` field: `off` | `ok` | `overdue` | `error`. `overdue` — an unpaid bill more than 24 hours (hardcoded) past its anchor's own `confirmed_at` — and `error` — receipts file present but unreadable — degrade to 503 like a wallet failure; `off` never degrades. The health check ingests receipts itself, so overdue is seen even if the payer never polls (it never mints — minting stays poll-only).
+
+The clock is the anchor's `confirmed_at`, not ingestion time. Enabling billing over a receipts file with old anchors therefore alarms **immediately** — intended, not a bug: those anchors are unbilled operational history, and the alarm is the machine declining to pretend otherwise. Either collect the bills or start from a fresh receipts path. And it is bookkeeping, not enforcement: sales are never gated by billing state — the machine reports the debt; collecting it is the operator's business.
+
+### Wiring the receipts file
+
+The fork writes, the gateway only reads. Two deployment shapes, two answers:
+
+**Compose (bundled otsd):** a dedicated shared volume, mounted read-write into otsd and read-only into the gateway — deliberately NOT the calendar volume: `/calendar` holds the hmac key, and the gateway container has no business mounting the directory that contains it. The wiring ships commented out in `docker-compose.yml` (a pull switches nothing on); uncomment the wiring lines and set the other three billing variables in `.env`:
+
+```yaml
+  gateway:
+    volumes:
+      - anchor_receipts:/anchor-receipts:ro
+    environment:
+      - ANCHOR_RECEIPTS_PATH=/anchor-receipts/anchor-receipts.jsonl
+  otsd:
+    volumes:
+      - anchor_receipts:/anchor-receipts
+    environment:
+      - OTSD_ANCHOR_RECEIPTS=/anchor-receipts/anchor-receipts.jsonl
+volumes:
+  anchor_receipts:
+```
+
+(`ANCHOR_RECEIPTS_PATH` lives in the compose file rather than `.env` because it names a container path fixed by the mount above.)
+
+**systemd + docker (the reference deployment):** no new mount. The otsd container already bind-mounts `/var/lib/otsd/calendar` at `/calendar` (`deploy/otsd.service.example`); point the receipts inside it, and the host-run gateway reads the host path directly:
+
+1. Add `OTSD_ANCHOR_RECEIPTS=/calendar/anchor-receipts.jsonl` to `/etc/systemd/system/otsd.env` — the same service-user-owned, mode-600 file that carries the RPC URL — and `systemctl restart otsd`.
+2. Set `ANCHOR_RECEIPTS_PATH=/var/lib/otsd/calendar/anchor-receipts.jsonl` (with the other three variables) in the gateway's `.env` and restart the gateway.
+
+On this path the receipts file does share a directory with the hmac key. Harmless here — the gateway is a host process opening one named file — but it is exactly why compose gets a dedicated volume instead of the calendar one: a volume mount exposes the whole directory, key included.
 
 ---
 

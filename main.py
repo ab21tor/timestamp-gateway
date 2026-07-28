@@ -71,6 +71,10 @@ class GatewayConfig:
     rate_limit_per_minute: int
     verify_rate_limit_per_minute: int
     gateway_behind_proxy: bool
+    anchor_billing_enabled: bool
+    price_markup: float | None
+    anchor_receipts_path: str | None
+    anchor_bills_token: str | None
 
 
 def _parse_config() -> GatewayConfig:
@@ -332,6 +336,56 @@ def _parse_config() -> GatewayConfig:
         )
     gateway_behind_proxy = behind_proxy_raw == "true"
 
+    # ── Anchor billing (part two of the pricing model) ───────────────────────
+    # Off by default: disabled means the three billing vars are never read and
+    # every behavior stays byte-identical. Strict bool like
+    # GATEWAY_BEHIND_PROXY — a typo silently treated as false would turn the
+    # billing ledger off without a word.
+    anchor_billing_raw = os.getenv("ANCHOR_BILLING_ENABLED", "false").lower()
+    if anchor_billing_raw not in ("true", "false"):
+        raise RuntimeError(
+            f"ANCHOR_BILLING_ENABLED must be 'true' or 'false', got {anchor_billing_raw!r}"
+        )
+    anchor_billing_enabled = anchor_billing_raw == "true"
+
+    price_markup: float | None = None
+    anchor_receipts_path: str | None = None
+    anchor_bills_token: str | None = None
+    if anchor_billing_enabled:
+        # All three are operator decisions with no sane default. Every missing
+        # one is named in a single error so the operator fixes them in one pass.
+        missing_billing = []
+        if not os.getenv("PRICE_MARKUP"):
+            missing_billing.append(
+                "PRICE_MARKUP — the ratio applied to each anchor's actual cost "
+                "(a float >= 1.0; 1.5 bills the standing payer 150% of the fee)"
+            )
+        if not os.getenv("ANCHOR_RECEIPTS_PATH"):
+            missing_billing.append(
+                "ANCHOR_RECEIPTS_PATH — the anchor-receipts JSONL file the "
+                "calendar fork writes (the path its OTSD_ANCHOR_RECEIPTS names)"
+            )
+        if not os.getenv("ANCHOR_BILLS_TOKEN"):
+            missing_billing.append(
+                "ANCHOR_BILLS_TOKEN — the bearer token guarding GET "
+                "/anchor-bills; operational history is not public"
+            )
+        if missing_billing:
+            raise RuntimeError(
+                "ANCHOR_BILLING_ENABLED=true requires: " + "; ".join(missing_billing)
+            )
+        try:
+            price_markup = float(os.getenv("PRICE_MARKUP"))
+        except ValueError:
+            raise RuntimeError("PRICE_MARKUP must be a number (e.g. 1.5)")
+        if not (math.isfinite(price_markup) and price_markup >= 1.0):
+            raise RuntimeError(
+                f"PRICE_MARKUP must be a finite number >= 1.0 — below 1.0 the "
+                f"shop sells anchors at a loss — got {price_markup}"
+            )
+        anchor_receipts_path = os.getenv("ANCHOR_RECEIPTS_PATH")
+        anchor_bills_token = os.getenv("ANCHOR_BILLS_TOKEN")
+
     return GatewayConfig(
         lnd_host=os.getenv("LND_HOST"),
         lnd_port=os.getenv("LND_PORT"),
@@ -363,6 +417,10 @@ def _parse_config() -> GatewayConfig:
         rate_limit_per_minute=rate_limit_per_minute,
         verify_rate_limit_per_minute=verify_rate_limit_per_minute,
         gateway_behind_proxy=gateway_behind_proxy,
+        anchor_billing_enabled=anchor_billing_enabled,
+        price_markup=price_markup,
+        anchor_receipts_path=anchor_receipts_path,
+        anchor_bills_token=anchor_bills_token,
     )
 
 
@@ -401,6 +459,10 @@ BACKUP_STATUS_MAX_AGE_SECONDS = _CONFIG.backup_status_max_age_seconds
 RATE_LIMIT_PER_MINUTE = _CONFIG.rate_limit_per_minute
 VERIFY_RATE_LIMIT_PER_MINUTE = _CONFIG.verify_rate_limit_per_minute
 GATEWAY_BEHIND_PROXY = _CONFIG.gateway_behind_proxy
+ANCHOR_BILLING_ENABLED = _CONFIG.anchor_billing_enabled
+PRICE_MARKUP = _CONFIG.price_markup
+ANCHOR_RECEIPTS_PATH = _CONFIG.anchor_receipts_path
+ANCHOR_BILLS_TOKEN = _CONFIG.anchor_bills_token
 
 if not LND_TLS_VERIFY:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -544,6 +606,28 @@ def init_obligation_db() -> None:
                 )
                 """
             )
+            # Gated on the flag, not created unconditionally: with billing
+            # disabled the gateway must stay byte-identical, including the
+            # bytes of a disabled operator's obligations.db.
+            if ANCHOR_BILLING_ENABLED:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS anchor_bills (
+                        txid               TEXT PRIMARY KEY,
+                        fee_sats           INTEGER NOT NULL,
+                        commitments        INTEGER NOT NULL,
+                        confirmed_height   INTEGER NOT NULL,
+                        confirmed_at       INTEGER NOT NULL,
+                        amount_sats        INTEGER NOT NULL,
+                        payment_hash       TEXT,
+                        bolt11             TEXT,
+                        invoice_created_at INTEGER,
+                        status             TEXT NOT NULL DEFAULT 'unpaid'
+                                           CHECK (status IN ('unpaid', 'paid')),
+                        paid_at            INTEGER
+                    )
+                    """
+                )
             conn.commit()
         finally:
             conn.close()
@@ -1455,6 +1539,145 @@ def verify_payment(payment_hash: str, digest: str, price_sats: int) -> bool:
     )
 
 
+# ── Anchor billing (part two of the pricing model) ────────────────────────────
+# The calendar fork records what each confirmed anchor actually cost in an
+# append-only JSONL receipts file (its OTSD_ANCHOR_RECEIPTS). With billing
+# enabled, the gateway ingests those receipts into the anchor_bills table and
+# bills the standing payer ceil(fee_sats × PRICE_MARKUP) per anchor. Invoices
+# are minted on poll of GET /anchor-bills, never at ingestion; settlement is
+# checked on the same poll through the existing payment backend. Billing state
+# gates nothing: sales, stamping, and redemption never consult this table.
+
+# A bill is overdue for /health once unpaid for 24h past its anchor's own
+# confirmed_at — a hardcoded bookkeeping alarm, not an enforcement clock.
+# Enabling billing over a receipts file with old anchors alarms immediately:
+# those anchors ARE unbilled operational history, so that is intended.
+_ANCHOR_BILL_OVERDUE_SECONDS = 24 * 3600
+# Paid bills stay in the /anchor-bills response for a reconciliation week.
+_ANCHOR_BILL_RECENTLY_PAID_SECONDS = 7 * 24 * 3600
+
+_ANCHOR_RECEIPT_FIELDS = (
+    ("txid", str),
+    ("fee_sats", int),
+    ("commitments", int),
+    ("confirmed_height", int),
+    ("confirmed_at", int),
+)
+
+
+def _ingest_anchor_receipts() -> None:
+    """Ingest the fork's anchor receipts into anchor_bills.
+
+    INSERT OR IGNORE keyed on txid does double duty: the fork's crash
+    semantics prefer a duplicate receipt line over a missed one (its
+    duplicates dedupe here, for free), and amount_sats is computed exactly
+    once — the bill's mint-time amount, immutable across later markup
+    changes, the same law as the quote.
+
+    An absent file is healthy (billing on, no anchors yet). A malformed line
+    is skipped with a warning and never blocks the rest. Raises only for an
+    unreadable-but-present file or a failing DB — the caller classifies that
+    as billing "error"."""
+    try:
+        with open(ANCHOR_RECEIPTS_PATH, "r") as fd:
+            lines = fd.readlines()
+    except FileNotFoundError:
+        return
+
+    conn = _obligation_connect()
+    try:
+        for lineno, line in enumerate(lines, 1):
+            if not line.strip():
+                continue
+            try:
+                receipt = json.loads(line)
+                if not isinstance(receipt, dict):
+                    raise ValueError("not a JSON object")
+                for field, ftype in _ANCHOR_RECEIPT_FIELDS:
+                    if not isinstance(receipt[field], ftype) or isinstance(
+                        receipt[field], bool
+                    ):
+                        raise ValueError(f"bad {field}")
+            except (ValueError, KeyError) as exp:
+                logging.warning(
+                    "Anchor receipt line %d skipped (malformed): %r", lineno, exp
+                )
+                continue
+            conn.execute(
+                "INSERT OR IGNORE INTO anchor_bills "
+                "(txid, fee_sats, commitments, confirmed_height, confirmed_at, "
+                "amount_sats, status) VALUES (?, ?, ?, ?, ?, ?, 'unpaid')",
+                (
+                    receipt["txid"],
+                    receipt["fee_sats"],
+                    receipt["commitments"],
+                    receipt["confirmed_height"],
+                    receipt["confirmed_at"],
+                    math.ceil(receipt["fee_sats"] * PRICE_MARKUP),
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _store_anchor_bill_invoice(
+    txid: str, payment_hash: str, bolt11: str, created_at: int
+) -> None:
+    conn = _obligation_connect()
+    try:
+        conn.execute(
+            "UPDATE anchor_bills SET payment_hash=?, bolt11=?, "
+            "invoice_created_at=? WHERE txid=?",
+            (payment_hash, bolt11, created_at, txid),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _mark_anchor_bill_paid(txid: str, paid_at: int) -> None:
+    conn = _obligation_connect()
+    try:
+        conn.execute(
+            "UPDATE anchor_bills SET status='paid', paid_at=? WHERE txid=?",
+            (paid_at, txid),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _billing_status() -> str:
+    """Classify anchor billing for /health. Returns one of:
+      off     — ANCHOR_BILLING_ENABLED=false; reported, never degrades
+      ok      — receipts ingestable, no unpaid bill older than 24h
+      overdue — an unpaid bill has sat >24h past its anchor's confirmed_at
+                (bookkeeping alarm; sales are never gated by billing state)
+      error   — the receipts file is present but unreadable, or the bills
+                table cannot be read, with billing on
+    Ingests receipts itself so overdue is seen even if the payer never
+    polls, but never mints invoices — minting is poll-only.
+    Never raises — /health must never crash."""
+    if not ANCHOR_BILLING_ENABLED:
+        return "off"
+    try:
+        _ingest_anchor_receipts()
+        conn = _obligation_connect()
+        try:
+            overdue = conn.execute(
+                "SELECT COUNT(*) FROM anchor_bills "
+                "WHERE status='unpaid' AND confirmed_at < ?",
+                (int(time.time()) - _ANCHOR_BILL_OVERDUE_SECONDS,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+    except Exception:
+        logging.warning("Health check: anchor billing unreadable", exc_info=True)
+        return "error"
+    return "overdue" if overdue else "ok"
+
+
 @app.get("/")
 def root():
     return {"status": "running"}
@@ -1522,6 +1745,11 @@ def health():
     # failure.
     backup_status = _backup_status()
 
+    # Anchor billing: "off" when disabled (reported, never degrades);
+    # overdue/error degrade like the wallet field. Bookkeeping only — no
+    # sales path consults billing state.
+    billing_status = _billing_status()
+
     if paused:
         overall = "paused"
     elif float_state == "stop":
@@ -1535,6 +1763,7 @@ def health():
             and proofs_status in ("ok", "absent")
             and backup_status in ("ok", "local_only", "absent")
             and float_state in ("ok", "inactive")
+            and billing_status in ("off", "ok")
             else "degraded"
         )
 
@@ -1550,7 +1779,113 @@ def health():
             "float": float_state,
             "proofs": proofs_status,
             "backup": backup_status,
+            "billing": billing_status,
         },
+    )
+
+
+@app.get("/anchor-bills")
+def anchor_bills(request: Request):
+    """The standing payer's bills ledger. Poll-driven: minting and settlement
+    checks happen here, never at ingestion — a bill lacking a live invoice
+    (none yet, or expired) gets a fresh bolt11 on each poll that needs one,
+    and a paid bill never re-mints. Plain bolt11s: anchor bills are NOT L402;
+    the macaroon machinery and verify_payment are not involved."""
+    # Absent unless billing is enabled: same 404 as an unregistered route.
+    if not ANCHOR_BILLING_ENABLED:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    # Same budget as the other non-sales endpoints (/verify, /upgrade): polls
+    # cost gateway CPU and phoenixd round-trips. Limiting before the token
+    # compare also throttles guessing.
+    retry_after = _verify_rate_limit_retry_after(_client_ip(request))
+    if retry_after is not None:
+        raise HTTPException(
+            status_code=429,
+            headers={"Retry-After": str(retry_after)},
+            detail={"status": "rate_limited", "retry_after_seconds": retry_after},
+        )
+
+    # Operational history is not public: bearer token, constant-time compare.
+    auth = request.headers.get("Authorization", "")
+    provided = auth[len("Bearer "):] if auth.startswith("Bearer ") else ""
+    if not provided or not secrets.compare_digest(
+        provided.encode(), ANCHOR_BILLS_TOKEN.encode()
+    ):
+        raise HTTPException(status_code=401, detail="Invalid or missing bearer token")
+
+    _ingest_anchor_receipts()
+
+    now = int(time.time())
+    # Read everything first and close — never hold a connection across the
+    # phoenixd round-trips below (the sweeper's short-transaction pattern).
+    conn = _obligation_connect()
+    try:
+        rows = conn.execute(
+            "SELECT txid, fee_sats, commitments, confirmed_height, confirmed_at, "
+            "amount_sats, payment_hash, bolt11, invoice_created_at, status, paid_at "
+            "FROM anchor_bills WHERE status='unpaid' OR paid_at >= ? "
+            "ORDER BY confirmed_at",
+            (now - _ANCHOR_BILL_RECENTLY_PAID_SECONDS,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    bills = []
+    unpaid_count = 0
+    unpaid_sats = 0
+    for (
+        txid, fee_sats, commitments, confirmed_height, confirmed_at,
+        amount_sats, payment_hash, bolt11, invoice_created_at, status, paid_at,
+    ) in rows:
+        bill = {
+            "txid": txid,
+            "fee_sats": fee_sats,
+            "commitments": commitments,
+            "confirmed_height": confirmed_height,
+            "confirmed_at": confirmed_at,
+            "amount_sats": amount_sats,
+            "status": status,
+        }
+        if status == "paid":
+            # Recently paid: reported for reconciliation, bolt11 dropped.
+            bill["payment_hash"] = payment_hash
+            bill["paid_at"] = paid_at
+            bills.append(bill)
+            continue
+
+        needs_mint = payment_hash is None
+        if payment_hash is not None:
+            invoice_status = PAYMENT_BACKEND.lookup_invoice(payment_hash)
+            if invoice_status.settled:
+                _mark_anchor_bill_paid(txid, now)
+                bill["status"] = "paid"
+                bill["payment_hash"] = payment_hash
+                bill["paid_at"] = now
+                bills.append(bill)
+                continue
+            # expired is None when the backend has no expiry signal: treat
+            # the invoice as live rather than re-mint on every poll.
+            needs_mint = invoice_status.expired is True
+        if needs_mint:
+            # A backend failure propagates as the existing 502: the poll is
+            # retryable and nothing is lost.
+            bolt11, payment_hash = create_invoice(f"anchor-bill {txid}", amount_sats)
+            invoice_created_at = now
+            _store_anchor_bill_invoice(txid, payment_hash, bolt11, invoice_created_at)
+
+        bill["payment_hash"] = payment_hash
+        bill["bolt11"] = bolt11
+        bill["invoice_created_at"] = invoice_created_at
+        bills.append(bill)
+        unpaid_count += 1
+        unpaid_sats += amount_sats
+
+    return JSONResponse(
+        content={
+            "bills": bills,
+            "summary": {"unpaid_count": unpaid_count, "unpaid_sats": unpaid_sats},
+        }
     )
 
 

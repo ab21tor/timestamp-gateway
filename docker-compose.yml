@@ -52,6 +52,16 @@ services:
     # the status files the timers write are the ones /health reads.
     volumes:
       - ${GATEWAY_STATE_DIR:-gateway_data}:/var/lib/timestamp-gateway
+      # Anchor billing (operator guide, "Anchor billing"): the receipts
+      # file the calendar fork writes, read-only — a dedicated volume,
+      # deliberately NOT otsd_calendar, which holds the hmac key.
+      # Uncomment here, in otsd, and under top-level volumes; nothing
+      # switches on while these stay commented (and ANCHOR_BILLING_ENABLED
+      # stays false in .env).
+      # - anchor_receipts:/anchor-receipts:ro
+    # environment:
+    #   # Container path fixed by the mount above — pinned here, not .env.
+    #   - ANCHOR_RECEIPTS_PATH=/anchor-receipts/anchor-receipts.jsonl
     # Loopback-only publish: reachable from this host (curl, ops scripts,
     # the health monitor) but not from the network — Tor is the public
     # front door. For clearnet exposure change to "8000:8000" and see
@@ -114,12 +124,18 @@ services:
       - ${OTSD_CALENDAR_DIR:-otsd_calendar}:/calendar
       # Calendar code: the fork checkout (see above).
       - ${OTSD_FORK_PATH:-../opentimestamps-server}:/app
+      # Anchor billing: the receipts volume, writable — the fork writes,
+      # the gateway reads (see the gateway service above).
+      # - anchor_receipts:/anchor-receipts
     environment:
       # Full RPC URL including credentials. Set in gitignored .env ONLY.
       # Unset -> otsd exits at startup with a clear error. Runtime
       # fail-loud, deliberately not ${VAR:?}: parse-time errors here would
       # break every compose command for operators not using this profile.
       - BITCOIN_RPC_SERVICE_URL=${BITCOIN_RPC_SERVICE_URL:-}
+      # Anchor billing: where the fork writes its receipts JSONL —
+      # uncomment with the wiring above.
+      # - OTSD_ANCHOR_RECEIPTS=/anchor-receipts/anchor-receipts.jsonl
 
   # ── socat bridge to an onion Bitcoin node ── --profile onion-rpc ──
   # For operators whose Bitcoin node exposes RPC as a Tor onion service
@@ -148,3 +164,5 @@ volumes:
   tor_keys:
   gateway_data:
   otsd_calendar:
+  # Anchor billing receipts (uncomment with the gateway and otsd wiring):
+  # anchor_receipts:

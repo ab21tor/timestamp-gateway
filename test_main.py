@@ -979,6 +979,7 @@ def test_health_both_ok_returns_200():
         "float": "inactive",
         "proofs": "absent",
         "backup": "absent",
+        "billing": "off",
     }
 
 
@@ -1036,6 +1037,7 @@ def test_health_otsd_na_in_public_mode():
         "float": "inactive",
         "proofs": "absent",
         "backup": "absent",
+        "billing": "off",
     }
 
 
@@ -2484,3 +2486,431 @@ def test_rate_limit_zero_disables(monkeypatch):
                  for _ in range(15)]
     assert codes == [402] * 15
     assert main._rate_buckets == {}  # disabled limiter keeps no state
+
+
+# ══ 17. Anchor billing ════════════════════════════════════════════════════════
+# Part two of the pricing model: the calendar fork writes anchor receipts;
+# the gateway ingests them into anchor_bills and bills the standing payer
+# ceil(fee_sats × PRICE_MARKUP) per anchor via plain bolt11s (NOT L402).
+# The floor: billing stays out of the suite's base env — every billing-on
+# test builds its own state through the anchor_billing fixture.
+
+ANCHOR_TXID = "ab" * 32
+OTHER_TXID = "cd" * 32
+BILLS_TOKEN = "test-bills-token-1234"
+HASH_A = "aa" * 32
+HASH_B = "bb" * 32
+
+
+def receipt_line(txid=ANCHOR_TXID, fee_sats=153, commitments=5,
+                 confirmed_height=850000, confirmed_at=None, **overrides):
+    """One fork-format receipt line; overrides let a test malform any field."""
+    if confirmed_at is None:
+        confirmed_at = int(time.time())
+    receipt = {
+        "txid": txid, "fee_sats": fee_sats, "commitments": commitments,
+        "confirmed_height": confirmed_height, "confirmed_at": confirmed_at,
+    }
+    receipt.update(overrides)
+    return json.dumps(receipt) + "\n"
+
+
+@pytest.fixture
+def anchor_billing(tmp_path, monkeypatch, obligations_db):
+    """Enable anchor billing for one test: markup 1.5, a per-test receipts
+    path (no file until the test writes one), a known bearer token, and the
+    anchor_bills table in the per-test obligations DB. Depends on
+    obligations_db so the DB path is already repointed when init runs."""
+    receipts = tmp_path / "anchor-receipts.jsonl"
+    monkeypatch.setattr(main, "ANCHOR_BILLING_ENABLED", True)
+    monkeypatch.setattr(main, "PRICE_MARKUP", 1.5)
+    monkeypatch.setattr(main, "ANCHOR_RECEIPTS_PATH", str(receipts))
+    monkeypatch.setattr(main, "ANCHOR_BILLS_TOKEN", BILLS_TOKEN)
+    main.init_obligation_db()
+    return receipts
+
+
+def _bills_backend(payment_hash=HASH_A, settled=False, expired=False):
+    """A PAYMENT_BACKEND stand-in for billing tests. lookup/create behavior is
+    mutated mid-test to walk an invoice through live -> expired -> settled."""
+    backend = MagicMock()
+    backend.health.return_value = True
+    backend.create_invoice.return_value = main.Invoice(
+        bolt11=FAKE_INVOICE, payment_hash=payment_hash)
+    backend.lookup_invoice.return_value = main.InvoiceStatus(
+        settled=settled, amount_requested_sat=230, amount_received_sat=0,
+        memo=f"anchor-bill {ANCHOR_TXID}", expired=expired)
+    return backend
+
+
+def bills_get(token=BILLS_TOKEN):
+    headers = {} if token is None else {"Authorization": f"Bearer {token}"}
+    return client.get("/anchor-bills", headers=headers)
+
+
+def _bill_row(txid=ANCHOR_TXID):
+    import sqlite3
+    conn = sqlite3.connect(main.OBLIGATIONS_DB_PATH)
+    try:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM anchor_bills WHERE txid=?", (txid,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def _bill_count():
+    import sqlite3
+    conn = sqlite3.connect(main.OBLIGATIONS_DB_PATH)
+    try:
+        return conn.execute("SELECT COUNT(*) FROM anchor_bills").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _set_bill(txid, **cols):
+    import sqlite3
+    conn = sqlite3.connect(main.OBLIGATIONS_DB_PATH)
+    try:
+        sets = ", ".join(f"{k}=?" for k in cols)
+        conn.execute(f"UPDATE anchor_bills SET {sets} WHERE txid=?",
+                     (*cols.values(), txid))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ── Config validation ────────────────────────────────────────────────────────
+
+def test_billing_disabled_by_default():
+    cfg = main._parse_config()
+    assert cfg.anchor_billing_enabled is False
+    assert cfg.price_markup is None
+    assert cfg.anchor_receipts_path is None
+    assert cfg.anchor_bills_token is None
+
+
+def test_billing_enabled_requires_all_three_named():
+    with patch.dict(os.environ, {"ANCHOR_BILLING_ENABLED": "true"}):
+        with pytest.raises(RuntimeError) as e:
+            main._parse_config()
+    msg = str(e.value)
+    assert "PRICE_MARKUP" in msg
+    assert "ANCHOR_RECEIPTS_PATH" in msg
+    assert "ANCHOR_BILLS_TOKEN" in msg
+
+
+def test_billing_enabled_names_only_the_missing():
+    with patch.dict(os.environ, {"ANCHOR_BILLING_ENABLED": "true",
+                                 "PRICE_MARKUP": "1.5"}):
+        with pytest.raises(RuntimeError) as e:
+            main._parse_config()
+    msg = str(e.value)
+    assert "PRICE_MARKUP" not in msg
+    assert "ANCHOR_RECEIPTS_PATH" in msg
+    assert "ANCHOR_BILLS_TOKEN" in msg
+
+
+def test_billing_markup_below_one_fails():
+    with patch.dict(os.environ, {"ANCHOR_BILLING_ENABLED": "true",
+                                 "PRICE_MARKUP": "0.9",
+                                 "ANCHOR_RECEIPTS_PATH": "/tmp/r.jsonl",
+                                 "ANCHOR_BILLS_TOKEN": "t"}):
+        with pytest.raises(RuntimeError, match=">= 1.0"):
+            main._parse_config()
+
+
+def test_billing_markup_non_numeric_fails():
+    with patch.dict(os.environ, {"ANCHOR_BILLING_ENABLED": "true",
+                                 "PRICE_MARKUP": "half again",
+                                 "ANCHOR_RECEIPTS_PATH": "/tmp/r.jsonl",
+                                 "ANCHOR_BILLS_TOKEN": "t"}):
+        with pytest.raises(RuntimeError, match="PRICE_MARKUP must be a number"):
+            main._parse_config()
+
+
+def test_billing_enabled_flag_strict_bool():
+    with patch.dict(os.environ, {"ANCHOR_BILLING_ENABLED": "yes"}):
+        with pytest.raises(RuntimeError, match="ANCHOR_BILLING_ENABLED"):
+            main._parse_config()
+
+
+def test_billing_disabled_ignores_the_three_silently():
+    # Garbage in all three with the feature off: parse succeeds, nothing read.
+    with patch.dict(os.environ, {"ANCHOR_BILLING_ENABLED": "false",
+                                 "PRICE_MARKUP": "not a number",
+                                 "ANCHOR_RECEIPTS_PATH": "",
+                                 "ANCHOR_BILLS_TOKEN": ""}):
+        cfg = main._parse_config()
+    assert cfg.anchor_billing_enabled is False
+    assert cfg.price_markup is None
+    assert cfg.anchor_receipts_path is None
+    assert cfg.anchor_bills_token is None
+
+
+def test_billing_enabled_valid_config():
+    with patch.dict(os.environ, {"ANCHOR_BILLING_ENABLED": "true",
+                                 "PRICE_MARKUP": "1.5",
+                                 "ANCHOR_RECEIPTS_PATH": "/var/lib/x/r.jsonl",
+                                 "ANCHOR_BILLS_TOKEN": "secret-token"}):
+        cfg = main._parse_config()
+    assert cfg.anchor_billing_enabled is True
+    assert cfg.price_markup == 1.5
+    assert cfg.anchor_receipts_path == "/var/lib/x/r.jsonl"
+    assert cfg.anchor_bills_token == "secret-token"
+
+
+# ── Receipts reader ──────────────────────────────────────────────────────────
+
+def test_receipts_duplicate_txid_lines_dedupe(anchor_billing):
+    # The fork's crash semantics allow duplicate lines; INSERT OR IGNORE on
+    # txid dedupes them, keeping the first.
+    anchor_billing.write_text(
+        receipt_line() + receipt_line() + receipt_line(fee_sats=999))
+    main._ingest_anchor_receipts()
+    assert _bill_count() == 1
+    assert _bill_row()["fee_sats"] == 153
+
+
+def test_receipts_malformed_line_skipped_with_warning(anchor_billing, caplog):
+    anchor_billing.write_text(
+        receipt_line() + "not json at all\n" + receipt_line(txid=OTHER_TXID))
+    with caplog.at_level(logging.WARNING):
+        main._ingest_anchor_receipts()
+    assert _bill_count() == 2
+    assert any("line 2" in r.getMessage() and "skipped" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_receipts_wrong_typed_field_skipped(anchor_billing, caplog):
+    # fee_sats as a string and as a bool are both malformed (the format is
+    # pinned: JSON integer); neither may ingest.
+    anchor_billing.write_text(
+        receipt_line(fee_sats="153") + receipt_line(txid=OTHER_TXID, fee_sats=True))
+    with caplog.at_level(logging.WARNING):
+        main._ingest_anchor_receipts()
+    assert _bill_count() == 0
+    assert len([r for r in caplog.records if "skipped" in r.message]) == 2
+
+
+def test_receipts_absent_file_is_healthy_zero_rows(anchor_billing):
+    main._ingest_anchor_receipts()  # must not raise
+    assert _bill_count() == 0
+
+
+# ── Billing math ─────────────────────────────────────────────────────────────
+
+def test_amount_sats_ceils_fractional_product(anchor_billing):
+    anchor_billing.write_text(receipt_line(fee_sats=153))  # 153 × 1.5 = 229.5
+    main._ingest_anchor_receipts()
+    assert _bill_row()["amount_sats"] == 230
+
+
+def test_amount_sats_immutable_across_markup_change(anchor_billing, monkeypatch):
+    anchor_billing.write_text(receipt_line(fee_sats=153))
+    main._ingest_anchor_receipts()
+    assert _bill_row()["amount_sats"] == 230
+    # The bill's mint-time amount is law, like the quote: a repriced markup
+    # must never touch an already-ingested bill.
+    monkeypatch.setattr(main, "PRICE_MARKUP", 3.0)
+    main._ingest_anchor_receipts()
+    assert _bill_row()["amount_sats"] == 230
+
+
+# ── GET /anchor-bills ────────────────────────────────────────────────────────
+
+def test_anchor_bills_404_when_disabled():
+    resp = bills_get()
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "Not Found"
+
+
+def test_anchor_bills_401_missing_token(anchor_billing):
+    assert bills_get(token=None).status_code == 401
+
+
+def test_anchor_bills_401_wrong_token(anchor_billing):
+    assert bills_get(token="wrong-token").status_code == 401
+
+
+def test_anchor_bills_200_unpaid_with_bolt11(anchor_billing):
+    anchor_billing.write_text(receipt_line())
+    backend = _bills_backend()
+    with patch("main.PAYMENT_BACKEND", backend):
+        resp = bills_get()
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["bills"]) == 1
+    bill = body["bills"][0]
+    assert bill["txid"] == ANCHOR_TXID
+    assert bill["fee_sats"] == 153
+    assert bill["commitments"] == 5
+    assert bill["confirmed_height"] == 850000
+    assert bill["amount_sats"] == 230
+    assert bill["status"] == "unpaid"
+    assert bill["bolt11"] == FAKE_INVOICE
+    assert bill["payment_hash"] == HASH_A
+    assert body["summary"] == {"unpaid_count": 1, "unpaid_sats": 230}
+    backend.create_invoice.assert_called_once_with(
+        f"anchor-bill {ANCHOR_TXID}", 230)
+
+
+def test_anchor_bills_poll_idempotent_live_invoice_no_remint(anchor_billing):
+    anchor_billing.write_text(receipt_line())
+    backend = _bills_backend()
+    with patch("main.PAYMENT_BACKEND", backend):
+        first = bills_get().json()["bills"][0]
+        second = bills_get().json()["bills"][0]
+    # Mint on the first poll only; the live (unsettled, unexpired) invoice
+    # is re-served, not replaced.
+    assert backend.create_invoice.call_count == 1
+    assert first["payment_hash"] == second["payment_hash"] == HASH_A
+
+
+def test_anchor_bills_expired_invoice_remints_new_hash(anchor_billing):
+    anchor_billing.write_text(receipt_line())
+    backend = _bills_backend(payment_hash=HASH_A)
+    with patch("main.PAYMENT_BACKEND", backend):
+        assert bills_get().json()["bills"][0]["payment_hash"] == HASH_A
+        backend.lookup_invoice.return_value = main.InvoiceStatus(
+            settled=False, amount_requested_sat=230, amount_received_sat=0,
+            memo=f"anchor-bill {ANCHOR_TXID}", expired=True)
+        backend.create_invoice.return_value = main.Invoice(
+            bolt11="lnbc-fresh", payment_hash=HASH_B)
+        bill = bills_get().json()["bills"][0]
+    assert bill["payment_hash"] == HASH_B
+    assert bill["bolt11"] == "lnbc-fresh"
+    assert backend.create_invoice.call_count == 2
+    assert _bill_row()["payment_hash"] == HASH_B
+
+
+def test_anchor_bills_expired_none_treated_as_live(anchor_billing):
+    # A backend with no expiry signal (LND shape) must not re-mint each poll.
+    anchor_billing.write_text(receipt_line())
+    backend = _bills_backend()
+    with patch("main.PAYMENT_BACKEND", backend):
+        bills_get()
+        backend.lookup_invoice.return_value = main.InvoiceStatus(
+            settled=False, amount_requested_sat=230, amount_received_sat=0,
+            memo=f"anchor-bill {ANCHOR_TXID}", expired=None)
+        bills_get()
+    assert backend.create_invoice.call_count == 1
+
+
+def test_anchor_bills_settled_marks_paid_drops_bolt11_stops_reminting(anchor_billing):
+    anchor_billing.write_text(receipt_line())
+    backend = _bills_backend()
+    with patch("main.PAYMENT_BACKEND", backend):
+        bills_get()  # mints
+        backend.lookup_invoice.return_value = main.InvoiceStatus(
+            settled=True, amount_requested_sat=230, amount_received_sat=230,
+            memo=f"anchor-bill {ANCHOR_TXID}", expired=False)
+        body = bills_get().json()
+        bill = body["bills"][0]
+        assert bill["status"] == "paid"
+        assert bill["payment_hash"] == HASH_A
+        assert bill["paid_at"] is not None
+        assert "bolt11" not in bill
+        assert body["summary"] == {"unpaid_count": 0, "unpaid_sats": 0}
+        paid_at = bill["paid_at"]
+        # A paid bill is terminal: later polls neither look it up nor re-mint.
+        backend.lookup_invoice.reset_mock()
+        backend.create_invoice.reset_mock()
+        third = bills_get().json()["bills"][0]
+    backend.lookup_invoice.assert_not_called()
+    backend.create_invoice.assert_not_called()
+    assert third["status"] == "paid"
+    assert third["paid_at"] == paid_at
+    assert _bill_row()["status"] == "paid"
+
+
+def test_anchor_bills_paid_older_than_week_not_listed(anchor_billing):
+    anchor_billing.write_text(receipt_line())
+    main._ingest_anchor_receipts()
+    _set_bill(ANCHOR_TXID, status="paid",
+              paid_at=int(time.time()) - 8 * 24 * 3600)
+    backend = _bills_backend()
+    with patch("main.PAYMENT_BACKEND", backend):
+        body = bills_get().json()
+    assert body["bills"] == []
+    assert body["summary"] == {"unpaid_count": 0, "unpaid_sats": 0}
+
+
+def test_anchor_bills_absent_receipts_file_zero_bills(anchor_billing):
+    backend = _bills_backend()
+    with patch("main.PAYMENT_BACKEND", backend):
+        resp = bills_get()
+    assert resp.status_code == 200
+    assert resp.json() == {"bills": [],
+                           "summary": {"unpaid_count": 0, "unpaid_sats": 0}}
+
+
+def test_anchor_bills_rate_limited_by_verify_bucket(anchor_billing, monkeypatch):
+    monkeypatch.setattr(main, "VERIFY_RATE_LIMIT_PER_MINUTE", 1)
+    backend = _bills_backend()
+    with patch("main.PAYMENT_BACKEND", backend):
+        first = bills_get()
+        second = bills_get()
+    assert first.status_code == 200
+    assert second.status_code == 429
+    assert "Retry-After" in second.headers
+
+
+# ── /health billing field ────────────────────────────────────────────────────
+
+def _health_with_billing(backend):
+    """GET /health with the payment backend stubbed healthy and otsd healthy;
+    the billing field is then determined by billing state alone."""
+    with patch("main.PAYMENT_BACKEND", backend):
+        with patch("main.requests.get", return_value=_ok_otsd()):
+            return client.get("/health")
+
+
+def test_health_billing_ok_fresh_unpaid_bill(anchor_billing):
+    anchor_billing.write_text(receipt_line())  # confirmed_at = now: not overdue
+    resp = _health_with_billing(_bills_backend())
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["billing"] == "ok"
+    assert body["status"] == "ok"
+
+
+def test_health_billing_overdue_degrades(anchor_billing):
+    anchor_billing.write_text(
+        receipt_line(confirmed_at=int(time.time()) - 25 * 3600))
+    resp = _health_with_billing(_bills_backend())
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["billing"] == "overdue"
+    assert body["status"] == "degraded"
+
+
+def test_health_billing_old_paid_bill_not_overdue(anchor_billing):
+    anchor_billing.write_text(
+        receipt_line(confirmed_at=int(time.time()) - 25 * 3600))
+    main._ingest_anchor_receipts()
+    _set_bill(ANCHOR_TXID, status="paid", paid_at=int(time.time()))
+    resp = _health_with_billing(_bills_backend())
+    assert resp.json()["billing"] == "ok"
+
+
+def test_health_billing_unreadable_receipts_error_degrades(anchor_billing):
+    # Present but unreadable (a directory, not a file) — distinct from
+    # absent, which is healthy.
+    anchor_billing.mkdir()
+    resp = _health_with_billing(_bills_backend())
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["billing"] == "error"
+    assert body["status"] == "degraded"
+
+
+def test_health_billing_never_mints(anchor_billing):
+    # /health ingests (overdue must surface without polls) but minting is
+    # poll-only: an unpaid bill with no invoice stays invoice-less.
+    anchor_billing.write_text(receipt_line())
+    backend = _bills_backend()
+    _health_with_billing(backend)
+    backend.create_invoice.assert_not_called()
+    assert _bill_row()["payment_hash"] is None
