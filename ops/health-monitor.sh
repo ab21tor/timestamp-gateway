@@ -38,8 +38,10 @@ esac
 NOW="$(date +%s)"
 
 # Poll /health. No -f: a 503 body is data (the degraded details), not a
-# transport error. An unreachable gateway is itself the alarm.
-BODY="$(curl -sS --max-time 10 "$HEALTH_URL" 2>/dev/null)"
+# transport error. An unreachable gateway is itself the alarm. 60s budget:
+# /health's otsd probe can honestly take ~50s through a Tor stall, and a
+# shorter timeout misreads honest-slow as UNREACHABLE.
+BODY="$(curl -sS --max-time 60 "$HEALTH_URL" 2>/dev/null)"
 CURL_EXIT=$?
 
 if [ "$CURL_EXIT" -ne 0 ] || [ -z "$BODY" ]; then
@@ -50,7 +52,7 @@ else
 import json, sys
 try:
     d = json.load(sys.stdin)
-    print(" ".join("%s=%s" % (k, d.get(k)) for k in ("status", "paused", "payment", "otsd", "wallet", "proofs", "backup")))
+    print(" ".join("%s=%s" % (k, d.get(k)) for k in ("status", "paused", "payment", "otsd", "wallet", "float", "proofs", "backup", "billing")))
 except Exception:
     print("unparseable")
 ')"
