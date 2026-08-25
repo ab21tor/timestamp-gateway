@@ -39,8 +39,8 @@ NOW="$(date +%s)"
 
 # Poll /health. No -f: a 503 body is data (the degraded details), not a
 # transport error. An unreachable gateway is itself the alarm. 60s budget:
-# /health's otsd probe can honestly take ~50s through a Tor stall, and a
-# shorter timeout misreads honest-slow as UNREACHABLE.
+# /health's otsd probe can take ~50s through a Tor stall, and a shorter
+# timeout misreads slow as UNREACHABLE.
 BODY="$(curl -sS --max-time 60 "$HEALTH_URL" 2>/dev/null)"
 CURL_EXIT=$?
 
@@ -61,6 +61,62 @@ fi
 
 STATUS="${FP#status=}"
 STATUS="${STATUS%% *}"
+
+# Anchor stall alarm
+# A wedged stamper with healthy Bitcoin RPC fails no /health field: otsd
+# renders its homepage fine while commitments sit pending and no anchor
+# transaction ever appears. Probe otsd's homepage JSON from inside the
+# compose network (otsd is unpublished on the host) and alarm when
+# pending_commitments > 0 with most_recent_tx None for longer than
+# ANCHOR_STALL_SECONDS — default 43200 = 2 x otsd's default
+# min_tx_interval (21600), the longest a legitimate jittered departure can
+# wait. The sidecar state file holds the first-seen time of the current
+# stall; it is cleared when the condition clears and left untouched when
+# the probe itself fails (compose down, non-compose deployment), so a
+# flapping probe can never reset the clock. The alarm prepends a STABLE
+# marker to the fingerprint (duration goes in the message only), so the
+# existing debounce, re-alert, and recovery machinery handles delivery.
+ANCHOR_STALL_SECONDS="${ANCHOR_STALL_SECONDS:-43200}"
+case "$ANCHOR_STALL_SECONDS" in
+  ''|*[!0-9]*) echo "ANCHOR_STALL_SECONDS must be a non-negative integer" >&2; exit 1 ;;
+esac
+STALL_STATE_FILE="${STATE_FILE}.stall"
+
+# Prints "<pending> <most_recent_tx>" (pending de-comma'd), or nothing on
+# probe failure.
+anchor_probe() {
+  docker compose --project-directory "$REPO" exec -T otsd python -c '
+import json, urllib.request
+req = urllib.request.Request("http://127.0.0.1:14788/",
+                             headers={"Accept": "application/json"})
+d = json.load(urllib.request.urlopen(req, timeout=10))
+print(int(str(d["pending_commitments"]).replace(",", "")), d["most_recent_tx"])
+' 2>/dev/null
+}
+
+PROBE_OUT="$(anchor_probe)" || PROBE_OUT=""
+if [ -n "$PROBE_OUT" ]; then
+  PENDING="${PROBE_OUT%% *}"
+  RECENT_TX="${PROBE_OUT#* }"
+  case "$PENDING" in ''|*[!0-9]*) PENDING="" ;; esac
+  if [ -n "$PENDING" ]; then
+    if [ "$PENDING" -gt 0 ] && [ "$RECENT_TX" = "None" ]; then
+      FIRST_SEEN=""
+      [ -f "$STALL_STATE_FILE" ] && FIRST_SEEN="$(sed -n 1p "$STALL_STATE_FILE")"
+      case "$FIRST_SEEN" in
+        ''|*[!0-9]*) FIRST_SEEN="$NOW"; printf '%s\n' "$NOW" > "$STALL_STATE_FILE" ;;
+      esac
+      STALLED_FOR=$((NOW - FIRST_SEEN))
+      if [ "$STALLED_FOR" -gt "$ANCHOR_STALL_SECONDS" ]; then
+        FP="anchor_stall=yes $FP"
+        MSG="timestamp-gateway ANCHOR STALL: $PENDING commitments pending, no unconfirmed anchor tx for ${STALLED_FOR}s (threshold ${ANCHOR_STALL_SECONDS}s); $MSG"
+        [ "$STATUS" = "ok" ] && STATUS="stalled"
+      fi
+    else
+      rm -f "$STALL_STATE_FILE"
+    fi
+  fi
+fi
 
 LAST_FP=""
 LAST_TS=0

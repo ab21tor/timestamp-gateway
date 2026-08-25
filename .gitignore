@@ -68,3 +68,6 @@ calendar/
 calendars/
 bitcoin/
 lnd/
+
+# Pre-edit copies left beside edited files
+*.bak-*

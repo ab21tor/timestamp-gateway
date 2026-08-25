@@ -31,7 +31,9 @@ EXPOSE 14788
 # (otsd's default) — safe under any networking; docker-compose overrides
 # with --rpc-address 0.0.0.0 for its internal bridge network.
 # --btc-max-fee takes BTC: 0.0002 BTC = 20,000 sats. Never "fix" it to 20000.
-# No -v: INFO is the production log level in every launch path (ruled
-# 2026-07-22) — DEBUG ships commitment hexes and wallet outpoints into
-# container logs.
+# No -v: INFO is the production log level in every launch path — DEBUG
+# ships commitment hexes and wallet outpoints into container logs.
+# otsd's clean-exit path hangs off KeyboardInterrupt: SIGINT, not the
+# docker-default SIGTERM, is what actually runs it.
+STOPSIGNAL SIGINT
 CMD ["python", "/app/otsd", "--calendar", "/calendar", "--btc-conf-target", "12", "--btc-max-fee", "0.0002"]

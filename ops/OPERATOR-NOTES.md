@@ -2,30 +2,24 @@
 
 ## Live services
 
-Gateway service:
+Gateway:
 
-- `timestamp-gateway.service`
+- compose service `gateway` (the compose path), or `timestamp-gateway.service` under systemd
 
 Payment backend:
 
 - Phoenixd
-- service: `phoenixd.service`
+- host service (`phoenixd.service` where systemd-managed)
 - API: `127.0.0.1:9740`
-- enabled on boot
 
 Local OpenTimestamps calendar:
 
-- Docker container: `otsd`
-- host calendar path: `/var/lib/otsd/calendar`
-- container calendar path: `/calendar`
+- compose service `otsd` (or the standalone `otsd` container under systemd)
+- calendar state: the host path `OTSD_CALENDAR_DIR` names, mounted at `/calendar`
 
 ## Operator commands
 
-Run from:
-
-`/home/gateway/timestamp-gateway`
-
-Commands:
+Run from the repo checkout:
 
 `./ops/status.sh`
 
@@ -51,9 +45,8 @@ The gateway uses Phoenixd through `.env`.
 
 Do not print or paste the Phoenixd password.
 
-Phoenixd state lives here:
-
-`/home/gateway/phoenixd/home/.phoenix`
+Phoenixd state lives in the directory `PHOENIX_HOME` names (a `.phoenix`
+directory — e.g. `~/.phoenix` beside the phoenixd binary's user).
 
 Important files:
 
@@ -64,32 +57,15 @@ Important files:
 - `phoenix.mainnet.*.db-shm`
 - `phoenix.log`
 
-`seed.dat` is critical. Treat it as secret wallet material.
-
-## LND role in this deployment
-
-LND is present on this VPS but is NOT the active payment backend.
-
-Current payment backend: Phoenixd
-
-LND is used only as a test payer in operator scripts:
-
-- ops/l402-paid-proof.sh uses lncli to pay Phoenixd invoices for testing
-- This creates a local loop: LND pays → Phoenixd receives
-
-This is a testing artifact. In production:
-
-- Client wallets pay Phoenixd invoices directly over the Lightning network
-- LND is not involved in the payment flow
-- LND may be removed or replaced in a future deployment
-
-Do not confuse LND's presence with it being the active payment backend.
+`seed.dat` is critical. Treat it as secret wallet material. Recovery is
+by seed — a restored phoenixd is never started from copied state
+(ops/BACKUP-RECOVERY.md, "Recovery is by seed").
 
 ## Phoenixd first payment warning
 
 On a fresh Phoenixd node with no open channel, the first received payment triggers an automatic channel open by ACINQ.
 
-ACINQ deducts a liquidity fee from the received amount. The figures are ACINQ's, they change, and this file does not record them — current schedule: https://phoenix.acinq.co/server/liquidity (pointer recorded 2026-07-21). Shape of the fee: a mining-fee component plus a service percentage of the liquidity purchased, paid upfront out of the payment that triggers it.
+ACINQ deducts a liquidity fee from the received amount. The figures are ACINQ's, they change, and this file does not record them — current schedule: https://phoenix.acinq.co/server/liquidity. Shape of the fee: a mining-fee component plus a service percentage of the liquidity purchased, paid upfront out of the payment that triggers it.
 
 The arithmetic that matters is not the exact figures:
 
@@ -97,7 +73,7 @@ The arithmetic that matters is not the exact figures:
 
 The fee can exceed the whole margin of a small first payment — or the payment itself.
 
-What the gateway does about it (pinned by the H3 tests in test_main.py): verify_payment checks the invoice's FACE amount (requestedSat) against the mint-time price, never the credited amount — a settled bolt11 is atomic, so settlement proves the payer paid the face amount in full. A settled first payment gets its proof; the liquidity fee nets the OPERATOR's credit and logs a WARNING ("Liquidity fee observed: requested N sat, received M sat"). The customer is never refused over ACINQ's fee.
+What the gateway does about it (pinned by `test_liquidity_fee_netted_receive_still_verifies` and `test_liquidity_fee_payment_yields_obligation_and_proof` in test_main.py): verify_payment checks the invoice's FACE amount (requestedSat) against the mint-time price, never the credited amount — a settled bolt11 is atomic, so settlement proves the payer paid the face amount in full. A settled first payment gets its proof; the liquidity fee nets the OPERATOR's credit and logs a WARNING ("Liquidity fee observed: requested N sat, received M sat"). The customer is never refused over ACINQ's fee.
 
 The remaining failure mode is upstream of the gateway: a payment too small to carry the fee fails to settle at the Lightning layer — no sats move, the invoice stays unpaid, and a retry after pre-funding succeeds. (phoenixd liquidity-policy behaviour; not yet exercised on this deployment — unverified.)
 
@@ -111,22 +87,18 @@ Once a channel is open, subsequent payments arrive at full value with no deducti
 
 The local calendar is your own `otsd`, not the public OpenTimestamps calendars.
 
-The live container's exact shape — image, mounts, network, env, command —
-is recorded once, in BACKUP-RECOVERY.md "Current Docker shape" (the
-restore record). Since 2026-07-21 the installed unit matches the repo
-template (`deploy/otsd.service.example`).
+The container's exact shape — image, mounts, network, env, command — is
+recorded once, in BACKUP-RECOVERY.md "Docker shape" (the restore record);
+the installed unit matches `deploy/otsd.service.example`.
 
-Policy on this box:
+Policy:
 
-- Fee cap LIVE since 2026-07-21: the installed unit was updated to the
-  shipped template — `--btc-max-fee 0.0002` in force and `-v` gone (INFO
-  is the production log level), verified by docker inspect. Credentials
-  ride `/etc/systemd/system/otsd.env`, owned by the service user, mode
-  600. When hand-editing the cap: the flag takes BTC, 0.0002 BTC =
-  20,000 sats — never "fix" 0.0002 to 20000, that would mean 20,000 BTC.
-- Rotation lesson (durable): a rotation is pull+restart and never touches
-  the installed unit — a unit change lands only through an explicit
-  install + daemon-reload, as on 2026-07-21.
+- Fee cap: `--btc-max-fee 0.0002` in the shipped template, no `-v` (INFO
+  is the production log level). Credentials ride
+  `/etc/systemd/system/otsd.env`, owned by the service user, mode 600.
+  When hand-editing the cap: the flag takes BTC, 0.0002 BTC = 20,000 sats.
+- A code rotation is pull + restart and never touches the installed unit;
+  a unit change lands only through an explicit install + daemon-reload.
 - Cap semantics (what one anchor cycle can spend across its RBF ladder):
   operator guide, "Bitcoin transaction cost". The cap-stall signal —
   `Maximum txfee reached!` in otsd's log while `/health` shows `otsd: ok`
@@ -161,26 +133,6 @@ client-facing API vocabulary is different and lives in the README
 
 ## Product boundary
 
-No files.
+No files, no accounts, no claims, no truth, no custody (README, "What the gateway does and does not do").
 
-No accounts.
-
-No claims.
-
-No truth.
-
-No custody.
-
-The gateway accepts digests and returns portable `.ots` receipts.
-
-A receipt proves the digest existed no later than the time supported by the OpenTimestamps proof path.
-
-It does not prove document truth, authorship, consent, legality, originality, completeness, or content review.
-
-## notarie boundary
-
-Do not build notarie until the proof machine is boring.
-
-notarie should only be a local watcher, hasher, and receipt saver.
-
-It should not parse documents, upload files, judge content, make claims, or expose Lightning/OpenTimestamps internals to the user.
+The gateway accepts digests and returns portable `.ots` receipts. A receipt proves the digest existed no later than the time supported by the OpenTimestamps proof path. It does not prove document truth, authorship, consent, legality, originality, completeness, or content review.

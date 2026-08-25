@@ -43,8 +43,8 @@ fi
 
 # ots upgrade makes its own backup: it renames the proof to proof.ots.bak
 # before writing, and refuses to touch anything if that name is taken. A .bak
-# byte-identical to the artifact carries no information the artifact lacks
-# (the pre-fix sweeper planted one on every run) — clear exactly that case.
+# byte-identical to the artifact carries no information the artifact lacks —
+# clear exactly that case.
 if [ -f "$PROOF.bak" ] && cmp -s "$PROOF" "$PROOF.bak"; then
   rm -f "$PROOF.bak"
 fi

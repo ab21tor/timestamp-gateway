@@ -29,16 +29,16 @@ The gateway cannot produce Bitcoin-anchored proofs on its own. It requires a run
 - A running phoenixd instance (the live payment backend — see "Payment backend (phoenixd)" below for how to get one) — or an LND node with REST API and invoice macaroon if using the LND test-payer / alternative backend
 - Inbound Lightning liquidity on the payment backend
 - An OTS calendar backend (otsd) — bundled via `--profile calendar` or external
-- An **existing, already-synced** Bitcoin Core node reachable by otsd, with a wallet loaded and funded. This is the heaviest prerequisite, and this guide does not teach it: standing up a node from nothing is a multi-day project — on the order of 750 GB of initial-block-download ingress, days of sync time, and real money to fund the wallet. If you do not already run a node, start at https://bitcoincore.org and come back.
+- An **existing, already-synced** Bitcoin Core node reachable by otsd, with a wallet loaded and funded. This is the heaviest prerequisite, and this guide does not teach it: standing up a node from nothing is a multi-day project — on the order of 750 GB of initial-block-download ingress, days of sync time, and a funded wallet. If you do not already run a node, start at https://bitcoincore.org.
 
-You do not need a VPS. You do not need a static IP. You do not need to expose any clearnet ports if you use Tor-only mode.
+A VPS, a static IP, and clearnet ports are all optional; Tor-only mode needs none of them.
 
 ---
 
 ## First-run checklist
 
 1. Clone this repository, clone the calendar fork next to it (clone command: "Deploying the calendar (otsd)" below), and copy `.env.example` to `.env`.
-2. Generate the L402 signing key and set `L402_SECRET_HEX` in `.env`: `python3 -c 'import secrets; print(secrets.token_hex(32))'`. The gateway refuses to start without it — likewise `PRICE_PER_PROOF_SATS`, the flat price every hash pays (sizing arithmetic: "Pricing" below). Set both before first start.
+2. Generate the L402 signing key and set `L402_SECRET_HEX` in `.env`: `python3 -c 'import secrets; print(secrets.token_hex(32))'`. The gateway refuses to start without it — likewise `PRICE_PER_PROOF_SATS`, the flat price every hash pays, an integer ≥ 1 (sizing arithmetic: "Pricing" below). Set both before first start. Both apply to the default paid door (`L402_ENABLED=true`); a free door (`L402_ENABLED=false` — "Pricing", "The door switch") reads neither.
 3. Set `PAYMENT_BACKEND_TYPE=phoenixd` (the default) and fill in `PHOENIXD_URL` (`http://host.docker.internal:9740` for a phoenixd on this host — Docker Desktop only; on a Linux engine phoenixd must be bound where the container can reach it, see "Payment backend (phoenixd)") and `PHOENIXD_HTTP_PASSWORD_LIMITED`. Only fill in `LND_*` if using the LND test-payer / alternative backend.
 4. (lnd test-payer backend only) Set `TOR_PROXY=tor:9050` if `LND_HOST` is a `.onion` address; leave blank otherwise.
 5. Set `OTS_BACKEND_MODE=calendar` and `OTS_CALENDAR_URL=http://otsd:14788`.
@@ -83,7 +83,7 @@ OTS_BACKEND_MODE=public
 
 The gateway forwards paid digests to the four public OpenTimestamps aggregators (`a.pool.opentimestamps.org`, etc.). This mode is provided so you can test the payment flow without running otsd. It is not the real target.
 
-**Do not use `public` mode in production.** In public mode, the gateway is a paid relay to other operators' infrastructure — not an independent calendar node (the README's "What we corrected" section records why that matters).
+**Do not use `public` mode in production.** In public mode, the gateway is a paid relay to other operators' infrastructure — not an independent calendar node.
 
 ---
 
@@ -238,9 +238,9 @@ Do not expose otsd on a public port. It has no authentication. Access should be 
 1. **Immediate:** The gateway submits the digest to otsd and receives a receipt with a `PendingAttestation` pointing to the calendar URL. This is the `.ots` file returned to the client. It is not yet Bitcoin-anchored.
 2. **Within hours:** otsd submits a Bitcoin transaction anchoring the Merkle root of the pending digests — at most one transaction per anchoring interval ("Bitcoin transaction cost") — then waits for `--btc-min-confirmations` (default 6) before writing the Bitcoin attestation. Typically a few hours end to end: best case about an hour, worst case the full anchoring interval plus confirmation time. (An expectation derived from the defaults — no timing record is committed.)
 3. **Upgrade:** The client POSTs the pending proof (base64) with its digest to the gateway's `/upgrade` endpoint, which fetches the Bitcoin anchoring from the operator's calendar and returns the anchored proof (see the README's `/verify` and `/upgrade` status vocabulary). Plain `ots upgrade proof.ots` reaches the calendar URL inside the pending attestation directly, so it works only if the operator serves that URL publicly — with the calendar private, as this guide recommends, the gateway endpoint is the client path.
-4. **Verify:** The client runs `ots verify proof.ots` to verify the proof against the Bitcoin blockchain independently.
+4. **Verify:** The client runs `ots verify proof.ots` to verify the anchored proof against the Bitcoin blockchain — independently exactly when the verifying machine has its own Bitcoin node or a block-header source the client chose to trust; `ots verify` is only as independent as its view of Bitcoin.
 
-The `.ots` file returned immediately by the gateway is a valid receipt. It is not incomplete or broken. It simply has not been finalized yet because Bitcoin blocks take time.
+The `.ots` file returned immediately by the gateway is a valid receipt. It is not incomplete or broken; it has not been finalized yet because Bitcoin blocks take time.
 
 ---
 
@@ -262,7 +262,7 @@ The obligation log and the proof cache coexist: the cache is the instant path fo
 ### What it is not
 
 - It is **not** part of proof validity. The database is never consulted to verify a proof. A finished `.ots` verifies against Bitcoin with zero dependency on this database, the payment backend, or the gateway itself.
-- It is **not** proof storage. It records payment-hash → digest → status only; it never holds proof bytes durably (the proof cache is in-memory and resets on restart, which is fine — the obligation row drives re-stamping, and re-stamping the same digest is idempotent).
+- It is **not** proof storage. It records payment-hash → digest → status only; it never holds proof bytes durably (the proof cache is in-memory and resets on restart, which is fine — the obligation row drives re-stamping, and re-stamping the same digest is idempotent for the proof **and** for the bill: within the calendar fork's dedupe horizon — in-memory, one hour, refreshed on every resubmission — a re-stamped digest attaches to the already-pending commitment and is counted as one record. Only a re-stamp that crosses a fork restart boundary counts a second record; that is the one bounded exception).
 
 ### Configuration
 
@@ -275,7 +275,11 @@ Two environment variables (see `.env.example`):
 
 Under Docker Compose the database lives on the persistent `gateway_data` volume, mounted at `/var/lib/timestamp-gateway`. This volume must survive container recreation — otherwise a settled-but-unstamped obligation could be lost. SQLite runs in WAL mode, so the database is accompanied by `-wal` and `-shm` sidecar files; back up all three together (see the backup notes below).
 
-> Backup: on the live VPS, `ops/backup-live-state.sh` and `ops/BACKUP-RECOVERY.md` cover the operational backup set and now include the obligations database and its `-wal`/`-shm` sidecars. If you run the gateway outside that layout, ensure your own backups capture `OBLIGATIONS_DB_PATH` and its two sidecar files while the gateway is stopped (or use SQLite's `.backup`/`VACUUM INTO` for a consistent hot copy).
+> Backup: `ops/backup-live-state.sh` and `ops/BACKUP-RECOVERY.md` cover the operational backup set, including the obligations database and its `-wal`/`-shm` sidecars. If you run the gateway outside that layout, ensure your own backups capture `OBLIGATIONS_DB_PATH` and its two sidecar files while the gateway is stopped (or use SQLite's `.backup`/`VACUUM INTO` for a consistent hot copy).
+
+### Retention
+
+Rows are never deleted by the gateway itself, so the table grows with every paid stamp, forever. **Purging `stamped` rows older than N days is safe by design**: the durable-log guarantee lives entirely in `needs_stamp` rows (a paid-but-unstamped obligation), and the store is never consulted to validate a proof — a finished `.ots` verifies with zero dependency on this database. `stamped` rows are audit history only; archive-then-delete them on whatever schedule your bookkeeping wants (e.g. monthly, keeping 90 days), and never touch `needs_stamp` rows. The sweeper's scan is backed by a partial index (`obligations_needs_stamp`, created automatically on startup — including on existing databases) that holds only un-swept rows, so sweep cost stays flat even if you keep stamped history forever; retention is then a disk decision, not a performance one.
 
 ---
 
@@ -305,8 +309,12 @@ So provision the channel yourself, before the first real sale. Two rails end in 
 #    URL = where phoenixd is bound as seen from this host:
 #    127.0.0.1:9740 on the systemd path; 172.17.0.1:9740 with the
 #    deploy/phoenixd.service.example bind.
-curl -sS -u ":$PHOENIXD_HTTP_PASSWORD_LIMITED" \
-  http://127.0.0.1:9740/getswapinaddress
+# Password via stdin config, never -u argv (argv is world-readable in ps) —
+# the payer scripts' pattern, used for every phoenixd curl in this guide.
+curl -sS --config - <<EOF
+url = "http://127.0.0.1:9740/getswapinaddress"
+user = ":$PHOENIXD_HTTP_PASSWORD_LIMITED"
+EOF
 
 # 2. Send ~25,000–30,000 sats on-chain to that address, from any wallet.
 
@@ -323,18 +331,22 @@ Measured (stranger run, 2026-07): 31,232 sats deposited → 21,561 sats total to
 # 1. On the gateway host: mint an invoice directly from phoenixd
 #    (the limited password may create and read invoices; it cannot spend).
 #    URL: same as above.
-curl -sS -u ":$PHOENIXD_HTTP_PASSWORD_LIMITED" \
-  -X POST http://127.0.0.1:9740/createinvoice \
-  -d amountSat=30000 \
-  -d description=prefund
+curl -sS --config - <<EOF
+url = "http://127.0.0.1:9740/createinvoice"
+user = ":$PHOENIXD_HTTP_PASSWORD_LIMITED"
+data = "amountSat=30000"
+data = "description=prefund"
+EOF
 
 # 2. Pay the returned bolt11 ("serialized" field) from the payer wallet —
 #    the second, independently funded wallet (README, "The payer side").
 
 # 3. Confirm receipt: incoming payments listing shows it settled, minus
 #    the channel-open fee.
-curl -sS -u ":$PHOENIXD_HTTP_PASSWORD_LIMITED" \
-  http://127.0.0.1:9740/payments/incoming?limit=5
+curl -sS --config - <<EOF
+url = "http://127.0.0.1:9740/payments/incoming?limit=5"
+user = ":$PHOENIXD_HTTP_PASSWORD_LIMITED"
+EOF
 ```
 
 Caveat from live testing (2026-07): three attempts to pay such a pre-fund invoice from a Phoenix mobile sender were refused upstream — ACINQ returned `UpdateFailHtlc` within ~1 second, without ever contacting the receiving phoenixd. The walkthrough's prescribed sender (the payer wallet) remains untested on this rail. If the payment is refused, use the on-chain deposit above; it needs no Lightning sender at all.
@@ -343,7 +355,7 @@ After either rail, the channel exists and subsequent payments — the real sales
 
 ### Funding the payer side (phoenixd as payer)
 
-The end-to-end test needs a second, independently funded wallet (README, "The payer side"). If that payer is itself a phoenixd, do not budget mining fees only for its on-chain funding: under the default `--auto-liquidity 2m`, a phoenixd used purely as a payer pays the full auto-liquidity toll on first funding, exactly as the shop's node does. Measured (stranger run, 2026-07): 81,736 sats deposited on-chain → toll 21,561 sats, identical to the shop's → 60,175 sats spendable. The mining-fees-only assumption for on-chain payer funding is false under defaults.
+The end-to-end test needs a second, independently funded wallet (README, "The payer side"). If that payer is itself a phoenixd, do not budget mining fees only for its on-chain funding: under the default `--auto-liquidity 2m`, a phoenixd used purely as a payer pays the full auto-liquidity toll on first funding, exactly as the gateway's node does. Measured (stranger run, 2026-07): 81,736 sats deposited on-chain → toll 21,561 sats, identical to the gateway node's → 60,175 sats spendable. The mining-fees-only assumption for on-chain payer funding is false under defaults.
 
 This can be a deliberate choice rather than a surprise — operators may set `--auto-liquidity` for payer roles on purpose; the deposited funds are spendable once the deposit has 3 confirmations and the splice completes. Budget the toll either way.
 
@@ -353,9 +365,22 @@ This can be a deliberate choice rather than a surprise — operators may set `--
 
 Pricing is a two-part model. **Both parts are live.**
 
-**Part one — the flat per-proof rate (live).** Every hash pays `PRICE_PER_PROOF_SATS` at submission. That is the whole quote: no feerate, no estimator, no floor logic — the gateway makes no Bitcoin RPC calls. The variable is required with no default (startup fails without it, the same pattern as `L402_SECRET_HEX`); `0` is allowed and boots with a warning — the shop earns nothing per proof. A token minted at N validates at N for as long as its settled invoice backs it: settlement, not the clock, gates redemption (the expiry in the challenge is advisory), so repricing never strands an in-flight invoice.
+**Part one — the flat per-proof rate (live).** With the L402 door on (`L402_ENABLED=true`, the default), every hash pays `PRICE_PER_PROOF_SATS` at submission. That is the whole quote: no feerate, no estimator, no floor logic — the gateway makes no Bitcoin RPC calls. The variable is required with no default while the door is on (startup fails without it, the same pattern as `L402_SECRET_HEX`) and must be an integer ≥ 1. `0` is refused: a token minted at 0 could never redeem (the price caveat rejects it); a free door is the switch below. A token minted at N validates at N for as long as its settled invoice backs it: settlement, not the clock, gates redemption (the expiry in the challenge is advisory), so repricing never strands an in-flight invoice.
 
-**Part two — anchor billing (live).** Each anchor's actual cost, times `PRICE_MARKUP`, is billed to a standing payer wallet: the calendar fork records what every confirmed anchor really cost in an append-only receipts file, and the gateway turns those receipts into Lightning bills served on `GET /anchor-bills`. Off by default; a gateway with `ANCHOR_BILLING_ENABLED=false` behaves exactly as before it existed. With billing on, anchor costs move from the operator's side of the ledger to the standing payer's — the flat rate becomes a pure service premium. Everything about it: "Anchor billing" below.
+**Part two — anchor billing (live).** Each anchor's records, times `PER_RECORD_SATS`, is billed to a standing payer wallet: the calendar fork writes a receipt per confirmed anchor into an append-only file, including the number of digest submissions inside that anchor's tree, and the gateway turns those receipts into Lightning bills served on `GET /anchor-bills`. Off by default; a gateway with `ANCHOR_BILLING_ENABLED=false` behaves exactly as before it existed. With billing on, anchor costs move from the operator's side of the ledger to the standing payer's — the flat rate becomes a pure service premium. Everything about it: "Anchor billing" below.
+
+### The door switch — free mode
+
+`L402_ENABLED=false` (strict `true`/`false`, default `true`) is the free door. With the door off, `POST /timestamp` stamps the digest immediately and returns the proof free of charge — no invoice, no macaroon, no 402; the payment backend is never contacted from that path, and any `Authorization` header is ignored (a token minted before a flip gets its proof regardless: settlement outranks expiry holds trivially). The per-record cost is charged at anchor time through the existing anchor-bill machinery — records × `PER_RECORD_SATS` per confirmed anchor — so a free door with billing on is the deployment where the standing payer carries everything.
+
+What changes with the door off, precisely:
+
+- **No obligation row is written for a free stamp.** The obligation log exists so a PAID customer is never dropped; nothing is paid here. A failed stamp returns the same 502 and the client retries.
+- **`PRICE_PER_PROOF_SATS` and `L402_SECRET_HEX` are never read** — set-but-unused values are ignored silently; an `.env` legitimately holds both modes' vars.
+- **No rate limit remains on `/timestamp`.** The invoice-mint bucket does not apply (nothing mints; the calendar's per-second aggregation absorbs volume). Whatever can reach a free door can load the calendar and the anchor bill.
+- **`/verify` and `/upgrade` are unaffected** in both modes, including their shared rate bucket.
+- **`/health` reports the mode** in an `l402` field: `on`/`off`, reported, never degrading — the same contract as billing `off`.
+- **Startup names the mode once.** Door off with billing on logs one INFO line (free door; anchor billing carries the charges). Door off with billing off logs one warning instead: nothing charges anywhere — a valid choice (a subsidising operator), named once.
 
 ### Sizing the flat rate
 
@@ -363,34 +388,40 @@ Measured constants (2026-07): a calm anchor cost 153–308 sats (153 amortized, 
 
 Two deployments, two answers:
 
-- **No standing payer — anchoring comes out of the flat rate.** Size in the hundreds of sats. At the measured constants, a 500-sat rate carries a calm 308-sat anchor from the first sale of each batch; a sustained run of cap-priced anchors (20,000 sats each) needs the batch to hold 20,000 ÷ rate sales (40 at 500 sats) or the difference comes out of the float — which is what the float and the cap are for. Storm risk belongs to the float and the cap, not the price.
-- **Standing payer carries anchor costs (anchor billing on).** The flat rate is a pure service premium: single digits to tens of sats. The anchors are recovered — with margin — through the bills below.
+- **No standing payer — anchoring comes out of the flat rate.** Size in the hundreds of sats. At the measured constants, a 500-sat rate carries a calm 308-sat anchor from the first sale of each batch; a sustained run of cap-priced anchors (20,000 sats each) needs the batch to hold 20,000 ÷ rate sales (40 at 500 sats) or the difference comes out of the float — which is what the float and the cap are for. Fee-spike risk belongs to the float and the cap, not the price.
+- **Standing payer carries anchor costs (anchor billing on).** The flat rate is a pure service premium: single digits to tens of sats. Whether the anchors are recovered is a breakeven condition, not a property of the mechanism: **anchors per day × anchor cost must sit at or below records per day × `PER_RECORD_SATS`** (the rate has no default; the examples here use the guide's running 50). At the default cadence (2–4 anchors/day — "Anchor billing" below), 600 records/day earns 30,000 sats/day against at most 4 × 308 = 1,232 sats of calm anchor cost: roughly 24× breakeven. But 20 records/day earns 1,000 sats/day and loses money on a perfectly calm four-anchor day (1,232 sats) — and one fee-cap anchor (20,000 sats) needs 400 records on its own. Size the rate against your worst expected fee day and your real record volume, not the calm measurements.
 
 ### The float backstop
 
-The anchor wallet (`otsd-hot`) is the machine's float. The gateway watches it through the same file-mediated wallet status the liquidity alarm uses (no RPC, no credential — see "Wallet liquidity alarm"). Thresholds derive from `STAMPER_FEE_CAP_SATS` (default 20,000 — keep it equal to the otsd `--btc-max-fee` flag; the flag takes BTC, 0.0002 BTC = 20,000 sats, never "fix" one to the other's unit):
+The anchor wallet (`otsd-hot`) funds anchoring. The gateway watches it through the same file-mediated wallet status the liquidity alarm uses (no RPC, no credential — see "Wallet liquidity alarm"). Thresholds derive from `STAMPER_FEE_CAP_SATS` (default 20,000 — keep it equal to the otsd `--btc-max-fee` flag; the flag takes BTC, 0.0002 BTC = 20,000 sats):
 
 - **Below 5 × cap (100,000 sats):** `/health` reports `float: alarm` and degrades to 503. Sales continue. Refill.
-- **Below 1 × cap (20,000 sats):** the machine cannot be sure of affording its next anchor cycle, so it full-stops itself: everything returns 503 except `/health` (overall `auto_paused`), and the sweeper skips its cycles — the PAUSED semantics, but as the machine's OWN state, distinct from your PAUSED file. It never touches operator intent and clears itself when a newer balance reading shows recovery (lag bounded by the 30-minute timer). Settlement outranks expiry throughout: paid tokens redeem after recovery.
-- **No balance reading** — the ops timers not installed (the compose path today), or the status file carries no balance: the backstop is **inactive**, reported honestly in `/health` (`float: inactive`) without degrading. A stale file's last reading stands (ruled 2026-07-27); staleness itself alarms through the `wallet` field.
+- **Below 1 × cap (20,000 sats):** the next anchor cycle may be unaffordable, so the gateway stops itself: everything returns 503 except `/health` (overall `auto_paused`), and the sweeper skips its cycles — the PAUSED semantics, as the gateway's own state, distinct from your PAUSED file. It never touches your file and clears itself when a newer balance reading shows recovery (lag bounded by the 30-minute timer). Settlement outranks expiry throughout: paid tokens redeem after recovery.
+- **No balance reading** — the ops timers not installed (the compose path today), or the status file carries no balance: the backstop is **inactive**, reported in `/health` (`float: inactive`) without degrading. A stale file's last reading stands; staleness itself alarms through the `wallet` field.
 
 ### Retired pricing variables
 
-`GATEWAY_PRICE_SATS`, `MIN_GATEWAY_PRICE_SATS`, `PRICE_BLIND_SATS`, `PRICE_BUMP_RESERVE`, `PRICE_MARGIN`, `PRICE_TX_VSIZE_ESTIMATE`, `PRICE_CONF_TARGET`, and `PRICE_RPC_URL` are no longer read. Any of them present in the environment logs one startup warning naming it, then is ignored — never a startup failure.
+`GATEWAY_PRICE_SATS`, `MIN_GATEWAY_PRICE_SATS`, `PRICE_BLIND_SATS`, `PRICE_BUMP_RESERVE`, `PRICE_MARGIN`, `PRICE_TX_VSIZE_ESTIMATE`, `PRICE_CONF_TARGET`, and `PRICE_RPC_URL` are no longer read. Any of them present in the environment logs one startup warning naming it, then is ignored — never a startup failure. `PRICE_MARKUP` is retired the same way with its own warning (its successor is the anchor-bill rate, not the quote): anchor bills are now records × `PER_RECORD_SATS` ("Anchor billing" below).
 
 ---
 
 ## Anchor billing
 
-Part two of the pricing model ("Pricing" above), off by default. The calendar fork records what each confirmed anchor actually cost in an append-only JSONL receipts file — one line per confirmed anchor, at the path its `OTSD_ANCHOR_RECEIPTS` environment variable names, written before the calendar save so a crash produces at worst a duplicate line, never a missing one. With billing on, the gateway ingests those receipts into an `anchor_bills` table (`INSERT OR IGNORE` keyed on txid — the fork's crash-preferred duplicates dedupe for free) and bills a standing payer `ceil(fee_sats × PRICE_MARKUP)` sats per anchor. The amount is computed exactly once, at ingestion, and is immutable: changing the markup later never reprices an existing bill — the same law as the quote.
+Part two of the pricing model ("Pricing" above), off by default. The calendar fork writes one receipt line per confirmed anchor into an append-only JSONL file — at the path its `OTSD_ANCHOR_RECEIPTS` environment variable names, written before the calendar save so a crash produces at worst a duplicate line, never a missing one. Each receipt carries `records`: the number of digest submissions inside that anchor's tree (an integer; `0` means the fork could not prove a count — it errs low by design). With billing on, the gateway ingests those receipts into an `anchor_bills` table (`INSERT OR IGNORE` keyed on txid dedupes the fork's crash-preferred duplicate lines) and bills a standing payer `records × PER_RECORD_SATS` sats per anchor. The amount is computed exactly once, at ingestion, and is immutable: changing the rate later never reprices an existing bill, as with the quote. Bills already in the table keep their stored amounts, whatever formula made them (markup-era bills read back with `records` null).
 
-Billing gates nothing. Sales, stamping, and redemption never consult billing state — an unpaid bill degrades `/health` (below), and that is the whole mechanism. The standing payer is a customer with a ledger, not a dependency the machine waits on.
+**Sizing the payer's ceilings.** One anchor's bill is everything submitted in one inter-anchor window: at the default cadence (`--btc-min-tx-interval` 21600 × jitter 1–2, so 6–12 hours) that is records-per-window × `PER_RECORD_SATS`, and the payer's `MAX_SATS_PER_BILL` (default 60,000), its `DAILY_BUDGET_SATS` (default 200,000), and the client's outbound channel capacity must all be sized to that product — the bill arrives as one bolt11, so the channel must carry it in a single payment. The defaults are demo-scale, and enterprise volume exceeds them quietly: 30 records/minute puts 21,600 records in a 12-hour window — one bill of 1,080,000 sats at rate 50, 18× the default per-bill ceiling, with the day's ~2.16M sats at 10× the default budget. What that looks like: the payer logs `skipped reason: exceeds_per_bill_ceiling` on every run and never pays; after 24 hours the gateway's `billing` flips `overdue` and `/health` degrades to 503 — which pages only where the health-monitor timer is installed, so on the compose path alone nothing pages anyone; sales continue throughout (billing gates nothing). Raise the ceilings and the channel with the volume, or shorten the window (`--btc-min-tx-interval`) so each bill stays inside them.
+
+**The double-bill crash edge.** The receipt-before-save ordering has one operator-visible failure: a stamper crash between the receipt append and the calendar save leaves those commitments unsaved, so on restart the fork re-anchors them in a new transaction — and that second receipt carries a different txid, which the txid dedupe rightly treats as a new anchor. What you see is two bills in `GET /anchor-bills`: different txids, `confirmed_at` values close together, each carrying a `records` count for what is substantially the same batch of submissions, each priced records × `PER_RECORD_SATS`. The ordering is deliberate — a crash the other way around loses the receipt silently, revenue nothing would ever surface — so the failure is traded toward the extra bill you can see. The client can spot it through the `records` field (two bills whose counts cover one batch); the gateway neither detects nor reverses it; any refund is the operator's decision.
+
+**Deploy order: the fork must carry the `records` receipt field before this gateway version bills anything — receipts without real counts do not bill.** A receipt with `records: 0` produces no bill and a warning naming the txid (the fork could not prove a count, so nothing is charged). A receipt missing `records` entirely, or carrying a non-integer, is malformed: skipped with the malformed-line warning. An old five-field receipts file from an un-upgraded fork therefore never bills — loudly, on every ingest pass.
+
+Billing gates nothing. Sales, stamping, and redemption never consult billing state — an unpaid bill degrades `/health` (below), and that is the whole mechanism. The standing payer is a customer with a ledger, not a dependency the gateway waits on.
 
 ### Configuration
 
 `ANCHOR_BILLING_ENABLED` is a strict `true`/`false` (anything else fails startup) and defaults to `false`, which means the feature is entirely absent: the three variables below are never read, `GET /anchor-bills` returns the same 404 as an unregistered route, and `/health` reports `billing: off` without ever degrading. With `true`, all three are required with no defaults — startup fails, naming every missing one in a single error:
 
-- **`PRICE_MARKUP`** — the ratio applied to each anchor's actual fee: a finite float ≥ 1.0 (`1.5` bills the standing payer 150% of the fee). Below 1.0 the shop sells anchors at a loss, so startup refuses it.
+- **`PER_RECORD_SATS`** — the price in sats per record inside each anchor: an integer ≥ 1, the same rule as `PRICE_PER_PROOF_SATS`. `0` is refused — to bill nothing, set `ANCHOR_BILLING_ENABLED=false`. Replaces the retired `PRICE_MARKUP`.
 - **`ANCHOR_RECEIPTS_PATH`** — the receipts file as the gateway sees it (wiring below). An absent file is healthy — billing on, no anchors yet. Present but unreadable is `billing: error`.
 - **`ANCHOR_BILLS_TOKEN`** — the opaque bearer token guarding `GET /anchor-bills`: operational history (anchor timing, fees, payment state) is not public. Generate it like `L402_SECRET_HEX` (`python3 -c 'import secrets; print(secrets.token_hex(32))'`).
 
@@ -409,30 +440,31 @@ Everything happens on the poll; ingestion never mints. A bill without a live inv
       "commitments": 5,
       "confirmed_height": 955211,
       "confirmed_at": 1753574400,
-      "amount_sats": 462,
+      "records": 4,
+      "amount_sats": 200,
       "status": "unpaid",
       "payment_hash": "9f86d0…a08",
-      "bolt11": "lnbc4620n1…",
+      "bolt11": "lnbc2000n1…",
       "invoice_created_at": 1753660800
     }
   ],
-  "summary": { "unpaid_count": 1, "unpaid_sats": 462 }
+  "summary": { "unpaid_count": 1, "unpaid_sats": 200 }
 }
 ```
 
-(`amount_sats` 462 = ceil(308 × 1.5) at `PRICE_MARKUP=1.5`.) The payer's whole loop is: poll, pay every `bolt11`, poll again and watch the bills flip to `paid`.
+(`amount_sats` 200 = 4 records × `PER_RECORD_SATS=50`; `records` can sit below `commitments` — the fork's count errs low, with one bounded exception: a digest re-submitted across a fork restart boundary, or past the fork's one-hour in-memory dedupe horizon, counts a second record.) Each bill's `records` is the payer's audit handle: check `amount_sats` = `records` × the contracted rate before paying. The bill's record arithmetic is public, so the client's own ledger exposes any duplicate: records billed reconcile against records the client actually submitted, and an excess is a real duplicate and grounds for a refund. A bill ingested under the retired markup formula reads back with `records` null — its stored amount stands. The payer's whole loop is: poll, pay every `bolt11`, poll again and watch the bills flip to `paid`.
 
 ### The 24-hour bookkeeping alarm
 
-`/health` carries a `billing` field: `off` | `ok` | `overdue` | `error`. `overdue` — an unpaid bill more than 24 hours (hardcoded) past its anchor's own `confirmed_at` — and `error` — receipts file present but unreadable — degrade to 503 like a wallet failure; `off` never degrades. The health check ingests receipts itself, so overdue is seen even if the payer never polls (it never mints — minting stays poll-only).
+`/health` carries a `billing` field: `off` | `ok` | `rejected` | `overdue` | `error`. `rejected` — receipt lines are being rejected as malformed — `overdue` — an unpaid bill more than 24 hours (hardcoded) past its anchor's own `confirmed_at` — and `error` — receipts file present but unreadable — all degrade to 503 like a wallet failure (`overdue` and `error` outrank `rejected`); `off` never degrades. With billing on, `/health` also carries two counters: `billing_bills` (total rows in the bills table) and `billing_rejected` (receipt lines rejected as malformed, recounted from the file on every check — fixing the file clears it). "No receipts yet" is therefore visibly healthy — `billing: ok`, `billing_bills: 0`, `billing_rejected: 0` — distinguishable from a receipts stream being rejected wholesale. A well-formed `records: 0` receipt is **not** rejected: it is unbilled by design (err-low), warned in the log, and never degrades — a permanent line in the append-only file must not alarm forever. The health check ingests receipts itself, so overdue is seen even if the payer never polls (it never mints — minting stays poll-only).
 
-The clock is the anchor's `confirmed_at`, not ingestion time. Enabling billing over a receipts file with old anchors therefore alarms **immediately** — intended, not a bug: those anchors are unbilled operational history, and the alarm is the machine declining to pretend otherwise. Either collect the bills or start from a fresh receipts path. And it is bookkeeping, not enforcement: sales are never gated by billing state — the machine reports the debt; collecting it is the operator's business.
+The clock is the anchor's `confirmed_at`, not ingestion time. Enabling billing over a receipts file with old anchors therefore alarms **immediately** — intended: those anchors are unbilled operational history. Either collect the bills or start from a fresh receipts path. It is bookkeeping, not enforcement: sales are never gated by billing state — the gateway reports the debt; collecting it is the operator's job.
 
 ### Wiring the receipts file
 
 The fork writes, the gateway only reads. Two deployment shapes, two answers:
 
-**Compose (bundled otsd):** a dedicated shared volume, mounted read-write into otsd and read-only into the gateway — deliberately NOT the calendar volume: `/calendar` holds the hmac key, and the gateway container has no business mounting the directory that contains it. The wiring ships commented out in `docker-compose.yml` (a pull switches nothing on); uncomment the wiring lines and set the other three billing variables in `.env`:
+**Compose (bundled otsd):** a dedicated shared volume, mounted read-write into otsd and read-only into the gateway — deliberately NOT the calendar volume: `/calendar` holds the hmac key, and the gateway container must not mount the directory that contains it. The wiring ships commented out in `docker-compose.yml` (a pull switches nothing on); uncomment the wiring lines and set the other three billing variables in `.env`:
 
 ```yaml
   gateway:
@@ -516,13 +548,18 @@ Retrieve from the LND app's Properties page or via SSH. Path varies by EmbassyOS
 
 Tor generates a private key for your hidden service on first start. It is stored in the `tor_keys` Docker volume. If you destroy this volume, your `.onion` address changes permanently.
 
-**Back up the key:**
+**Back up the key** — without it ever printing to the terminal (terminals
+scroll back, and session transcripts persist):
 
 ```bash
-docker compose exec tor cat /var/lib/tor/timestamp_gateway/hs_ed25519_secret_key | base64
+umask 077
+docker compose exec -T tor tar -czf - -C /var/lib/tor timestamp_gateway > tor-keys-backup.tar.gz
 ```
 
-Store the output somewhere safe. To restore, copy the key back into the volume before starting the stack.
+Store that mode-600 file somewhere safe. To restore, extract the archive
+back into the `tor_keys` volume before starting the stack. (The automated
+backup already archives the same directory via `TOR_KEYS_DIR` — this
+recipe is for a one-off manual copy.)
 
 **Never share the secret key.** Anyone with it can impersonate your hidden service.
 
@@ -536,7 +573,7 @@ To receive Lightning payments, the payment backend must have inbound capacity �
 
 ### phoenixd (live default backend)
 
-phoenixd manages its own liquidity: it purchases inbound capacity from ACINQ automatically, either when an on-chain swap-in deposit confirms or when a received Lightning payment needs a channel, the fee deducted from that deposit or payment (see `ops/OPERATOR-NOTES.md`). Pre-provision it with the on-chain deposit before going live — the walkthrough is "First payment: pre-fund before going live". Do not leave the channel purchase to the first real payment: in live testing (2026-07) three pre-fund payment attempts from a Phoenix mobile sender were refused upstream, ACINQ returning `UpdateFailHtlc` within ~1 second without ever contacting the receiving phoenixd — and even when that rail works, the first payment simply nets less.
+phoenixd manages its own liquidity: it purchases inbound capacity from ACINQ automatically, either when an on-chain swap-in deposit confirms or when a received Lightning payment needs a channel, the fee deducted from that deposit or payment (see `ops/OPERATOR-NOTES.md`). Pre-provision it with the on-chain deposit before going live — the walkthrough is "First payment: pre-fund before going live". Do not leave the channel purchase to the first real payment: in live testing (2026-07) three pre-fund payment attempts from a Phoenix mobile sender were refused upstream, ACINQ returning `UpdateFailHtlc` within ~1 second without ever contacting the receiving phoenixd — and even when that rail works, the first payment nets less.
 
 Both funding rails — the on-chain deposit and a received Lightning payment — purchase inbound liquidity from ACINQ, phoenixd's only peer. That is a deliberate single-provider dependency of the phoenixd backend; third-party channel-open services do not apply. Operators who require peer choice need the alternative backend (LND, below), where inbound capacity is arranged manually.
 
@@ -612,13 +649,13 @@ docker compose logs -f otsd      # OTS calendar server
 
 The gateway runs without an access log (`--no-access-log` in both shipped launch paths) and logs warnings/errors for payment backend and OTS backend failures at `WARNING`/`ERROR` level. For the precise logging posture — what is never logged, payment-hash truncation, the traceback residual, and where digests do persist — see the README's "Privacy trade-offs" section.
 
-**If your Bitcoin node is still syncing (IBD), expect a false alarm with teeth.** A wallet on a syncing node reads balance 0 until the sync passes the funding transaction. That reading does not just fire the wallet alarm (`low`, 503 degraded) — a balance below `STAMPER_FEE_CAP_SATS` trips the float backstop and full-stops the machine (`auto_paused`; see "Pricing") on a perfectly healthy box. So install the monitoring timers below only after the node is synced. Quotes are unaffected by IBD: the flat `PRICE_PER_PROOF_SATS` consults no feerate, so 402 challenges quote the same price from the first request.
+**If your Bitcoin node is still syncing (IBD), expect a false alarm that stops the gateway.** A wallet on a syncing node reads balance 0 until the sync passes the funding transaction. That reading does not just fire the wallet alarm (`low`, 503 degraded) — a balance below `STAMPER_FEE_CAP_SATS` trips the float backstop and stops the gateway (`auto_paused`; see "Pricing") on a healthy box. So install the monitoring timers below only after the node is synced. Quotes are unaffected by IBD: the flat `PRICE_PER_PROOF_SATS` consults no feerate, so 402 challenges quote the same price from the first request.
 
 ### What `otsd: error` in `/health` means (and what it does not)
 
 `/health` probes otsd's homepage and requires the `Best-block` line in the body, not just a 200. otsd commits its 200 status line before making any Bitcoin call, so with Bitcoin RPC dead it still answers 200 — with an empty page. `Best-block` renders only after otsd's `getbestblockhash`/`getblockcount` succeed, so its presence is the only external proof that otsd can reach Bitcoin. `otsd: error` therefore means one of two things: otsd is unreachable, or otsd is up but **Bitcoin-blind** — the gateway log distinguishes them (`otsd unreachable` vs `otsd HTTP up but Bitcoin-blind`).
 
-Not covered: a wedged stamper thread with healthy RPC still renders the page. That class surfaces at outcome level in the `proofs` field (pending-too-long), with hours of latency.
+Not covered by this probe: a wedged stamper thread with healthy RPC still renders the page. The proof sweep behind the `proofs` field is a host-timer extra, `absent` under compose alone; the health monitor's anchor stall alarm (see "Monitoring") covers that class: pending commitments with no unconfirmed anchor transaction for longer than twice the anchoring interval.
 
 Two different "anchoring isn't happening" signals, and how to tell them apart:
 
@@ -629,7 +666,7 @@ Two different "anchoring isn't happening" signals, and how to tell them apart:
 
 The otsd-hot wallet funds anchoring transactions. If it drains, anchoring silently stops — so its balance is checked unattended and surfaced through `/health`.
 
-**How it works:** `ops/wallet-balance-check.sh` (run by a systemd timer every 30 minutes) reads the wallet balance over Bitcoin JSON-RPC (`getbalances`, via `BITCOIN_RPC_SERVICE_URL` from `.env`), compares it against `WALLET_MIN_SATS` (default 50000), and atomically writes a one-line JSON status file (`WALLET_STATUS_PATH`, default `/var/lib/timestamp-gateway/wallet-status`). `/health` reads only that file — the wallet field never comes from the gateway talking to Bitcoin RPC, and the gateway holds no wallet credential for it. (The gateway makes no Bitcoin RPC calls at all: the balance-check timer holds the only read credential, and the gateway reads only the file it leaves behind.) The float backstop reads `balance_sats` from this same file — thresholds and the auto-pause semantics are under "Pricing".
+**How it works:** `ops/wallet-balance-check.sh` (run by a systemd timer every 30 minutes) reads the wallet balance over Bitcoin JSON-RPC (`getbalances`, via `BITCOIN_RPC_SERVICE_URL` from `.env`), compares it against `WALLET_MIN_SATS` (default 50000), and atomically writes a one-line JSON status file (`WALLET_STATUS_PATH`, default `/var/lib/timestamp-gateway/wallet-status`). `/health` reads only that file — the wallet field never comes from the gateway talking to Bitcoin RPC, and the gateway holds no wallet credential for it. (The gateway makes no Bitcoin RPC calls at all: the balance-check timer holds the only read credential, and the gateway reads only the file it leaves behind.) The float backstop reads `balance_sats` from this same file — thresholds and the auto-pause semantics are under "Pricing". The two alarms read one file but trip at different levels: with defaults, the float alarm fires first (5 × `STAMPER_FEE_CAP_SATS` = 100,000), then the wallet field goes `low` (`WALLET_MIN_SATS` = 50,000), then the full stop (1 × cap = 20,000) — keep `WALLET_MIN_SATS` between the two float thresholds or one of the alarms becomes dead weight.
 
 **Install the timer:**
 
@@ -665,6 +702,8 @@ sudo systemctl enable --now wallet-balance-check.timer
 
 `ops/health-monitor.sh` (run by `ops/systemd/health-monitor.{service,timer}`, every 5 minutes) polls `/health` and pushes state changes through `ops/notify.sh` to the ntfy topic URL in `NTFY_URL` — set it in `.env` and treat it as a secret (anyone holding the URL can read and post alarms). Unset, `notify.sh` logs and exits non-zero: an unconfigured alarm channel is a failure, not silence. A persisting problem re-alerts after `HEALTH_REALERT_SECONDS` (default 14400); recovery to `ok` pushes once.
 
+The monitor also carries the **anchor stall alarm**, closing the wedged-stamper gap ("What `otsd: error` means", above): each run probes otsd's homepage JSON from inside the compose network (`docker compose exec` — otsd is unpublished on the host) and alarms when `pending_commitments` sits above 0 with no unconfirmed anchor transaction (`most_recent_tx: None`) for longer than `ANCHOR_STALL_SECONDS` — default 43200, i.e. 2 × otsd's default `min_tx_interval` of 21600, the longest a legitimate jittered departure can wait; raise it if you raise the interval. The first-seen time of the current stall lives in a sidecar state file (`<state file>.stall`), cleared when the condition clears and left untouched when the probe itself fails, so a compose-down or non-compose deployment never sees the alarm and a flapping probe cannot reset the clock. Stall alarms and their recovery ride the same debounce/re-alert/recovery machinery as every other condition.
+
 The monitor polls `HEALTH_URL` (default `http://127.0.0.1:8000/health`), and that URL must match where the gateway actually listens **as seen from the monitor's host**. The compose default publishes `127.0.0.1:8000` on the Docker host, so the default matches out of the box. If you change the gateway's publish address or port — or bind it elsewhere on bare metal — change `HEALTH_URL` with it, or the monitor alarms against a dead URL while the gateway is fine.
 
 Install:
@@ -687,7 +726,8 @@ sudo systemctl enable --now health-monitor.timer
 docker compose --profile calendar down        # stop; preserve volumes
 docker compose --profile calendar down -v     # stop and delete all volumes
                                               # WARNING: destroys onion key (address lost),
-                                              # otsd calendar state (proofs unverifiable),
+                                              # otsd calendar state (pending proofs can never
+                                              # upgrade; anchored proofs are unaffected),
                                               # and the gateway obligation log (pending
                                               # settled payments can no longer be recovered)
 ```

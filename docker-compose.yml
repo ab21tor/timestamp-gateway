@@ -10,7 +10,7 @@
 #     from its container (LAN node, host node via host.docker.internal, or
 #     an onion node via --profile onion-rpc).
 #   - the ops/ alarm timers (systemd) — without them /health reports
-#     wallet/proofs/backup as "absent": honest, not degraded. To run them
+#     wallet/proofs/backup as "absent": reported, not degraded. To run them
 #     on this host alongside compose, see GATEWAY_STATE_DIR below.
 #
 # The reference production deployment runs the gateway under systemd
@@ -81,9 +81,9 @@ services:
     # ports:
     #   - "127.0.0.1:9050:9050"
 
-  # ── OTS calendar backend (otsd) ── docker compose --profile calendar up -d
-  # The operator-controlled OpenTimestamps calendar server. This is the
-  # proof engine; the gateway is the paid front door to this service.
+  # OTS calendar backend (otsd): docker compose --profile calendar up -d
+  # The operator-controlled OpenTimestamps calendar server, which the
+  # gateway fronts.
   # Or point OTS_CALENDAR_URL at an external otsd instance and omit this
   # profile.
   #
@@ -117,6 +117,10 @@ services:
     # No -v: INFO is the production level — DEBUG ships commitment hexes and
     # wallet outpoints into the container log.
     command: ["python", "/app/otsd", "--rpc-address", "0.0.0.0", "--calendar", "/calendar", "--btc-conf-target", "12", "--btc-max-fee", "0.0002"]
+    # otsd's clean-exit path hangs off KeyboardInterrupt — SIGINT, not the
+    # compose-default SIGTERM, is what actually runs it.
+    stop_signal: SIGINT
+    stop_grace_period: 30s
     volumes:
       # Calendar state — the proof namespace. Destroying it strands every
       # pending proof this calendar has issued. Default: named volume; set
@@ -137,7 +141,7 @@ services:
       # uncomment with the wiring above.
       # - OTSD_ANCHOR_RECEIPTS=/anchor-receipts/anchor-receipts.jsonl
 
-  # ── socat bridge to an onion Bitcoin node ── --profile onion-rpc ──
+  # socat bridge to an onion Bitcoin node: --profile onion-rpc
   # For operators whose Bitcoin node exposes RPC as a Tor onion service
   # (Start9 and self-hosted-over-Tor setups — the reference deployment's
   # own shape). Forwards rpc-bridge:18332 on the compose network to your

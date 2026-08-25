@@ -6,7 +6,7 @@
 # — the full RPC URL including credentials. It must be owned by the SERVICE
 # USER below (User=gateway), mode 600 — NOT root: --env-file is read by the
 # docker client, which runs as that user, so a root-owned 600 file fails
-# with EACCES (hit live on the reference box, 2026-07-21). Docker reads the
+# with EACCES. Docker reads the
 # file directly (--env-file below), so the URL never appears on a command
 # line (ps/argv) and never in tracked files. Residual: `docker inspect
 # otsd` still shows the container's env to local root — unavoidable for
@@ -43,6 +43,12 @@ ExecStart=/usr/bin/docker run --name otsd --network host \
   --env-file /etc/systemd/system/otsd.env \
   otsd-local python3 otsd --calendar /calendar --btc-conf-target 12 --btc-max-fee 0.0002
 Restart=on-failure
+
+# Sandboxing for the docker CLI client (the container's own confinement is
+# docker's): full, not strict — the client needs its socket and config.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
 RestartSec=30
 
 [Install]

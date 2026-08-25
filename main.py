@@ -15,12 +15,12 @@ import requests
 import urllib3
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
 from pymacaroons import Macaroon, Verifier
 from pymacaroons.exceptions import MacaroonException
@@ -45,14 +45,15 @@ class GatewayConfig:
     lnd_port: str | None
     lnd_macaroon_hex: str | None
     tor_proxy: str | None
-    price_per_proof_sats: int
+    price_per_proof_sats: int | None
     stamper_fee_cap_sats: int
     pause_file: str
     lnd_tls_verify: bool
     ots_backend_mode: str
     ots_calendar_url: str | None
     lnd_readonly_macaroon_hex: str | None
-    l402_secret: bytes
+    l402_enabled: bool
+    l402_secret: bytes | None
     l402_token_expiry_seconds: int
     ots_submit_max_attempts: int
     ots_submit_backoff_seconds: float
@@ -71,7 +72,7 @@ class GatewayConfig:
     verify_rate_limit_per_minute: int
     gateway_behind_proxy: bool
     anchor_billing_enabled: bool
-    price_markup: float | None
+    per_record_sats: int | None
     anchor_receipts_path: str | None
     anchor_bills_token: str | None
 
@@ -94,7 +95,7 @@ def _parse_config() -> GatewayConfig:
     if missing:
         raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
 
-    # ── Retired pricing model (one warning, never a failure) ─────────────────
+    # Retired pricing model (one warning, never a failure)
     # The quote is the flat PRICE_PER_PROOF_SATS; the gateway reads no
     # feerates for any purpose. Old-model variables found in the environment
     # are named once and ignored, so no operator's env goes silently inert.
@@ -117,30 +118,56 @@ def _parse_config() -> GatewayConfig:
     if retired_present:
         logging.warning(
             "Retired pricing variables present and ignored: %s. The quote is "
-            "now the flat PRICE_PER_PROOF_SATS; the gateway reads no feerates.",
+            "now the flat PRICE_PER_PROOF_SATS; the gateway reads no feerates. "
+            "Remove them from .env.",
             ", ".join(retired_present),
         )
 
-    # ── Flat per-proof price ─────────────────────────────────────────────────
-    # Required with no default, like L402_SECRET_HEX: the price is an operator
-    # decision, and a silently defaulted one would misprice the shop.
-    price_per_proof_raw = os.getenv("PRICE_PER_PROOF_SATS")
-    if price_per_proof_raw is None or price_per_proof_raw == "":
-        raise RuntimeError(
-            "PRICE_PER_PROOF_SATS is required — the flat price in sats every "
-            "hash pays at submission. Size it with the operator guide's "
-            '"Pricing" arithmetic.'
+    # PRICE_MARKUP retired separately: its successor is the anchor-bill rate,
+    # not the quote, so the feerate-era message above would misname it. Same
+    # mechanics — fires only when itself explicitly set, never a failure.
+    if os.getenv("PRICE_MARKUP") not in (None, ""):
+        logging.warning(
+            "PRICE_MARKUP present and ignored: anchor bills are now "
+            "records × PER_RECORD_SATS. Remove it from .env."
         )
-    try:
-        price_per_proof = int(price_per_proof_raw)
-    except ValueError:
-        raise RuntimeError("PRICE_PER_PROOF_SATS must be an integer")
-    if price_per_proof < 0:
+
+    # L402 door switch. true (default): /timestamp charges the flat per-proof
+    # rate. false: records are stamped free and the per-record cost lands on
+    # the anchor bill (records × PER_RECORD_SATS per confirmed anchor, when
+    # billing is on). Strict true/false: a typo silently read as a mode would
+    # change what the door charges.
+    l402_enabled_raw = os.getenv("L402_ENABLED", "true").lower()
+    if l402_enabled_raw not in ("true", "false"):
         raise RuntimeError(
-            f"PRICE_PER_PROOF_SATS must be >= 0, got {price_per_proof}"
+            f"L402_ENABLED must be 'true' or 'false', got {l402_enabled_raw!r}"
         )
-    if price_per_proof == 0:
-        logging.warning("PRICE_PER_PROOF_SATS=0: the shop earns nothing per proof.")
+    l402_enabled = l402_enabled_raw == "true"
+
+    # Flat per-proof price. Required with no default when the door is on: the
+    # price is an operator decision. With the door off it is never read — an
+    # .env legitimately holds both modes' vars. Zero is refused: a token
+    # minted at 0 could never redeem (the price caveat regexes reject "0");
+    # the free door is L402_ENABLED=false.
+    price_per_proof: int | None = None
+    if l402_enabled:
+        price_per_proof_raw = os.getenv("PRICE_PER_PROOF_SATS")
+        if price_per_proof_raw is None or price_per_proof_raw == "":
+            raise RuntimeError(
+                "PRICE_PER_PROOF_SATS is required — the flat price in sats every "
+                "hash pays at submission. Size it with the operator guide's "
+                '"Pricing" arithmetic. To run a free door instead, set '
+                "L402_ENABLED=false."
+            )
+        try:
+            price_per_proof = int(price_per_proof_raw)
+        except ValueError:
+            raise RuntimeError("PRICE_PER_PROOF_SATS must be an integer")
+        if price_per_proof < 1:
+            raise RuntimeError(
+                f"PRICE_PER_PROOF_SATS must be >= 1, got {price_per_proof}. "
+                "For a free door set L402_ENABLED=false."
+            )
 
     pause_file = os.getenv("PAUSE_FILE", "/var/lib/timestamp-gateway/PAUSED")
 
@@ -161,35 +188,38 @@ def _parse_config() -> GatewayConfig:
             "set OTS_BACKEND_MODE=calendar to use a specific calendar backend"
         )
 
-    # ── L402 token signing key ────────────────────────────────────────────────
+    # L402 token signing key
     # Root key used to sign and verify L402 macaroons. It is required in
     # production: a stable key means a paid-but-not-yet-redeemed token still
     # verifies after a gateway restart. A random per-process key is allowed only
     # as an explicit development opt-out, because it would invalidate such tokens
-    # on every restart.
-    secret_hex = os.getenv("L402_SECRET_HEX") or None
-    allow_ephemeral = os.getenv("L402_ALLOW_EPHEMERAL_SECRET", "false").lower() == "true"
-    if secret_hex:
-        try:
-            l402_secret = bytes.fromhex(secret_hex)
-        except ValueError:
-            raise RuntimeError("L402_SECRET_HEX must be a hex string")
-        if len(l402_secret) < 16:
-            raise RuntimeError("L402_SECRET_HEX must decode to at least 16 bytes")
-    elif allow_ephemeral:
-        l402_secret = secrets.token_bytes(32)
-        logging.warning(
-            "L402_SECRET_HEX is not set and L402_ALLOW_EPHEMERAL_SECRET=true; using a "
-            "random per-process key. Paid-but-unredeemed tokens will not verify after a "
-            "restart. Development only."
-        )
-    else:
-        raise RuntimeError(
-            "L402_SECRET_HEX is required. Generate one with "
-            "`python -c \"import secrets; print(secrets.token_hex(32))\"`. "
-            "For development only, set L402_ALLOW_EPHEMERAL_SECRET=true to use a "
-            "random per-process key instead."
-        )
+    # on every restart. Never read with the door off — no token is minted or
+    # verified there.
+    l402_secret: bytes | None = None
+    if l402_enabled:
+        secret_hex = os.getenv("L402_SECRET_HEX") or None
+        allow_ephemeral = os.getenv("L402_ALLOW_EPHEMERAL_SECRET", "false").lower() == "true"
+        if secret_hex:
+            try:
+                l402_secret = bytes.fromhex(secret_hex)
+            except ValueError:
+                raise RuntimeError("L402_SECRET_HEX must be a hex string")
+            if len(l402_secret) < 16:
+                raise RuntimeError("L402_SECRET_HEX must decode to at least 16 bytes")
+        elif allow_ephemeral:
+            l402_secret = secrets.token_bytes(32)
+            logging.warning(
+                "L402_SECRET_HEX is not set and L402_ALLOW_EPHEMERAL_SECRET=true; using a "
+                "random per-process key. Paid-but-unredeemed tokens will not verify after a "
+                "restart. Development only."
+            )
+        else:
+            raise RuntimeError(
+                "L402_SECRET_HEX is required. Generate one with "
+                "`python -c \"import secrets; print(secrets.token_hex(32))\"`. "
+                "For development only, set L402_ALLOW_EPHEMERAL_SECRET=true to use a "
+                "random per-process key instead."
+            )
 
     try:
         l402_expiry = int(os.getenv("L402_TOKEN_EXPIRY_SECONDS", "3600"))
@@ -198,7 +228,7 @@ def _parse_config() -> GatewayConfig:
     if l402_expiry <= 0:
         raise RuntimeError("L402_TOKEN_EXPIRY_SECONDS must be a positive integer")
 
-    # ── OTS submission retry (otsd-not-ready resilience) ──────────────────────
+    # OTS submission retry (otsd-not-ready resilience)
     try:
         ots_max_attempts = int(os.getenv("OTS_SUBMIT_MAX_ATTEMPTS", "5"))
     except ValueError:
@@ -224,7 +254,7 @@ def _parse_config() -> GatewayConfig:
         or None
     )
 
-    # ── Durable obligation log ────────────────────────────────────────────────
+    # Durable obligation log
     # Path to the SQLite obligation store and how often the backstop sweeper
     # retries obligations left in needs_stamp. The store is what guarantees a
     # settled payment is never lost if calendar submission fails.
@@ -238,7 +268,7 @@ def _parse_config() -> GatewayConfig:
     if obligation_sweep_interval <= 0:
         raise RuntimeError("OBLIGATION_SWEEP_INTERVAL must be a positive integer")
 
-    # ── Wallet liquidity alarm (file-mediated; NO Bitcoin RPC from the gateway)
+    # Wallet liquidity alarm (file-mediated; NO Bitcoin RPC from the gateway)
     # /health reads the status file written by ops/wallet-balance-check.sh.
     # The gateway never holds a wallet credential and makes no Bitcoin RPC
     # calls at all. Its one scoped credential is PHOENIXD_HTTP_PASSWORD_LIMITED
@@ -270,7 +300,7 @@ def _parse_config() -> GatewayConfig:
 
     # /health reads the status file written by ops/backup-live-state.sh (the
     # backup timer). Same file-mediated pattern as the wallet alarm. Max age
-    # defaults to 2x the daily timer, the established convention.
+    # defaults to 2x the daily timer.
     backup_status_path = os.getenv(
         "BACKUP_STATUS_PATH", "/var/lib/timestamp-gateway/backup-status"
     )
@@ -281,10 +311,10 @@ def _parse_config() -> GatewayConfig:
     if backup_status_max_age <= 0:
         raise RuntimeError("BACKUP_STATUS_MAX_AGE_SECONDS must be a positive integer")
 
-    # ── Stamper fee cap (float backstop thresholds only) ─────────────────────
+    # Stamper fee cap (float backstop thresholds only)
     # Mirrors otsd's --btc-max-fee flag: the most one anchor cycle can spend.
-    # The flag takes BTC and this takes sats (0.0002 BTC = 20,000 sats — keep
-    # the two in sync; never "fix" 0.0002 to 20000). The gateway uses it only
+    # The flag takes BTC and this takes sats (0.0002 BTC = 20,000 sats; keep
+    # the two in sync). The gateway uses it only
     # to derive the float backstop thresholds; it makes no Bitcoin RPC calls.
     try:
         stamper_fee_cap = int(os.getenv("STAMPER_FEE_CAP_SATS", "20000"))
@@ -295,7 +325,7 @@ def _parse_config() -> GatewayConfig:
             f"STAMPER_FEE_CAP_SATS must be a positive integer, got {stamper_fee_cap}"
         )
 
-    # ── Invoice-mint rate limit ───────────────────────────────────────────────
+    # Invoice-mint rate limit
     # Per-IP token bucket on the unauthenticated 402 path. Every anonymous
     # request makes phoenixd sign AND durably store an invoice, so minting is
     # the one request whose backend cost is not bounded by payment. 0 disables.
@@ -335,11 +365,10 @@ def _parse_config() -> GatewayConfig:
         )
     gateway_behind_proxy = behind_proxy_raw == "true"
 
-    # ── Anchor billing (part two of the pricing model) ───────────────────────
+    # Anchor billing (part two of the pricing model)
     # Off by default: disabled means the three billing vars are never read and
-    # every behavior stays byte-identical. Strict bool like
-    # GATEWAY_BEHIND_PROXY — a typo silently treated as false would turn the
-    # billing ledger off without a word.
+    # every behavior stays byte-identical. Strict true/false: a typo silently
+    # treated as false would turn billing off without a word.
     anchor_billing_raw = os.getenv("ANCHOR_BILLING_ENABLED", "false").lower()
     if anchor_billing_raw not in ("true", "false"):
         raise RuntimeError(
@@ -347,17 +376,17 @@ def _parse_config() -> GatewayConfig:
         )
     anchor_billing_enabled = anchor_billing_raw == "true"
 
-    price_markup: float | None = None
+    per_record_sats: int | None = None
     anchor_receipts_path: str | None = None
     anchor_bills_token: str | None = None
     if anchor_billing_enabled:
         # All three are operator decisions with no sane default. Every missing
         # one is named in a single error so the operator fixes them in one pass.
         missing_billing = []
-        if not os.getenv("PRICE_MARKUP"):
+        if not os.getenv("PER_RECORD_SATS"):
             missing_billing.append(
-                "PRICE_MARKUP — the ratio applied to each anchor's actual cost "
-                "(a float >= 1.0; 1.5 bills the standing payer 150% of the fee)"
+                "PER_RECORD_SATS — the price in sats per record inside each "
+                "anchor (a bill is records × this rate)"
             )
         if not os.getenv("ANCHOR_RECEIPTS_PATH"):
             missing_billing.append(
@@ -373,17 +402,38 @@ def _parse_config() -> GatewayConfig:
             raise RuntimeError(
                 "ANCHOR_BILLING_ENABLED=true requires: " + "; ".join(missing_billing)
             )
+        # Same rule as PRICE_PER_PROOF_SATS: integer >= 1; zero is refused.
         try:
-            price_markup = float(os.getenv("PRICE_MARKUP"))
+            per_record_sats = int(os.getenv("PER_RECORD_SATS"))
         except ValueError:
-            raise RuntimeError("PRICE_MARKUP must be a number (e.g. 1.5)")
-        if not (math.isfinite(price_markup) and price_markup >= 1.0):
+            raise RuntimeError("PER_RECORD_SATS must be an integer")
+        if per_record_sats < 1:
             raise RuntimeError(
-                f"PRICE_MARKUP must be a finite number >= 1.0 — below 1.0 the "
-                f"shop sells anchors at a loss — got {price_markup}"
+                f"PER_RECORD_SATS must be >= 1, got {per_record_sats}. "
+                "To bill nothing set ANCHOR_BILLING_ENABLED=false."
             )
         anchor_receipts_path = os.getenv("ANCHOR_RECEIPTS_PATH")
         anchor_bills_token = os.getenv("ANCHOR_BILLS_TOKEN")
+
+    # Mode announcement (free door)
+    # One line at startup naming what charges. Free door with billing on is
+    # INFO: the anchor bill carries the per-record cost. Free door with
+    # billing off means nothing charges anywhere — a valid choice (a
+    # subsidising operator), named once at WARNING, never silent; the warning
+    # replaces the INFO line so each mode is announced exactly once.
+    if not l402_enabled:
+        if anchor_billing_enabled:
+            logging.info(
+                "L402_ENABLED=false: free door — records are stamped free of "
+                "charge; anchor billing carries the charges (records × "
+                "PER_RECORD_SATS per confirmed anchor)."
+            )
+        else:
+            logging.warning(
+                "L402_ENABLED=false and ANCHOR_BILLING_ENABLED=false: nothing "
+                "charges anywhere — the door is free and no anchor bills are "
+                "minted."
+            )
 
     return GatewayConfig(
         lnd_host=os.getenv("LND_HOST"),
@@ -398,6 +448,7 @@ def _parse_config() -> GatewayConfig:
         ots_calendar_url=calendar_url,
         # optional; falls back to LND_MACAROON_HEX
         lnd_readonly_macaroon_hex=os.getenv("LND_READONLY_MACAROON_HEX") or None,
+        l402_enabled=l402_enabled,
         l402_secret=l402_secret,
         l402_token_expiry_seconds=l402_expiry,
         ots_submit_max_attempts=ots_max_attempts,
@@ -417,7 +468,7 @@ def _parse_config() -> GatewayConfig:
         verify_rate_limit_per_minute=verify_rate_limit_per_minute,
         gateway_behind_proxy=gateway_behind_proxy,
         anchor_billing_enabled=anchor_billing_enabled,
-        price_markup=price_markup,
+        per_record_sats=per_record_sats,
         anchor_receipts_path=anchor_receipts_path,
         anchor_bills_token=anchor_bills_token,
     )
@@ -440,6 +491,7 @@ LND_TLS_VERIFY = _CONFIG.lnd_tls_verify
 OTS_BACKEND_MODE = _CONFIG.ots_backend_mode
 OTS_CALENDAR_URL = _CONFIG.ots_calendar_url
 LND_READONLY_MACAROON_HEX = _CONFIG.lnd_readonly_macaroon_hex
+L402_ENABLED = _CONFIG.l402_enabled
 L402_SECRET = _CONFIG.l402_secret
 L402_TOKEN_EXPIRY_SECONDS = _CONFIG.l402_token_expiry_seconds
 OTS_SUBMIT_MAX_ATTEMPTS = _CONFIG.ots_submit_max_attempts
@@ -459,7 +511,7 @@ RATE_LIMIT_PER_MINUTE = _CONFIG.rate_limit_per_minute
 VERIFY_RATE_LIMIT_PER_MINUTE = _CONFIG.verify_rate_limit_per_minute
 GATEWAY_BEHIND_PROXY = _CONFIG.gateway_behind_proxy
 ANCHOR_BILLING_ENABLED = _CONFIG.anchor_billing_enabled
-PRICE_MARKUP = _CONFIG.price_markup
+PER_RECORD_SATS = _CONFIG.per_record_sats
 ANCHOR_RECEIPTS_PATH = _CONFIG.anchor_receipts_path
 ANCHOR_BILLS_TOKEN = _CONFIG.anchor_bills_token
 
@@ -490,7 +542,7 @@ def _proof_cache_put(payment_hash: str, ots_bytes: bytes) -> None:
     _proof_cache[payment_hash] = ots_bytes
 
 
-# ── Invoice-mint rate limiter ─────────────────────────────────────────────────
+# Invoice-mint rate limiter
 # Per-IP token bucket guarding the unauthenticated mint path. Every anonymous
 # POST /timestamp makes phoenixd sign a bolt11 and persist an invoice row in its
 # own database, so minting is the one request whose backend cost is not bounded
@@ -560,7 +612,7 @@ def _verify_rate_limit_retry_after(ip: str) -> int | None:
     return _bucket_retry_after(_verify_rate_buckets, ip, VERIFY_RATE_LIMIT_PER_MINUTE)
 
 
-# ── Durable obligation log ────────────────────────────────────────────────────
+# Durable obligation log
 # A SQLite table recording each settled payment as an obligation to stamp. The
 # in-memory _proof_cache is the instant re-serve path; this DB is the durable
 # backstop. When a payment settles but stamping fails (e.g. otsd down past the
@@ -605,6 +657,15 @@ def init_obligation_db() -> None:
                 )
                 """
             )
+            # The sweeper's scan (WHERE status='needs_stamp') must not decay
+            # into a full-table walk as years of stamped history accumulate.
+            # A partial index holds only un-swept rows — near-empty in steady
+            # state — and IF NOT EXISTS is the whole migration on an existing
+            # database: the index builds once at the next startup.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS obligations_needs_stamp "
+                "ON obligations(payment_hash) WHERE status='needs_stamp'"
+            )
             # Gated on the flag, not created unconditionally: with billing
             # disabled the gateway must stay byte-identical, including the
             # bytes of a disabled operator's obligations.db.
@@ -617,6 +678,7 @@ def init_obligation_db() -> None:
                         commitments        INTEGER NOT NULL,
                         confirmed_height   INTEGER NOT NULL,
                         confirmed_at       INTEGER NOT NULL,
+                        records            INTEGER,
                         amount_sats        INTEGER NOT NULL,
                         payment_hash       TEXT,
                         bolt11             TEXT,
@@ -627,6 +689,17 @@ def init_obligation_db() -> None:
                     )
                     """
                 )
+                # Additive upgrade for a markup-era table: records is NULL on
+                # rows billed under the old formula — their stored amounts
+                # stay untouched (nullable column, no rewrite).
+                cols = [
+                    row[1]
+                    for row in conn.execute("PRAGMA table_info(anchor_bills)")
+                ]
+                if "records" not in cols:
+                    conn.execute(
+                        "ALTER TABLE anchor_bills ADD COLUMN records INTEGER"
+                    )
             conn.commit()
         finally:
             conn.close()
@@ -652,7 +725,6 @@ def record_obligation(payment_hash: str, digest: str) -> None:
 
 
 def mark_obligation_stamped(payment_hash: str) -> None:
-    """Mark an obligation complete after a successful stamp."""
     conn = _obligation_connect()
     try:
         conn.execute(
@@ -713,10 +785,8 @@ def _sweep_obligations_once() -> None:
 
 
 def _sweeper_tick() -> None:
-    """One sweeper cycle, pause-aware. Full-stop ruling (2026-07-22): PAUSED
-    silences the sweeper too — and the float backstop's auto-pause borrows
-    the same semantics. Nothing is dropped: 'needs_stamp' rows keep and wait
-    for unpause or recovery, like the rest of the machine."""
+    """One sweeper cycle. PAUSED and the float auto-pause both skip it;
+    'needs_stamp' rows wait for unpause or recovery — nothing is dropped."""
     if is_paused():
         logging.info("Sweeper: gateway paused; skipping sweep")
         return
@@ -755,7 +825,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
-app.mount("/ui", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="ui")
 
 
 def is_paused() -> bool:
@@ -764,17 +833,11 @@ def is_paused() -> bool:
 
 @app.middleware("http")
 async def _pause_gate(request, call_next):
-    # Full-stop ruling (2026-07-22): PAUSED means the gateway answers /health
-    # and nothing else. Bitcoin has no partial liveness — a node is either in
-    # consensus or absent, and absence takes nothing because state is durable.
-    # Ruling 1 (settlement outranks expiry) makes that guarantee here: paid
-    # tokens redeem after unpause; recorded obligations wait in the log.
-    #
-    # The float backstop borrows the same full-stop semantics as its OWN
-    # state: the machine never touches the operator's PAUSED file, and the
-    # auto-pause clears itself when the wallet-status file shows the balance
-    # recovered — machine protection and operator intent never overwrite
-    # each other.
+    # PAUSED (the operator's file) and the float auto-pause both stop
+    # everything except /health. Nothing is dropped: paid tokens redeem after
+    # unpause and recorded obligations wait in the log. The auto-pause never
+    # touches the operator's file and clears itself when the wallet-status
+    # file shows the balance recovered.
     if request.url.path != "/health":
         if is_paused():
             return JSONResponse(status_code=503, content={"detail": "Gateway is paused by operator"})
@@ -819,13 +882,13 @@ def _wallet_status() -> str:
     return status
 
 
-# ── Float backstop ───────────────────────────────────────────────────────────
-# The anchor wallet is the machine's float. Its balance is read from the SAME
+# Float backstop
+# The anchor wallet funds anchoring. Its balance is read from the SAME
 # wallet-status file the liquidity alarm uses (ops/wallet-balance-check.sh) —
 # the gateway holds no wallet credential and makes no Bitcoin RPC calls.
 # Thresholds derive from STAMPER_FEE_CAP_SATS (the most one anchor cycle can
-# spend): below 5 × cap the float is an alarm; below 1 × cap the machine
-# cannot be sure of affording its next anchor cycle, so it full-stops itself.
+# spend): below 5 × cap the float is an alarm; below 1 × cap the next anchor
+# cycle may be unaffordable, so the gateway stops itself.
 
 _FLOAT_ALARM_CAP_MULTIPLE = 5
 _FLOAT_STOP_CAP_MULTIPLE = 1
@@ -835,8 +898,8 @@ def _wallet_balance_sats() -> int | None:
     """The last balance reading from the wallet-status file, or None when no
     reading is available (file absent, unreadable, or balance null — the
     script writes null when its RPC fails). Freshness is deliberately not
-    consulted: the last reading stands until replaced (ruled 2026-07-27);
-    staleness alarms separately through the wallet field."""
+    consulted: the last reading stands until replaced; staleness alarms
+    separately through the wallet field."""
     try:
         data = json.loads(Path(WALLET_STATUS_PATH).read_text())
     except Exception:
@@ -854,7 +917,7 @@ def _float_state() -> str:
       stop     — below 1 × cap: automatic full stop (own state, distinct from
                  the operator's PAUSED file; clears itself on recovery)
       inactive — no balance reading available (e.g. the ops timers are not
-                 installed): backstop off, reported honestly, never degrades
+                 installed): backstop off, reported, never degrades
     """
     balance = _wallet_balance_sats()
     if balance is None:
@@ -875,7 +938,7 @@ def _proofs_status() -> str:
 
     File-mediated like the wallet alarm: the sweep timer scans and upgrades the
     proof artifacts; /health only reads the file it leaves behind. Returns one of:
-      ok        — every proof is anchored or honestly waiting for Bitcoin
+      ok        — every proof is anchored or still waiting for Bitcoin
       mismatch  — the calendar holds an attestation some artifact lacks
       attention — a proof is in a state the sweep cannot classify
       unknown   — the file is unreadable or malformed
@@ -909,7 +972,7 @@ def _backup_status() -> str:
     and pushes; /health only reads the file it leaves behind. Returns one of:
       ok         — archive created, encrypted, pushed off-box
       local_only — archive created but kept on this box (a configuration
-                   choice, honestly reported; does not degrade health)
+                   choice; reported, does not degrade health)
       attention  — a backup exists but degraded (its detail field says why)
       failed     — the run produced no usable archive
       unknown    — the file is unreadable or malformed
@@ -1121,8 +1184,7 @@ def _upgrade_ots_bytes(digest: str, ots_bytes: bytes) -> dict:
     return result("pending", original_b64)
 
 
-# ── L402 token (macaroon) ────────────────────────────────────────────────────
-
+# L402 token (macaroon)
 def _caveat_text(caveat_id) -> str:
     """pymacaroons stores caveat ids as str or bytes depending on version; normalize."""
     if isinstance(caveat_id, bytes):
@@ -1152,11 +1214,10 @@ def _caveat_value(m: Macaroon, key: str) -> str | None:
 
 
 def _expiry_satisfier(caveat_id) -> bool:
-    # Ruled 2026-07-22: settlement outranks expiry. A client who already paid
-    # is owed the proof (the machine's own pinned promise). The expiry caveat
-    # is advisory: it mirrors the unpaid invoice's own Lightning lifetime.
-    # Redemption is gated by the settlement check, never this clock.
-    # Format-only, like _payment_hash_satisfier.
+    # Settlement outranks expiry: a client who paid is owed the proof. The
+    # expiry caveat is advisory — it mirrors the unpaid invoice's Lightning
+    # lifetime — and redemption is gated by the settlement check, never this
+    # clock. Format-only, like _payment_hash_satisfier.
     return re.fullmatch(r"expiry=[0-9]+", _caveat_text(caveat_id)) is not None
 
 
@@ -1174,8 +1235,9 @@ def verify_l402_token(macaroon_b64: str, digest: str) -> tuple[str, int]:
     Checks token integrity (signature), the digest binding, the capability
     binding, and the expiry. The price is read from the macaroon's own signed
     caveat rather than compared to the current configured price: a token minted
-    at price N validates at N whenever its settled invoice backs it, so repricing between challenge and
-    payment never strands an in-flight invoice. The HMAC prevents a client
+    at price N validates at N whenever its settled invoice backs it, so
+    repricing between challenge and payment never strands an in-flight
+    invoice. The HMAC prevents a client
     from lowering the caveat; what the mint-time price must buy is enforced
     against the settled invoice in verify_payment. On success returns
     (payment_hash, mint_time_price_sats). Any invalid, tampered, or
@@ -1183,15 +1245,22 @@ def verify_l402_token(macaroon_b64: str, digest: str) -> tuple[str, int]:
     not a payment one."""
     try:
         m = Macaroon.deserialize(macaroon_b64)
-    except Exception:
-        logging.exception("L402 macaroon could not be parsed")
+    except Exception as exc:
+        # Unauthenticated input: one WARNING, no traceback — a stranger must not
+        # be able to write ERROR-level stack traces into the journal at will.
+        logging.warning("L402 macaroon could not be parsed: %r", exc)
         raise HTTPException(status_code=401, detail="Invalid L402 token")
 
-    payment_hash = _caveat_value(m, "payment_hash")
+    try:
+        payment_hash = _caveat_value(m, "payment_hash")
+        price_str = _caveat_value(m, "price")
+    except Exception as exc:
+        logging.warning("L402 macaroon caveats could not be read: %r", exc)
+        raise HTTPException(status_code=401, detail="Invalid L402 token")
+
     if not payment_hash or not re.fullmatch(r"[0-9a-f]{64}", payment_hash):
         raise HTTPException(status_code=401, detail="Invalid L402 token")
 
-    price_str = _caveat_value(m, "price")
     if not price_str or not re.fullmatch(r"[1-9][0-9]*", price_str):
         raise HTTPException(status_code=401, detail="Invalid L402 token")
 
@@ -1222,7 +1291,7 @@ def parse_l402_auth(auth: str) -> tuple[str, str] | None:
     return m.group(1), m.group(2).lower()
 
 
-# ── Pricing ──────────────────────────────────────────────────────────────────
+# Pricing
 # Flat rate: every hash pays PRICE_PER_PROOF_SATS at submission. The quote
 # consults nothing else — no feerate, no estimator, no floor logic; the
 # gateway makes no Bitcoin RPC calls. Anchoring costs are the operator's side
@@ -1235,14 +1304,13 @@ def quoted_price_sats() -> int:
     return PRICE_PER_PROOF_SATS
 
 
-# ── Payment backend abstraction ──────────────────────────────────────────────
+# Payment backend abstraction
 # Typed result objects and the operations the gateway depends on from a Lightning
 # node, so endpoint logic doesn't depend on any one node implementation.
 
 
 @dataclass(frozen=True)
 class Invoice:
-    """A newly created Lightning invoice."""
     bolt11: str
     payment_hash: str
 
@@ -1254,10 +1322,9 @@ class InvoiceStatus:
     ``expired`` is ``None`` when the backend exposes no expiry signal,
     distinguishing "not expired" from "unknown".
 
-    Two amounts, deliberately not one: the old single ``amount_paid_sat``
-    conflated what the customer paid with what our wallet was credited, and
-    "paid" was the lie — phoenixd reports the credited amount NET of any ACINQ
-    liquidity fee, so a fully paid invoice could look underpaid.
+    Two amounts, not one: phoenixd reports the credited amount net of any
+    ACINQ liquidity fee, so a fully paid invoice would look underpaid if the
+    face amount and the credited amount were conflated.
     """
     settled: bool
     # The invoice's face amount — what the gateway itself minted at quote
@@ -1269,6 +1336,29 @@ class InvoiceStatus:
     amount_received_sat: int
     memo: str | None
     expired: bool | None
+
+
+# The last real invoice mint the gateway attempted, recorded inside both
+# backends' create_invoice (the L402 challenge and anchor-bill minting both
+# land there). /health derives its payment field from this record, not from
+# a reachability probe: getinfo can answer ok while createinvoice is wedged,
+# and minting is the capability the field vouches for. Passive — no prober,
+# no timers — so a freshly started gateway reports "unknown" until the first
+# real mint. Replaced wholesale on every attempt (never mutated in place) so
+# /health always reads one consistent snapshot.
+_last_mint = {"result": None, "at": None, "detail": None}
+
+
+def _record_mint(result: str, detail: str | None = None) -> None:
+    """Record the outcome of a real mint attempt: result "ok"/"failed", a UTC
+    timestamp, and a short failure reason (exception class name; the full
+    traceback is already in the log)."""
+    global _last_mint
+    _last_mint = {
+        "result": result,
+        "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "detail": detail,
+    }
 
 
 class PaymentBackend(Protocol):
@@ -1292,8 +1382,7 @@ class LndPaymentBackend:
 
     Reads the ``LND_*`` / ``TOR_PROXY`` / ``LND_TLS_VERIFY`` module globals at call
     time (not construction) so configuration stays patchable and the backend never
-    holds a stale copy of connection settings. Wire behavior is preserved exactly
-    from the prior module-level functions.
+    holds a stale copy of connection settings.
     """
 
     def _proxies(self):
@@ -1316,8 +1405,11 @@ class LndPaymentBackend:
             payment_request = data["payment_request"]
             # LND returns r_hash as standard base64 over REST; normalize to hex.
             payment_hash = base64.b64decode(data["r_hash"]).hex()
-            return Invoice(bolt11=payment_request, payment_hash=payment_hash)
-        except Exception:
+            invoice = Invoice(bolt11=payment_request, payment_hash=payment_hash)
+            _record_mint("ok")
+            return invoice
+        except Exception as exc:
+            _record_mint("failed", type(exc).__name__)
             logging.exception("LND invoice creation failed")
             raise HTTPException(status_code=502, detail="LND error: could not create invoice")
 
@@ -1359,8 +1451,6 @@ class LndPaymentBackend:
 
 
 class PhoenixdPaymentBackend:
-    """PaymentBackend backed by the phoenixd HTTP API."""
-
     def _auth(self):
         return (
             ("", PHOENIXD_HTTP_PASSWORD_LIMITED)
@@ -1383,11 +1473,14 @@ class PhoenixdPaymentBackend:
             )
             resp.raise_for_status()
             data = resp.json()
-            return Invoice(
+            invoice = Invoice(
                 bolt11=data["serialized"],
                 payment_hash=data["paymentHash"].lower(),
             )
-        except Exception:
+            _record_mint("ok")
+            return invoice
+        except Exception as exc:
+            _record_mint("failed", type(exc).__name__)
             logging.exception("phoenixd invoice creation failed")
             raise HTTPException(
                 status_code=502,
@@ -1538,14 +1631,16 @@ def verify_payment(payment_hash: str, digest: str, price_sats: int) -> bool:
     )
 
 
-# ── Anchor billing (part two of the pricing model) ────────────────────────────
-# The calendar fork records what each confirmed anchor actually cost in an
-# append-only JSONL receipts file (its OTSD_ANCHOR_RECEIPTS). With billing
-# enabled, the gateway ingests those receipts into the anchor_bills table and
-# bills the standing payer ceil(fee_sats × PRICE_MARKUP) per anchor. Invoices
-# are minted on poll of GET /anchor-bills, never at ingestion; settlement is
-# checked on the same poll through the existing payment backend. Billing state
-# gates nothing: sales, stamping, and redemption never consult this table.
+# Anchor billing (part two of the pricing model)
+# The calendar fork writes a receipt line per confirmed anchor into an
+# append-only JSONL file (its OTSD_ANCHOR_RECEIPTS), including "records" —
+# the number of digest submissions inside that anchor's tree (0 = the fork
+# could not prove a count; it errs low by design). With billing enabled, the
+# gateway ingests those receipts into the anchor_bills table and bills the
+# standing payer records × PER_RECORD_SATS per anchor. Invoices are minted on
+# poll of GET /anchor-bills, never at ingestion; settlement is checked on the
+# same poll through the existing payment backend. Billing state gates
+# nothing: sales, stamping, and redemption never consult this table.
 
 # A bill is overdue for /health once unpaid for 24h past its anchor's own
 # confirmed_at — a hardcoded bookkeeping alarm, not an enforcement clock.
@@ -1561,28 +1656,33 @@ _ANCHOR_RECEIPT_FIELDS = (
     ("commitments", int),
     ("confirmed_height", int),
     ("confirmed_at", int),
+    ("records", int),
 )
 
 
-def _ingest_anchor_receipts() -> None:
-    """Ingest the fork's anchor receipts into anchor_bills.
+def _ingest_anchor_receipts() -> int:
+    """Ingest the fork's anchor receipts into anchor_bills. Returns the
+    number of lines rejected as malformed this pass — recounted from the
+    file every time, so the counter clears when the file is fixed.
 
-    INSERT OR IGNORE keyed on txid does double duty: the fork's crash
-    semantics prefer a duplicate receipt line over a missed one (its
-    duplicates dedupe here, for free), and amount_sats is computed exactly
-    once — the bill's mint-time amount, immutable across later markup
-    changes, the same law as the quote.
-
-    An absent file is healthy (billing on, no anchors yet). A malformed line
-    is skipped with a warning and never blocks the rest. Raises only for an
+    INSERT OR IGNORE keyed on txid dedupes the fork's crash-preferred
+    duplicate lines, and amount_sats is computed exactly once: the bill's
+    mint-time amount, immutable across later rate changes, like the quote.
+    records=0 (the fork could not prove a count) is never billed — no row,
+    a warning naming the txid — and is not counted as rejected: the line is
+    well-formed and permanent in the append-only file. A line missing
+    records (an un-upgraded fork) is malformed and skipped with a warning,
+    so an old five-field receipts file never bills. An absent file is
+    healthy (billing on, no anchors yet). Raises only for an
     unreadable-but-present file or a failing DB — the caller classifies that
     as billing "error"."""
     try:
         with open(ANCHOR_RECEIPTS_PATH, "r") as fd:
             lines = fd.readlines()
     except FileNotFoundError:
-        return
+        return 0
 
+    rejected = 0
     conn = _obligation_connect()
     try:
         for lineno, line in enumerate(lines, 1):
@@ -1597,40 +1697,82 @@ def _ingest_anchor_receipts() -> None:
                         receipt[field], bool
                     ):
                         raise ValueError(f"bad {field}")
+                # The fork cannot produce a negative count: malformed.
+                if receipt["records"] < 0:
+                    raise ValueError("bad records")
             except (ValueError, KeyError) as exp:
+                rejected += 1
                 logging.warning(
                     "Anchor receipt line %d skipped (malformed): %r", lineno, exp
+                )
+                continue
+            if receipt["records"] == 0:
+                logging.warning(
+                    "Anchor receipt %s not billed: the fork could not prove "
+                    "a record count (records=0)",
+                    receipt["txid"],
                 )
                 continue
             conn.execute(
                 "INSERT OR IGNORE INTO anchor_bills "
                 "(txid, fee_sats, commitments, confirmed_height, confirmed_at, "
-                "amount_sats, status) VALUES (?, ?, ?, ?, ?, ?, 'unpaid')",
+                "records, amount_sats, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'unpaid')",
                 (
                     receipt["txid"],
                     receipt["fee_sats"],
                     receipt["commitments"],
                     receipt["confirmed_height"],
                     receipt["confirmed_at"],
-                    math.ceil(receipt["fee_sats"] * PRICE_MARKUP),
+                    receipt["records"],
+                    receipt["records"] * PER_RECORD_SATS,
                 ),
             )
         conn.commit()
     finally:
         conn.close()
+    return rejected
 
 
 def _store_anchor_bill_invoice(
-    txid: str, payment_hash: str, bolt11: str, created_at: int
-) -> None:
+    txid: str, payment_hash: str, bolt11: str, created_at: int,
+    expected_hash: str | None,
+) -> bool:
+    """Attach a freshly minted invoice to a bill — only if the row still
+    holds what this poll read (expected_hash; None = no invoice yet, the
+    IS NULL arm). Two concurrent polls can both decide to mint for one
+    bill; the conditional WHERE makes exactly one store win. Returns False
+    to the loser, which must re-read and serve the winner's invoice: a
+    blind overwrite would orphan an invoice the payer may already hold —
+    paid, it would settle invisibly (no poll ever checks a replaced hash),
+    the bill would re-serve as unpaid, and one anchor would be paid twice.
+    The losing mint is never stored and never served; it dies unpaid at
+    its own Lightning expiry."""
     conn = _obligation_connect()
     try:
-        conn.execute(
+        cur = conn.execute(
             "UPDATE anchor_bills SET payment_hash=?, bolt11=?, "
-            "invoice_created_at=? WHERE txid=?",
-            (payment_hash, bolt11, created_at, txid),
+            "invoice_created_at=? "
+            "WHERE txid=? AND (payment_hash IS NULL OR payment_hash=?)",
+            (payment_hash, bolt11, created_at, txid, expected_hash),
         )
         conn.commit()
+        return cur.rowcount == 1
+    finally:
+        conn.close()
+
+
+def _read_anchor_bill_invoice(txid: str) -> tuple[str | None, str | None, int | None]:
+    """The bill's stored (payment_hash, bolt11, invoice_created_at) — what a
+    poll that lost the mint race serves instead of its own orphaned mint."""
+    conn = _obligation_connect()
+    try:
+        row = conn.execute(
+            "SELECT payment_hash, bolt11, invoice_created_at "
+            "FROM anchor_bills WHERE txid=?",
+            (txid,),
+        ).fetchone()
+        return (row[0], row[1], row[2]) if row else (None, None, None)
     finally:
         conn.close()
 
@@ -1647,23 +1789,32 @@ def _mark_anchor_bill_paid(txid: str, paid_at: int) -> None:
         conn.close()
 
 
-def _billing_status() -> str:
-    """Classify anchor billing for /health. Returns one of:
-      off     — ANCHOR_BILLING_ENABLED=false; reported, never degrades
-      ok      — receipts ingestable, no unpaid bill older than 24h
-      overdue — an unpaid bill has sat >24h past its anchor's confirmed_at
-                (bookkeeping alarm; sales are never gated by billing state)
-      error   — the receipts file is present but unreadable, or the bills
-                table cannot be read, with billing on
+def _billing_status() -> tuple[str, int, int]:
+    """Classify anchor billing for /health. Returns (status, bills, rejected)
+    where bills is the total rows in anchor_bills, rejected the receipt
+    lines rejected as malformed this pass, and status one of:
+      off      — ANCHOR_BILLING_ENABLED=false; reported, never degrades
+      ok       — receipts ingestable, nothing rejected, no unpaid bill
+                 older than 24h. With bills 0 this is "no receipts yet",
+                 distinct from rejection.
+      rejected — receipt lines are being rejected as malformed (rejected
+                 > 0); degrades. overdue and error outrank it.
+      overdue  — an unpaid bill has sat >24h past its anchor's confirmed_at
+                 (bookkeeping alarm; sales are never gated by billing state)
+      error    — the receipts file is present but unreadable, or the bills
+                 table cannot be read, with billing on
     Ingests receipts itself so overdue is seen even if the payer never
     polls, but never mints invoices — minting is poll-only.
     Never raises — /health must never crash."""
     if not ANCHOR_BILLING_ENABLED:
-        return "off"
+        return "off", 0, 0
     try:
-        _ingest_anchor_receipts()
+        rejected = _ingest_anchor_receipts()
         conn = _obligation_connect()
         try:
+            bills = conn.execute(
+                "SELECT COUNT(*) FROM anchor_bills"
+            ).fetchone()[0]
             overdue = conn.execute(
                 "SELECT COUNT(*) FROM anchor_bills "
                 "WHERE status='unpaid' AND confirmed_at < ?",
@@ -1673,8 +1824,12 @@ def _billing_status() -> str:
             conn.close()
     except Exception:
         logging.warning("Health check: anchor billing unreadable", exc_info=True)
-        return "error"
-    return "overdue" if overdue else "ok"
+        return "error", 0, 0
+    if overdue:
+        return "overdue", bills, rejected
+    if rejected:
+        return "rejected", bills, rejected
+    return "ok", bills, rejected
 
 
 @app.get("/")
@@ -1685,12 +1840,22 @@ def root():
 @app.get("/health")
 def health():
     paused = is_paused()
-    # Float backstop: ok / alarm / stop / inactive. "stop" is the machine's
+    # Float backstop: ok / alarm / stop / inactive. "stop" is the gateway's
     # own full stop (overall "auto_paused"); the operator's PAUSED file wins
     # the label when both hold. "inactive" (no balance reading — e.g. the ops
-    # timers are not installed) reports honestly and never degrades.
+    # timers are not installed) reports and never degrades.
     float_state = _float_state()
-    payment_status = "ok" if PAYMENT_BACKEND.health() else "error"
+    # Payment: the outcome of the last real mint (see _last_mint), never a
+    # reachability probe. "unknown" (no mint since startup) reports and never
+    # degrades, same contract as wallet "absent" / float "inactive";
+    # "degraded" (last mint failed) degrades like a backend failure.
+    last_mint = _last_mint
+    if last_mint["result"] == "ok":
+        payment_status = "ok"
+    elif last_mint["result"] == "failed":
+        payment_status = "degraded"
+    else:
+        payment_status = "unknown"
 
     if OTS_CALENDAR_URL:
         otsd_status = "ok"
@@ -1700,21 +1865,20 @@ def health():
             # commits headers instantly and writes the body in ONE shot after
             # ~4 Bitcoin RPCs over Tor, each allowed up to a 30s stall by the
             # fork's make_proxy(timeout=30) — so a single-stall render can
-            # honestly take ~34s. A plain 5 here timed out ~11% of honest
-            # renders (2026-07-17). Paired with the fork homepage timeout:
-            # change the two together.
+            # take ~34s. A plain 5 here timed out ~11% of such renders
+            # (2026-07-17). Paired with the fork homepage timeout: change the
+            # two together.
             resp = requests.get(OTS_CALENDAR_URL, timeout=(5, 45))
             resp.raise_for_status()
-            # A 200 from otsd proves nothing: its homepage commits the status
-            # line (fork rpc.py:204) BEFORE any Bitcoin call, and both failure
-            # shapes — Proxy() construction failing (bare return, rpc.py:214-217)
-            # or the first RPC call dying after the headers went out — yield an
-            # empty 200 body. "Best-block" renders only after getbestblockhash
-            # and getblockcount both succeed, so its presence is the only
-            # external proof that otsd's Bitcoin RPC path is alive. Residual:
-            # this proves RPC reachability, not that the stamper thread is
-            # unwedged — that class surfaces at outcome level in the
-            # proofs-status field, with hours of latency.
+            # A 200 from otsd proves nothing: its homepage (fork rpc.py,
+            # do_GET) commits the status line BEFORE any Bitcoin call, and both
+            # failure shapes — make_proxy() raising, or the first RPC call dying
+            # after the headers went out — yield an empty 200 body. "Best-block"
+            # renders only after getbestblockhash and getblockcount both
+            # succeed, so its presence is the only external proof that otsd's
+            # Bitcoin RPC path is alive. Residual: this proves RPC reachability,
+            # not that the stamper thread is unwedged — that class surfaces in
+            # the proofs-status field, with hours of latency.
             if b"Best-block" not in resp.content:
                 logging.warning(
                     "Health check: otsd HTTP up but Bitcoin-blind at %s "
@@ -1728,26 +1892,19 @@ def health():
     else:
         otsd_status = "n/a"
 
-    # Wallet liquidity alarm: read the status file left by the balance-check
-    # timer. "absent" (alarm not installed) reports but does not degrade;
-    # "low"/"unknown"/"stale" degrade like a backend failure.
+    # File-mediated fields (wallet, proofs, backup) and billing: each
+    # classifier's docstring lists its vocabulary. "absent", "local_only",
+    # and billing "off" report without degrading; every other non-ok value
+    # degrades like a backend failure — the expression below is the rule.
     wallet_status = _wallet_status()
-
-    # Proof sweep status: same file-mediated pattern. "absent" (sweep not
-    # installed) reports but does not degrade; mismatch/attention/unknown/stale
-    # degrade like a backend failure.
     proofs_status = _proofs_status()
-
-    # Backup status: same file-mediated pattern. "absent" (backups not
-    # installed) and "local_only" (a configuration choice, honestly reported)
-    # do not degrade; attention/failed/unknown/stale degrade like a backend
-    # failure.
     backup_status = _backup_status()
+    billing_status, billing_bills, billing_rejected = _billing_status()
 
-    # Anchor billing: "off" when disabled (reported, never degrades);
-    # overdue/error degrade like the wallet field. Bookkeeping only — no
-    # sales path consults billing state.
-    billing_status = _billing_status()
+    # L402 door: "on"/"off" — a mode, reported, never degrading; the same
+    # contract as billing "off". "off" means /timestamp stamps free of charge
+    # and the per-record cost lands on the anchor bill.
+    l402_status = "on" if L402_ENABLED else "off"
 
     if paused:
         overall = "paused"
@@ -1756,7 +1913,7 @@ def health():
     else:
         overall = (
             "ok"
-            if payment_status == "ok"
+            if payment_status in ("ok", "unknown")
             and otsd_status in ("ok", "n/a")
             and wallet_status in ("ok", "absent")
             and proofs_status in ("ok", "absent")
@@ -1766,20 +1923,29 @@ def health():
             else "degraded"
         )
 
+    content = {
+        "status": overall,
+        "paused": paused,
+        "payment": payment_status,
+        "payment_backend": PAYMENT_BACKEND_TYPE,
+        "last_mint_at": last_mint["at"],
+        "otsd": otsd_status,
+        "wallet": wallet_status,
+        "float": float_state,
+        "proofs": proofs_status,
+        "backup": backup_status,
+        "billing": billing_status,
+        "l402": l402_status,
+    }
+    # Billing "off" means the feature is entirely absent (same contract as
+    # the 404 on /anchor-bills), so the counters exist only with billing on.
+    if ANCHOR_BILLING_ENABLED:
+        content["billing_bills"] = billing_bills
+        content["billing_rejected"] = billing_rejected
+
     return JSONResponse(
         status_code=200 if overall == "ok" else 503,
-        content={
-            "status": overall,
-            "paused": paused,
-            "payment": payment_status,
-            "payment_backend": PAYMENT_BACKEND_TYPE,
-            "otsd": otsd_status,
-            "wallet": wallet_status,
-            "float": float_state,
-            "proofs": proofs_status,
-            "backup": backup_status,
-            "billing": billing_status,
-        },
+        content=content,
     )
 
 
@@ -1822,7 +1988,8 @@ def anchor_bills(request: Request):
     try:
         rows = conn.execute(
             "SELECT txid, fee_sats, commitments, confirmed_height, confirmed_at, "
-            "amount_sats, payment_hash, bolt11, invoice_created_at, status, paid_at "
+            "records, amount_sats, payment_hash, bolt11, invoice_created_at, "
+            "status, paid_at "
             "FROM anchor_bills WHERE status='unpaid' OR paid_at >= ? "
             "ORDER BY confirmed_at",
             (now - _ANCHOR_BILL_RECENTLY_PAID_SECONDS,),
@@ -1834,7 +2001,7 @@ def anchor_bills(request: Request):
     unpaid_count = 0
     unpaid_sats = 0
     for (
-        txid, fee_sats, commitments, confirmed_height, confirmed_at,
+        txid, fee_sats, commitments, confirmed_height, confirmed_at, records,
         amount_sats, payment_hash, bolt11, invoice_created_at, status, paid_at,
     ) in rows:
         bill = {
@@ -1843,6 +2010,10 @@ def anchor_bills(request: Request):
             "commitments": commitments,
             "confirmed_height": confirmed_height,
             "confirmed_at": confirmed_at,
+            # The payer's audit handle: amount_sats = records × the
+            # contracted rate. NULL on markup-era bills — their amounts
+            # stand as stored, whatever formula made them.
+            "records": records,
             "amount_sats": amount_sats,
             "status": status,
         }
@@ -1869,9 +2040,18 @@ def anchor_bills(request: Request):
         if needs_mint:
             # A backend failure propagates as the existing 502: the poll is
             # retryable and nothing is lost.
-            bolt11, payment_hash = create_invoice(f"anchor-bill {txid}", amount_sats)
-            invoice_created_at = now
-            _store_anchor_bill_invoice(txid, payment_hash, bolt11, invoice_created_at)
+            new_bolt11, new_hash = create_invoice(f"anchor-bill {txid}", amount_sats)
+            if _store_anchor_bill_invoice(txid, new_hash, new_bolt11, now,
+                                          expected_hash=payment_hash):
+                bolt11, payment_hash, invoice_created_at = new_bolt11, new_hash, now
+            else:
+                # Lost the mint race: a concurrent poll stored its invoice
+                # after this one read the row. Serve the winner's — every
+                # poller must converge on the ONE invoice later polls will
+                # settle-check.
+                payment_hash, bolt11, invoice_created_at = (
+                    _read_anchor_bill_invoice(txid)
+                )
 
         bill["payment_hash"] = payment_hash
         bill["bolt11"] = bolt11
@@ -1957,7 +2137,28 @@ def upgrade(body: VerifyRequest, request: Request):
 
 @app.post("/timestamp")
 def timestamp(body: TimestampRequest, request: Request):
-    # PAUSED is enforced app-wide by _pause_gate (full-stop, ruled 2026-07-22).
+    # PAUSED is enforced app-wide by _pause_gate.
+
+    if not L402_ENABLED:
+        # Free door: stamp immediately and hand over the proof. No invoice, no
+        # macaroon, no 402; the payment backend is never contacted and the
+        # Authorization header is never read (a token minted before the flip
+        # gets its proof regardless). No obligation row: that log exists so a
+        # paid customer is never dropped, and nothing is paid here — a failed
+        # stamp is the client's 502 to retry. The mint rate limiter does not
+        # apply: nothing mints. The per-record cost lands on the anchor bill
+        # when billing is on.
+        try:
+            ots_bytes = stamp_digest(body.digest)
+        except Exception:
+            logging.exception("OTS stamping failed")
+            raise HTTPException(status_code=502, detail="OTS error: stamping failed")
+        return Response(
+            content=ots_bytes,
+            media_type="application/octet-stream",
+            headers={"Content-Disposition": f"attachment; filename={body.digest}.ots"},
+        )
+
     auth = request.headers.get("Authorization", "")
 
     if auth:
@@ -1969,19 +2170,17 @@ def timestamp(body: TimestampRequest, request: Request):
             )
         macaroon_b64, preimage_hex = parsed
 
-        # 1. Token must be valid and bound to THIS digest (401 otherwise).
+        # Order matters: token, preimage, settlement, then the cache — an
+        # unpaid replay never reaches a cached proof.
         payment_hash, mint_price_sats = verify_l402_token(macaroon_b64, body.digest)
 
-        # 2. The presented preimage must hash to the token's payment hash.
         derived = hashlib.sha256(bytes.fromhex(preimage_hex)).hexdigest()
         if derived != payment_hash:
             raise HTTPException(status_code=401, detail="Preimage does not match token payment hash")
 
-        # 3. The invoice must be settled, for this digest, at the mint-time amount.
         if not verify_payment(payment_hash, body.digest, mint_price_sats):
             raise HTTPException(status_code=402, detail="Payment required or not settled")
 
-        # 4. Return cached proof if this payment_hash was already redeemed.
         if payment_hash in _proof_cache:
             logging.info("Returning cached proof for payment_hash %s", _hash8(payment_hash))
             ots_bytes = _proof_cache[payment_hash]
@@ -1991,9 +2190,9 @@ def timestamp(body: TimestampRequest, request: Request):
                 headers={"Content-Disposition": f"attachment; filename={body.digest}.ots"},
             )
 
-        # 5. Durably record the paid obligation BEFORE stamping. If stamping fails
-        #    below, the row stays 'needs_stamp' and the sweeper recovers it — the
-        #    settled payment is never lost. Idempotent on payment_hash.
+        # Record the paid obligation BEFORE stamping: if stamping fails below,
+        # the row stays 'needs_stamp' and the sweeper recovers it — the settled
+        # payment is never lost. Idempotent on payment_hash.
         record_obligation(payment_hash, body.digest)
 
         try:
@@ -2002,7 +2201,6 @@ def timestamp(body: TimestampRequest, request: Request):
             logging.exception("OTS stamping failed")
             raise HTTPException(status_code=502, detail="OTS error: stamping failed")
 
-        # 6. Stamped: populate the instant re-serve cache AND close the obligation.
         _proof_cache_put(payment_hash, ots_bytes)
         mark_obligation_stamped(payment_hash)
         return Response(

@@ -1,0 +1,11 @@
+-r requirements.txt
+# Test-only packages, pinned to the resolved set (see README "Running the tests").
+# Transitives already pinned by requirements.txt (anyio, certifi, h11, idna) are
+# not repeated here.
+pytest==9.1.1
+iniconfig==2.3.0
+packaging==26.3
+pluggy==1.6.0
+Pygments==2.20.0
+httpx==0.28.1
+httpcore==1.0.9

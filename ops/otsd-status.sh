@@ -62,7 +62,7 @@ else
 fi
 echo
 
-echo "=== recent useful logs ==="
+echo "=== recent logs ==="
 docker logs --tail 300 "$CONTAINER" 2>&1 \
   | grep -Ei 'commit|pending|tx|transaction|broadcast|confirm|bitcoin|fee|timestamp|No pending commitments' \
   | tail -40 || true

@@ -31,8 +31,6 @@ git grep -n -I -E 'password|passwd|secret|token|macaroon|preimage|invoice|seed|m
   ':!ops/*.md' \
   ':!LIVE_PROOF.md' \
   ':!test_main.py' \
-  ':!static/index.html' \
-  ':!ops/l402-paid-proof.sh' \
   ':!ops/phoenixd-status.sh' \
   ':!requirements.txt' || true
 

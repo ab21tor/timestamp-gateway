@@ -1,10 +1,11 @@
 """Test suite for the L402 gateway.
 
-Full coverage of the agreed "at least" list: startup/config validation, digest
-validation, L402 header parsing, the 402 challenge, token verify/reject, the paid
-retry path, LND payment verification, create_invoice wiring, OTS calendar/public
-modes with bounded retry and no public fallback, the health endpoint, reuse
-semantics, and error discipline (generic public details).
+Covers: startup/config validation, digest validation, L402 header parsing, the
+402 challenge, token verify/reject, the paid retry path, LND payment
+verification, create_invoice wiring, OTS calendar/public modes with bounded
+retry and no public fallback, the health endpoint, reuse semantics, error
+discipline (generic public details), the obligation log, the /health file
+fields, the float backstop, rate limits, anchor billing, and the free door.
 """
 
 import base64
@@ -17,6 +18,7 @@ import time
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 # Set env vars before importing main so module-level config validation passes.
 # load_dotenv() does not override existing env vars, so these take precedence.
@@ -34,13 +36,17 @@ os.environ["OTS_SUBMIT_BACKOFF_SECONDS"] = "0"     # keep retry tests fast
 os.environ["OBLIGATIONS_DB_PATH"] = ":memory:"     # overridden per-test by fixture below
 os.environ["RATE_LIMIT_PER_MINUTE"] = "0"          # whole suite shares one client IP;
                                                    # rate-limit tests patch the global
+os.environ["ANCHOR_BILLING_ENABLED"] = "false"  # billing off for determinism; billing tests patch the main.* globals
+os.environ["ANCHOR_RECEIPTS_PATH"] = ""
+os.environ["ANCHOR_BILLS_TOKEN"] = ""
 # Retired pricing names: pin them empty so a developer's real .env (read by
 # main's load_dotenv() at import) cannot fire the legacy startup warning
-# mid-suite; the legacy-warning tests set them explicitly.
+# mid-suite; the legacy-warning tests set them explicitly. PRICE_MARKUP has
+# its own dedicated retirement warning, same reason to pin.
 for _retired in (
     "GATEWAY_PRICE_SATS", "MIN_GATEWAY_PRICE_SATS", "PRICE_BLIND_SATS",
     "PRICE_BUMP_RESERVE", "PRICE_MARGIN", "PRICE_TX_VSIZE_ESTIMATE",
-    "PRICE_CONF_TARGET", "PRICE_RPC_URL",
+    "PRICE_CONF_TARGET", "PRICE_RPC_URL", "PRICE_MARKUP",
 ):
     os.environ[_retired] = ""
 
@@ -65,8 +71,7 @@ FAKE_OTS = b"ots-proof"
 TEST_CALENDAR_URL = "http://test-calendar:14788"
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
+# Helpers
 def valid_token(digest=DIGEST, price=21, expiry_ts=None):
     """Mint a valid token via the real minting code (exercises main.mint_l402_token)."""
     if expiry_ts is None:
@@ -163,8 +168,7 @@ def _fail():
     return m
 
 
-# ══ 1. Startup / config validation ════════════════════════════════════════════
-
+# 1. Startup / config validation
 @pytest.fixture(autouse=True)
 def clear_proof_cache():
     main._proof_cache.clear()
@@ -179,6 +183,15 @@ def clear_rate_buckets():
     yield
     main._rate_buckets.clear()
     main._verify_rate_buckets.clear()
+
+
+@pytest.fixture(autouse=True)
+def clear_last_mint():
+    """Reset the last-mint record to the fresh-boot state (/health payment
+    'unknown') so tests that mint don't leak into later /health assertions."""
+    main._last_mint = {"result": None, "at": None, "detail": None}
+    yield
+    main._last_mint = {"result": None, "at": None, "detail": None}
 
 
 @pytest.fixture(autouse=True)
@@ -267,16 +280,19 @@ def test_price_per_proof_non_integer_fails():
 
 def test_price_per_proof_negative_fails():
     with patch.dict(os.environ, {"PRICE_PER_PROOF_SATS": "-5"}):
-        with pytest.raises(RuntimeError, match="PRICE_PER_PROOF_SATS must be >= 0"):
+        with pytest.raises(RuntimeError, match="PRICE_PER_PROOF_SATS must be >= 1"):
             main._parse_config()
 
 
-def test_price_per_proof_zero_boots_with_warning(caplog):
+def test_price_per_proof_zero_fails_teaching_free_mode():
+    # A token minted at 0 could never redeem (the price caveat regexes reject
+    # "0"), so zero is refused with a pointer at the free door.
     with patch.dict(os.environ, {"PRICE_PER_PROOF_SATS": "0"}):
-        with caplog.at_level(logging.WARNING):
-            cfg = main._parse_config()
-    assert cfg.price_per_proof_sats == 0
-    assert any("earns nothing per proof" in r.getMessage() for r in caplog.records)
+        with pytest.raises(
+            RuntimeError,
+            match=r"PRICE_PER_PROOF_SATS must be >= 1.*L402_ENABLED=false",
+        ):
+            main._parse_config()
 
 
 def test_invalid_ots_backend_mode_fails():
@@ -363,8 +379,7 @@ def test_ots_backoff_negative_fails():
             main._parse_config()
 
 
-# ══ 2. Digest validation ══════════════════════════════════════════════════════
-
+# 2. Digest validation
 def test_invalid_digest_too_short_returns_422():
     resp = client.post("/timestamp", json={"digest": "abc123"})
     assert resp.status_code == 422
@@ -391,8 +406,7 @@ def test_digest_normalized_to_lowercase_in_memo():
     assert patched.call_args.kwargs["json"]["memo"] == "a" * 64
 
 
-# ══ 3. L402 header parsing ═════════════════════════════════════════════════════
-
+# 3. L402 header parsing
 def test_parse_l402_auth_accepts_valid_header():
     token = valid_token()  # real macaroon contains url-safe base64 chars
     parsed = main.parse_l402_auth(f"L402 {token}:{PREIMAGE}")
@@ -428,8 +442,7 @@ def test_malformed_authorization_returns_401(header):
     assert resp.status_code == 401
 
 
-# ══ 4. 402 challenge path ══════════════════════════════════════════════════════
-
+# 4. 402 challenge path
 def test_unauthenticated_post_returns_402():
     with patch("main.requests.post", return_value=_post_mock()):
         resp = client.post("/timestamp", json={"digest": DIGEST})
@@ -497,7 +510,7 @@ def test_quote_path_is_feerate_independent():
 
 
 def test_challenge_redeems_after_repricing_down():
-    # Full circle: challenge minted while the flat rate was 11250, the
+    # End to end: challenge minted while the flat rate was 11250, the
     # operator then reprices to the suite's 500. The 11250 invoice paid in
     # full must still redeem — mint-time binding end to end through the real
     # challenge.
@@ -530,8 +543,7 @@ def test_minted_token_verifies_and_carries_mint_time_price():
         assert main.verify_l402_token(token, DIGEST) == (PAYMENT_HASH, 500)
 
 
-# ══ 5. L402 token verification ═════════════════════════════════════════════════
-
+# 5. L402 token verification
 def test_verify_token_valid_same_digest_returns_payment_hash_and_price():
     assert main.verify_l402_token(valid_token(), DIGEST) == (PAYMENT_HASH, 21)
 
@@ -543,16 +555,16 @@ def test_verify_token_rejects_wrong_digest():
 
 
 def test_expired_token_still_verifies():
-    """Ruled 2026-07-22: settlement outranks expiry. An expired token passes
-    token verification (the expiry caveat is format-checked only); whether it
-    redeems is decided by the settlement check, not the clock."""
+    """Settlement outranks expiry: an expired token passes token verification
+    (the expiry caveat is format-checked only); whether it redeems is decided
+    by the settlement check, not the clock."""
     token = valid_token(expiry_ts=int(time.time()) - 10)
     assert main.verify_l402_token(token, DIGEST) == (PAYMENT_HASH, 21)
 
 
 def test_settled_but_expired_token_redeems():
-    """The economic edge, now pinned as chosen: pay, come back after expiry,
-    still get the proof. A client who already paid is owed the proof."""
+    """Pay, come back after expiry, still get the proof: a client who already
+    paid is owed it."""
     token = valid_token(expiry_ts=int(time.time()) - 10)
     with patch("main.requests.get", return_value=_settled_get()):
         with patch("main.stamp_digest", return_value=FAKE_OTS):
@@ -621,8 +633,50 @@ def test_verify_token_rejects_malformed_with_generic_detail():
     assert ei.value.detail == "Invalid L402 token"  # generic, no internal leakage
 
 
-# ══ 6. Paid retry path ═════════════════════════════════════════════════════════
+# Fuzz-mutated macaroon (seed=0xC0FFEE, verify_l402_token, index 21): it
+# deserializes, but its caveat bytes are not valid UTF-8, so the caveat read
+# raises. Shared by the 401 regression and the log-shape test below.
+UNDECODABLE_CAVEAT_TOKEN = (
+    "MDAxZmxvY2F0aW9uIHRpbWVzdGFtcC1nYXRld2F5CjAwNTBpZGVudGlmaWVyIDAyZDQ0OWEzMW3iYjI2N2M4ZjM1"
+    "MmU5OTY4YTc5ZTNlNWZjOTVjMWJiZWFhNTAyZmQ2NDU0ZWJkZTVhNGJlZGMKMDA1MGNpZCBkaWdlc3Q9YWFhYWFh"
+    "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYQowMDU2Y2lk"
+    "IHBheW1lbnRfaGFzaA0wMmQ0NDlhMzFmYmIyNjdjOGYzNTJlOTkkOGE3OWUzZTVmYzk1YzFiYmVhYTUwMmZkNjQ1"
+    "NGViZGU1YTRiZWRjCjAwMTFjaWQgcHJpY2U9MjEKMDAxZGNpZCBjYXBhYmlsaXG5PXRpbWVzdGFtcAowMDFhY2lk"
+    "IGV4cGlyeT00MTAyNDQ0ODAwCjAwMmZzaWduYXR1cmUg6Y2_anRuD-MzN-VZh4DCrQdyKLCEH2mKjr7kJB6eo0IK"
+)
 
+
+def test_verify_token_rejects_undecodable_caveat_bytes_with_401():
+    """Fuzz regression (seed=0xC0FFEE, verify_l402_token, index 21): a mutated
+    macaroon that deserializes but whose caveat bytes are not valid UTF-8 used
+    to escape as UnicodeDecodeError from pymacaroons' caveat_id access. It must
+    be the same generic 401 as any other invalid token."""
+    with pytest.raises(HTTPException) as ei:
+        main.verify_l402_token(UNDECODABLE_CAVEAT_TOKEN, DIGEST)
+    assert ei.value.status_code == 401
+    assert ei.value.detail == "Invalid L402 token"
+
+
+def test_garbage_token_logs_single_warning_no_traceback(caplog):
+    """Both unauthenticated failure stages (deserialize, caveat read) fire on
+    arbitrary stranger input, so neither may write ERROR-level records or
+    stack traces into the journal — one WARNING line with the exception repr
+    is the whole log surface."""
+    for stage, token in [
+        ("deserialize", "not-a-macaroon!!"),
+        ("caveat read", UNDECODABLE_CAVEAT_TOKEN),
+    ]:
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(HTTPException) as ei:
+                main.verify_l402_token(token, DIGEST)
+        assert ei.value.status_code == 401, stage
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR], stage
+        assert "Traceback" not in caplog.text, stage
+        assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1, stage
+
+
+# 6. Paid retry path
 def test_valid_paid_retry_returns_raw_ots_bytes_buffered_response():
     token = valid_token()
     with patch("main.requests.get", return_value=_settled_get()):
@@ -676,8 +730,7 @@ def test_same_token_preimage_different_digest_rejected():
     assert resp.status_code == 401
 
 
-# ══ 7. LND invoice lookup / payment verification ═══════════════════════════════
-
+# 7. LND invoice lookup / payment verification
 def test_verify_payment_true_when_settled_correct_memo_and_amount():
     with patch("main.requests.get", return_value=_settled_get()):
         assert main.verify_payment(PAYMENT_HASH, DIGEST, 21) is True
@@ -711,8 +764,8 @@ def test_verify_payment_enforces_mint_time_price_not_static_config():
             assert main.verify_payment(PAYMENT_HASH, DIGEST, 900) is True
 
 
-def test_h3_liquidity_fee_netted_receive_still_verifies(caplog):
-    # H3 regression: phoenixd nets an ACINQ liquidity fee off the credited
+def test_liquidity_fee_netted_receive_still_verifies(caplog):
+    # phoenixd nets an ACINQ liquidity fee off the credited
     # amount. bolt11 settlement is atomic — the customer paid the face amount
     # in full; the fee is our cost. Face 21 >= mint price 21 → verified, and
     # the node's first liquidity-fee event documents itself as a WARNING.
@@ -775,7 +828,7 @@ def test_endpoint_honors_in_flight_invoice_after_repricing():
     assert resp.content == FAKE_OTS
 
 
-def test_h3_liquidity_fee_payment_yields_obligation_and_proof(obligations_db):
+def test_liquidity_fee_payment_yields_obligation_and_proof(obligations_db):
     # End to end: settled with the credited amount netted below the mint
     # price still redeems — 200, real proof bytes, obligation recorded.
     token = valid_token()
@@ -809,8 +862,7 @@ def test_verify_payment_lookup_failure_raises_generic_502_and_logs(caplog):
     assert any("LND invoice lookup failed" in r.message for r in caplog.records)
 
 
-# ══ 8. create_invoice() wiring ═════════════════════════════════════════════════
-
+# 8. create_invoice() wiring
 def test_create_invoice_returns_tuple_and_decodes_rhash_to_hex():
     ph = "ab" * 32
     captured = {}
@@ -853,8 +905,7 @@ def test_create_invoice_lnd_failure_raises_generic_502_and_logs(caplog):
     assert any("LND invoice creation failed" in r.message for r in caplog.records)
 
 
-# ══ 9. OTS backend modes ═══════════════════════════════════════════════════════
-
+# 9. OTS backend modes
 def test_calendar_mode_submits_only_to_calendar_url():
     instance = MagicMock()
     instance.submit.return_value = _good_calendar_ts()
@@ -963,36 +1014,42 @@ def test_public_mode_fails_only_if_all_aggregators_fail():
     assert resp.json()["detail"] == "OTS error: stamping failed"
 
 
-# ══ 10. Health endpoint ════════════════════════════════════════════════════════
-
-def test_health_both_ok_returns_200():
-    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+# 10. Health endpoint
+def test_health_fresh_boot_payment_unknown_returns_200():
+    # Passive payment field: before any real mint there is nothing to vouch
+    # for, so a fresh gateway reports "unknown" without degrading (same
+    # contract as wallet "absent" / float "inactive").
+    with patch("main.requests.get", side_effect=[_ok_otsd()]):
         resp = client.get("/health")
     assert resp.status_code == 200
     assert resp.json() == {
         "status": "ok",
         "paused": False,
-        "payment": "ok",
+        "payment": "unknown",
         "payment_backend": main.PAYMENT_BACKEND_TYPE,
+        "last_mint_at": None,
         "otsd": "ok",
         "wallet": "absent",
         "float": "inactive",
         "proofs": "absent",
         "backup": "absent",
         "billing": "off",
+        "l402": "on",
     }
 
 
-def test_health_lnd_down_returns_503():
-    with patch("main.requests.get", side_effect=[_fail(), _ok_otsd()]):
-        resp = client.get("/health")
-    assert resp.status_code == 503
-    body = resp.json()
-    assert body["status"] == "degraded" and body["payment"] == "error"
+def test_lnd_health_success_and_failure():
+    # The reachability probe survives on the backend for operational use;
+    # /health no longer consults it (payment derives from the last real mint).
+    backend = main.LndPaymentBackend()
+    with patch("main.requests.get", return_value=_ok_lnd()):
+        assert backend.health() is True
+    with patch("main.requests.get", side_effect=Exception("boom")):
+        assert backend.health() is False
 
 
 def test_health_otsd_down_in_calendar_mode_returns_503():
-    with patch("main.requests.get", side_effect=[_ok_lnd(), _fail()]):
+    with patch("main.requests.get", side_effect=[_fail()]):
         resp = client.get("/health")
     assert resp.status_code == 503
     body = resp.json()
@@ -1003,7 +1060,7 @@ def test_health_otsd_bitcoin_blind_empty_200_returns_503(caplog):
     # otsd commits its 200 before any Bitcoin call, so a dead Bitcoin RPC
     # yields an empty 200 body. That must read as error, not ok — and the
     # log line must name the condition.
-    with patch("main.requests.get", side_effect=[_ok_lnd(), _blind_otsd(b"")]):
+    with patch("main.requests.get", side_effect=[_blind_otsd(b"")]):
         with caplog.at_level(logging.WARNING):
             resp = client.get("/health")
     assert resp.status_code == 503
@@ -1016,45 +1073,46 @@ def test_health_otsd_markerless_200_returns_503():
     # A rendered body without the Best-block marker (template drift, partial
     # render) fails loud rather than passing as healthy.
     with patch("main.requests.get",
-               side_effect=[_ok_lnd(), _blind_otsd(b"<html>calendar</html>")]):
+               side_effect=[_blind_otsd(b"<html>calendar</html>")]):
         resp = client.get("/health")
     assert resp.status_code == 503
     assert resp.json()["otsd"] == "error"
 
 
 def test_health_otsd_na_in_public_mode():
+    # No probes at all here: otsd has no calendar URL and the payment field
+    # is passive, so /health touches no backend.
     with patch("main.OTS_CALENDAR_URL", None):
-        with patch("main.requests.get", return_value=_ok_lnd()):
-            resp = client.get("/health")
+        resp = client.get("/health")
     assert resp.status_code == 200
     assert resp.json() == {
         "status": "ok",
         "paused": False,
-        "payment": "ok",
+        "payment": "unknown",
         "payment_backend": main.PAYMENT_BACKEND_TYPE,
+        "last_mint_at": None,
         "otsd": "n/a",
         "wallet": "absent",
         "float": "inactive",
         "proofs": "absent",
         "backup": "absent",
         "billing": "off",
+        "l402": "on",
     }
 
 
-def test_health_uses_readonly_macaroon_when_set():
+def test_lnd_health_uses_readonly_macaroon_when_set():
     readonly = "cd" * 32
     with patch("main.LND_READONLY_MACAROON_HEX", readonly):
-        with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]) as mock_get:
-            resp = client.get("/health")
-    assert resp.status_code == 200
+        with patch("main.requests.get", return_value=_ok_lnd()) as mock_get:
+            assert main.LndPaymentBackend().health() is True
     assert mock_get.call_args_list[0].kwargs["headers"]["Grpc-Metadata-macaroon"] == readonly
 
 
-def test_health_falls_back_to_invoice_macaroon_when_readonly_absent():
+def test_lnd_health_falls_back_to_invoice_macaroon_when_readonly_absent():
     with patch("main.LND_READONLY_MACAROON_HEX", None):
-        with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]) as mock_get:
-            resp = client.get("/health")
-    assert resp.status_code == 200
+        with patch("main.requests.get", return_value=_ok_lnd()) as mock_get:
+            assert main.LndPaymentBackend().health() is True
     assert mock_get.call_args_list[0].kwargs["headers"]["Grpc-Metadata-macaroon"] == main.LND_MACAROON_HEX
 
 
@@ -1062,24 +1120,59 @@ def test_health_never_raises():
     with patch("main.requests.get", side_effect=RuntimeError("unexpected crash")):
         resp = client.get("/health")
     assert resp.status_code == 503
-    assert resp.json()["payment"] == "error"
+    assert resp.json()["otsd"] == "error"
 
 
 def test_health_otsd_probe_timeout_pairs_with_fork_homepage():
     """The otsd probe's read leg races otsd's FULL homepage render (headers
     commit instantly; the body arrives in one write after ~4 Bitcoin RPCs over
     Tor, each allowed a 30s stall by the fork's make_proxy(timeout=30)), so a
-    single-stall render can honestly take ~34s. A plain timeout=5 marked ~11%
-    of honest renders red (2026-07-17). Pin (5, 45) so neither side of the
-    pair moves alone."""
-    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]) as mock_get:
+    single-stall render can take ~34s. A plain timeout=5 marked ~11% of
+    such renders red (2026-07-17). Pin (5, 45) so neither side of the pair
+    moves alone."""
+    with patch("main.requests.get", side_effect=[_ok_otsd()]) as mock_get:
         resp = client.get("/health")
     assert resp.status_code == 200
-    assert mock_get.call_args_list[1].kwargs["timeout"] == (5, 45)
+    assert mock_get.call_args_list[0].kwargs["timeout"] == (5, 45)
 
 
-# ══ 11. Error discipline (cross-cutting) ═══════════════════════════════════════
+def test_health_payment_reflects_last_real_mint():
+    """The payment field is the outcome of the last REAL mint, never a
+    reachability probe: fresh boot reads "unknown" (200, reported without
+    degrading); a wedged createinvoice (ReadTimeout while getinfo still
+    answers) reads "degraded" (503); a successful mint reads
+    "ok" (200). last_mint_at exposes the freshness of that verdict."""
+    # Fresh state: the autouse fixture reset the record — no mint yet.
+    with patch("main.requests.get", side_effect=[_ok_otsd()]):
+        resp = client.get("/health")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["payment"] == "unknown" and body["last_mint_at"] is None
 
+    # Wedged mint: the L402 challenge path attempts a real createinvoice.
+    with patch("main.requests.post",
+               side_effect=requests.exceptions.ReadTimeout("read timed out")):
+        challenge = client.post("/timestamp", json={"digest": DIGEST})
+    assert challenge.status_code == 502
+    with patch("main.requests.get", side_effect=[_ok_otsd()]):
+        resp = client.get("/health")
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["status"] == "degraded"
+    assert body["payment"] == "degraded" and body["last_mint_at"] is not None
+
+    # Recovered: the next successful mint flips it back to ok.
+    with patch("main.requests.post", return_value=_post_mock()):
+        challenge = client.post("/timestamp", json={"digest": DIGEST})
+    assert challenge.status_code == 402
+    with patch("main.requests.get", side_effect=[_ok_otsd()]):
+        resp = client.get("/health")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["payment"] == "ok" and body["last_mint_at"] is not None
+
+
+# 11. Error discipline (cross-cutting)
 def test_lnd_create_error_detail_is_generic_no_leak():
     m = MagicMock()
     m.raise_for_status.side_effect = Exception("secret-lnd-trace")
@@ -1102,8 +1195,7 @@ def test_unsettled_uses_402_not_error():
     assert resp.status_code == 402
 
 
-# ── /verify endpoint ─────────────────────────────────────────────────────────
-
+# /verify endpoint
 def make_detached_ots_bytes(digest=DIGEST, attestation=None):
     timestamp = main.Timestamp(bytes.fromhex(digest))
     if attestation is None:
@@ -1368,7 +1460,7 @@ def test_upgrade_override_allowlist_contacts_only_operator_calendar():
     assert instance.get_timestamp.called
 
 
-# PAYMENT BACKEND TESTS
+# Payment backend selection
 
 def test_payment_backend_default_is_phoenixd():
     """With PAYMENT_BACKEND_TYPE unset, the default is phoenixd (the live
@@ -1564,7 +1656,7 @@ def test_paused_health_returns_503(tmp_path):
     pause_file.write_text("paused\n")
 
     with patch("main.PAUSE_FILE", str(pause_file)):
-        with patch.object(main.PAYMENT_BACKEND, "health", return_value=True), patch("requests.get", return_value=_ok_otsd()):
+        with patch("requests.get", return_value=_ok_otsd()):
             resp = client.get("/health")
 
     assert resp.status_code == 503
@@ -1584,9 +1676,8 @@ def test_paused_timestamp_returns_503(tmp_path):
 
 
 def test_paused_blocks_paid_redemption_and_unpause_serves_it(tmp_path):
-    """Full-stop ruling (2026-07-22): PAUSED refuses even a settled token —
-    and ruling 1 guarantees the pause takes nothing: the same token redeems
-    after unpause."""
+    """PAUSED refuses even a settled token, and the pause takes nothing: the
+    same token redeems after unpause."""
     pause_file = tmp_path / "PAUSED"
     pause_file.write_text("paused\n")
     token = valid_token()
@@ -1636,7 +1727,7 @@ def test_sweeper_skips_while_paused(tmp_path):
     sweep.assert_called_once()
 
 
-# ══ 12. Durable obligation log ═════════════════════════════════════════════════
+# 12. Durable obligation log
 # The obligation store guarantees a settled payment is never lost if calendar
 # submission fails. It coexists with _proof_cache: the cache is the instant
 # re-serve path, the DB is the durable backstop the sweeper drains. Payment only
@@ -1722,6 +1813,33 @@ def test_token_representation_stays_instant_via_proof_cache():
     assert _obligation_count() == 1
 
 
+def test_obligations_needs_stamp_partial_index_migration_safe():
+    """The sweeper's needs_stamp scan is indexed — a partial index that stays
+    near-empty in steady state — and an EXISTING database gains it on init
+    (CREATE INDEX IF NOT EXISTS): drop it to simulate a pre-index DB, re-run
+    init, and the sweeper's exact query plans through it again."""
+    import sqlite3
+    conn = sqlite3.connect(main.OBLIGATIONS_DB_PATH)
+    try:
+        conn.execute("DROP INDEX IF EXISTS obligations_needs_stamp")
+        conn.commit()
+    finally:
+        conn.close()
+    main.init_obligation_db()  # the migration moment: table exists, index absent
+    conn = sqlite3.connect(main.OBLIGATIONS_DB_PATH)
+    try:
+        names = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='index' AND tbl_name='obligations'")]
+        assert "obligations_needs_stamp" in names
+        plan = " ".join(r[3] for r in conn.execute(
+            "EXPLAIN QUERY PLAN SELECT payment_hash, digest FROM obligations "
+            "WHERE status='needs_stamp'"))
+        assert "obligations_needs_stamp" in plan, plan
+    finally:
+        conn.close()
+
+
 def test_proof_cache_bounded_fifo(monkeypatch):
     """_proof_cache never exceeds _PROOF_CACHE_MAX: the oldest insertion is
     evicted first (FIFO), and overwriting an existing key neither grows the
@@ -1768,7 +1886,7 @@ def test_unwritable_obligation_db_fails_loud(tmp_path):
             main.init_obligation_db()
 
 
-# ══ 13. Wallet liquidity alarm (/health wallet field) ═══════════════════════════
+# 13. Wallet liquidity alarm (/health wallet field)
 # /health reads the status file written by ops/wallet-balance-check.sh — no
 # Bitcoin RPC from the gateway. "absent" (alarm not installed) does not degrade;
 # "low"/"stale"/"unknown" degrade to 503 like a backend failure.
@@ -1786,7 +1904,7 @@ def _write_wallet_status(path, status="ok", checked_at=None, balance_sats=100000
 
 def test_health_wallet_ok_returns_200(wallet_status_file):
     _write_wallet_status(wallet_status_file, status="ok")
-    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+    with patch("main.requests.get", side_effect=[_ok_otsd()]):
         resp = client.get("/health")
     assert resp.status_code == 200
     body = resp.json()
@@ -1798,7 +1916,7 @@ def test_health_wallet_low_returns_503(wallet_status_file):
     # but above the 20,000 stop — this test pins the wallet field, not the
     # backstop (section 16 covers the stop).
     _write_wallet_status(wallet_status_file, status="low", balance_sats=30000)
-    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+    with patch("main.requests.get", side_effect=[_ok_otsd()]):
         resp = client.get("/health")
     assert resp.status_code == 503
     body = resp.json()
@@ -1810,7 +1928,7 @@ def test_health_wallet_stale_returns_503(wallet_status_file):
     itself died — that must degrade health, not pass as ok."""
     old = int(time.time()) - main.WALLET_STATUS_MAX_AGE_SECONDS - 60
     _write_wallet_status(wallet_status_file, status="ok", checked_at=old)
-    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+    with patch("main.requests.get", side_effect=[_ok_otsd()]):
         resp = client.get("/health")
     assert resp.status_code == 503
     body = resp.json()
@@ -1821,7 +1939,7 @@ def test_health_wallet_absent_reports_but_stays_healthy(wallet_status_file):
     """No status file = alarm not installed. Reported, but operators without
     the calendar profile must not fail health."""
     assert not wallet_status_file.exists()
-    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+    with patch("main.requests.get", side_effect=[_ok_otsd()]):
         resp = client.get("/health")
     assert resp.status_code == 200
     assert resp.json()["wallet"] == "absent"
@@ -1829,14 +1947,14 @@ def test_health_wallet_absent_reports_but_stays_healthy(wallet_status_file):
 
 def test_health_wallet_malformed_returns_503_unknown(wallet_status_file):
     wallet_status_file.write_text("not json{{{")
-    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+    with patch("main.requests.get", side_effect=[_ok_otsd()]):
         resp = client.get("/health")
     assert resp.status_code == 503
     body = resp.json()
     assert body["status"] == "degraded" and body["wallet"] == "unknown"
 
 
-# ══ 14. Proof sweep status (/health proofs field) ════════════════════════════════
+# 14. Proof sweep status (/health proofs field)
 # /health reads the status file written by ops/upgrade-all-proofs.sh — no
 # artifact scanning from the gateway. "absent" (sweep not installed) does not
 # degrade; "mismatch"/"attention"/"stale"/"unknown" degrade to 503.
@@ -1857,7 +1975,7 @@ def _write_proofs_status(path, status="ok", checked_at=None):
 
 def test_health_proofs_ok_returns_200(proofs_status_file):
     _write_proofs_status(proofs_status_file, status="ok")
-    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+    with patch("main.requests.get", side_effect=[_ok_otsd()]):
         resp = client.get("/health")
     assert resp.status_code == 200
     body = resp.json()
@@ -1868,7 +1986,7 @@ def test_health_proofs_mismatch_returns_503(proofs_status_file):
     """attestation_mismatch is the signal the sweeper repair exists for — the
     calendar holds an attestation an artifact lacks. It must degrade health."""
     _write_proofs_status(proofs_status_file, status="mismatch")
-    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+    with patch("main.requests.get", side_effect=[_ok_otsd()]):
         resp = client.get("/health")
     assert resp.status_code == 503
     body = resp.json()
@@ -1877,7 +1995,7 @@ def test_health_proofs_mismatch_returns_503(proofs_status_file):
 
 def test_health_proofs_attention_returns_503(proofs_status_file):
     _write_proofs_status(proofs_status_file, status="attention")
-    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+    with patch("main.requests.get", side_effect=[_ok_otsd()]):
         resp = client.get("/health")
     assert resp.status_code == 503
     body = resp.json()
@@ -1889,7 +2007,7 @@ def test_health_proofs_stale_returns_503(proofs_status_file):
     timer itself died — that must degrade health, not pass as ok."""
     old = int(time.time()) - main.PROOFS_STATUS_MAX_AGE_SECONDS - 60
     _write_proofs_status(proofs_status_file, status="ok", checked_at=old)
-    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+    with patch("main.requests.get", side_effect=[_ok_otsd()]):
         resp = client.get("/health")
     assert resp.status_code == 503
     body = resp.json()
@@ -1900,7 +2018,7 @@ def test_health_proofs_absent_reports_but_stays_healthy(proofs_status_file):
     """No status file = sweep not installed. Reported, but operators without
     the calendar profile must not fail health."""
     assert not proofs_status_file.exists()
-    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+    with patch("main.requests.get", side_effect=[_ok_otsd()]):
         resp = client.get("/health")
     assert resp.status_code == 200
     assert resp.json()["proofs"] == "absent"
@@ -1908,7 +2026,7 @@ def test_health_proofs_absent_reports_but_stays_healthy(proofs_status_file):
 
 def test_health_proofs_malformed_returns_503_unknown(proofs_status_file):
     proofs_status_file.write_text("not json{{{")
-    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+    with patch("main.requests.get", side_effect=[_ok_otsd()]):
         resp = client.get("/health")
     assert resp.status_code == 503
     body = resp.json()
@@ -1928,7 +2046,7 @@ def _write_backup_status(path, status="ok", checked_at=None,
 
 def test_health_backup_ok_returns_200(backup_status_file):
     _write_backup_status(backup_status_file, status="ok")
-    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+    with patch("main.requests.get", side_effect=[_ok_otsd()]):
         resp = client.get("/health")
     assert resp.status_code == 200
     body = resp.json()
@@ -1936,10 +2054,10 @@ def test_health_backup_ok_returns_200(backup_status_file):
 
 
 def test_health_backup_local_only_reports_but_stays_healthy(backup_status_file):
-    """local_only is a configuration choice (no BACKUP_REMOTE/recipient set),
-    honestly reported — it must not degrade health."""
+    """local_only is a configuration choice (no BACKUP_REMOTE/recipient set)
+    and must not degrade health."""
     _write_backup_status(backup_status_file, status="local_only")
-    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+    with patch("main.requests.get", side_effect=[_ok_otsd()]):
         resp = client.get("/health")
     assert resp.status_code == 200
     body = resp.json()
@@ -1948,7 +2066,7 @@ def test_health_backup_local_only_reports_but_stays_healthy(backup_status_file):
 
 def test_health_backup_attention_returns_503(backup_status_file):
     _write_backup_status(backup_status_file, status="attention")
-    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+    with patch("main.requests.get", side_effect=[_ok_otsd()]):
         resp = client.get("/health")
     assert resp.status_code == 503
     body = resp.json()
@@ -1957,7 +2075,7 @@ def test_health_backup_attention_returns_503(backup_status_file):
 
 def test_health_backup_failed_returns_503(backup_status_file):
     _write_backup_status(backup_status_file, status="failed")
-    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+    with patch("main.requests.get", side_effect=[_ok_otsd()]):
         resp = client.get("/health")
     assert resp.status_code == 503
     body = resp.json()
@@ -1969,7 +2087,7 @@ def test_health_backup_stale_returns_503(backup_status_file):
     timer itself died — that must degrade health, not pass as ok."""
     old = int(time.time()) - main.BACKUP_STATUS_MAX_AGE_SECONDS - 60
     _write_backup_status(backup_status_file, status="ok", checked_at=old)
-    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+    with patch("main.requests.get", side_effect=[_ok_otsd()]):
         resp = client.get("/health")
     assert resp.status_code == 503
     body = resp.json()
@@ -1980,7 +2098,7 @@ def test_health_backup_absent_reports_but_stays_healthy(backup_status_file):
     """No status file = backups not installed. Reported, but boxes without the
     backup timer must not fail health."""
     assert not backup_status_file.exists()
-    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+    with patch("main.requests.get", side_effect=[_ok_otsd()]):
         resp = client.get("/health")
     assert resp.status_code == 200
     assert resp.json()["backup"] == "absent"
@@ -1988,14 +2106,14 @@ def test_health_backup_absent_reports_but_stays_healthy(backup_status_file):
 
 def test_health_backup_malformed_returns_503_unknown(backup_status_file):
     backup_status_file.write_text("not json{{{")
-    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+    with patch("main.requests.get", side_effect=[_ok_otsd()]):
         resp = client.get("/health")
     assert resp.status_code == 503
     body = resp.json()
     assert body["status"] == "degraded" and body["backup"] == "unknown"
 
 
-# ══ 15. Pricing (flat per-proof rate) ════════════════════════════════════════
+# 15. Pricing (flat per-proof rate)
 # The quote is PRICE_PER_PROOF_SATS, full stop. The retired floor/feerate
 # model warns once at startup and is ignored; STAMPER_FEE_CAP_SATS remains
 # only to derive the float backstop thresholds (section 16).
@@ -2031,7 +2149,7 @@ def test_legacy_warning_absent_when_env_clean(caplog):
 
 def test_price_rpc_url_never_warns_on_bitcoin_rpc_service_url(caplog):
     # BITCOIN_RPC_SERVICE_URL remains legitimately set for otsd; only an
-    # explicitly present PRICE_RPC_URL is named (ruled 2026-07-27).
+    # explicitly present PRICE_RPC_URL is named.
     env = {"BITCOIN_RPC_SERVICE_URL": "http://u:p@127.0.0.1:8332/wallet/otsd-hot"}
     with patch.dict(os.environ, env):
         with caplog.at_level(logging.WARNING):
@@ -2058,18 +2176,18 @@ def test_non_positive_stamper_fee_cap_fails():
                 main._parse_config()
 
 
-# ══ 16. Float backstop ═══════════════════════════════════════════════════════
-# The anchor wallet is the machine's float, read from the SAME wallet-status
-# file as the liquidity alarm — no RPC, no credential. Below
+# 16. Float backstop
+# The anchor wallet's balance is read from the SAME wallet-status file as
+# the liquidity alarm — no RPC, no credential. Below
 # 5 × STAMPER_FEE_CAP_SATS: alarm, sales continue, /health degrades. Below
-# 1 × cap: automatic full stop with PAUSED semantics as its OWN state,
-# clearing itself on recovery. No balance reading: inactive, honestly
+# 1 × cap: automatic full stop with PAUSED semantics as the gateway's OWN
+# state, clearing itself on recovery. No balance reading: inactive,
 # reported, never degrading.
 
 
 def test_float_ok_at_or_above_five_caps(wallet_status_file):
     _write_wallet_status(wallet_status_file, status="ok", balance_sats=100000)  # exactly 5 × cap
-    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+    with patch("main.requests.get", side_effect=[_ok_otsd()]):
         resp = client.get("/health")
     assert resp.status_code == 200
     assert resp.json()["float"] == "ok"
@@ -2077,7 +2195,7 @@ def test_float_ok_at_or_above_five_caps(wallet_status_file):
 
 def test_float_alarm_below_five_caps_degrades_sales_continue(wallet_status_file):
     _write_wallet_status(wallet_status_file, status="ok", balance_sats=60000)
-    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+    with patch("main.requests.get", side_effect=[_ok_otsd()]):
         resp = client.get("/health")
     assert resp.status_code == 503
     body = resp.json()
@@ -2090,9 +2208,9 @@ def test_float_alarm_below_five_caps_degrades_sales_continue(wallet_status_file)
 
 def test_float_stop_below_one_cap_full_stops(wallet_status_file):
     _write_wallet_status(wallet_status_file, status="low", balance_sats=10000)
-    # /health still answers: overall auto_paused — the machine's own state,
+    # /health still answers: overall auto_paused — the gateway's own state,
     # not the operator's (paused stays false).
-    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+    with patch("main.requests.get", side_effect=[_ok_otsd()]):
         resp = client.get("/health")
     assert resp.status_code == 503
     body = resp.json()
@@ -2108,14 +2226,14 @@ def test_float_stop_below_one_cap_full_stops(wallet_status_file):
 
 
 def test_float_stop_own_state_distinct_from_operator_pause(tmp_path, wallet_status_file):
-    # Both hold: the operator label wins everywhere; the machine never
+    # Both hold: the operator label wins everywhere; the gateway never
     # touches the operator's file, and lifting the manual pause leaves the
-    # machine's own stop standing.
+    # float stop standing.
     _write_wallet_status(wallet_status_file, status="low", balance_sats=10000)
     pause_file = tmp_path / "PAUSED"
     pause_file.write_text("manual\n")
     with patch("main.PAUSE_FILE", str(pause_file)):
-        with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+        with patch("main.requests.get", side_effect=[_ok_otsd()]):
             resp = client.get("/health")
         body = resp.json()
         assert body["status"] == "paused" and body["float"] == "stop"
@@ -2150,8 +2268,8 @@ def test_float_recovery_clears_itself(wallet_status_file):
 
 
 def test_float_stop_blocks_paid_redemption_and_recovery_serves_it(wallet_status_file, obligations_db):
-    # R1 (settlement outranks expiry) across an auto-pause: a paid token
-    # blocked by the machine's stop redeems after recovery.
+    # Settlement outranks expiry across an auto-pause: a paid token blocked
+    # by the float stop redeems after recovery.
     with patch("main.requests.post", return_value=_post_mock()):
         challenge = client.post("/timestamp", json={"digest": DIGEST})
     token = challenge.json()["detail"]["macaroon"]
@@ -2167,15 +2285,15 @@ def test_float_stop_blocks_paid_redemption_and_recovery_serves_it(wallet_status_
 
 
 def test_float_stale_last_reading_stands(wallet_status_file):
-    # Ruled 2026-07-27: freshness is not consulted — a stale low reading
-    # keeps the stop, a stale healthy reading keeps sales; staleness itself
-    # alarms through the wallet field.
+    # Freshness is not consulted: a stale low reading keeps the stop, a
+    # stale healthy reading keeps sales; staleness itself alarms through the
+    # wallet field.
     old = int(time.time()) - 7200
     _write_wallet_status(wallet_status_file, status="low", balance_sats=10000, checked_at=old)
     resp = client.post("/timestamp", json={"digest": DIGEST})
     assert resp.status_code == 503
     _write_wallet_status(wallet_status_file, status="ok", balance_sats=150000, checked_at=old)
-    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+    with patch("main.requests.get", side_effect=[_ok_otsd()]):
         resp = client.get("/health")
     body = resp.json()
     assert body["float"] == "ok" and body["wallet"] == "stale"
@@ -2188,7 +2306,7 @@ def test_float_stale_last_reading_stands(wallet_status_file):
 def test_float_absent_inactive_backstop_off(wallet_status_file):
     # No file: the backstop is off and says so; nothing degrades, sales run.
     assert not wallet_status_file.exists()
-    with patch("main.requests.get", side_effect=[_ok_lnd(), _ok_otsd()]):
+    with patch("main.requests.get", side_effect=[_ok_otsd()]):
         resp = client.get("/health")
     assert resp.status_code == 200
     body = resp.json()
@@ -2208,8 +2326,7 @@ def test_float_null_balance_reads_inactive(wallet_status_file):
     assert main._float_state() == "inactive"
 
 
-# ══ 16. Invoice-mint rate limit ══════════════════════════════════════════════════
-
+# 17. Invoice-mint rate limit
 def test_rate_limit_non_integer_fails():
     with patch.dict(os.environ, {"RATE_LIMIT_PER_MINUTE": "many"}):
         with pytest.raises(RuntimeError, match="RATE_LIMIT_PER_MINUTE must be an integer"):
@@ -2488,12 +2605,14 @@ def test_rate_limit_zero_disables(monkeypatch):
     assert main._rate_buckets == {}  # disabled limiter keeps no state
 
 
-# ══ 17. Anchor billing ════════════════════════════════════════════════════════
+# 18. Anchor billing
 # Part two of the pricing model: the calendar fork writes anchor receipts;
 # the gateway ingests them into anchor_bills and bills the standing payer
-# ceil(fee_sats × PRICE_MARKUP) per anchor via plain bolt11s (NOT L402).
-# The floor: billing stays out of the suite's base env — every billing-on
-# test builds its own state through the anchor_billing fixture.
+# records × PER_RECORD_SATS per anchor via plain bolt11s (NOT L402). A
+# receipt with records=0 (the fork could not prove a count) never bills,
+# loudly; a receipt missing records (an un-upgraded fork) is malformed.
+# Billing stays out of the suite's base env — every billing-on test builds
+# its own state through the anchor_billing fixture.
 
 ANCHOR_TXID = "ab" * 32
 OTHER_TXID = "cd" * 32
@@ -2503,13 +2622,15 @@ HASH_B = "bb" * 32
 
 
 def receipt_line(txid=ANCHOR_TXID, fee_sats=153, commitments=5,
-                 confirmed_height=850000, confirmed_at=None, **overrides):
+                 confirmed_height=850000, confirmed_at=None, records=5,
+                 **overrides):
     """One fork-format receipt line; overrides let a test malform any field."""
     if confirmed_at is None:
         confirmed_at = int(time.time())
     receipt = {
         "txid": txid, "fee_sats": fee_sats, "commitments": commitments,
         "confirmed_height": confirmed_height, "confirmed_at": confirmed_at,
+        "records": records,
     }
     receipt.update(overrides)
     return json.dumps(receipt) + "\n"
@@ -2517,13 +2638,14 @@ def receipt_line(txid=ANCHOR_TXID, fee_sats=153, commitments=5,
 
 @pytest.fixture
 def anchor_billing(tmp_path, monkeypatch, obligations_db):
-    """Enable anchor billing for one test: markup 1.5, a per-test receipts
-    path (no file until the test writes one), a known bearer token, and the
+    """Enable anchor billing for one test: 46 sats per record (5 records ×
+    46 = 230, the suite's stable bill amount), a per-test receipts path (no
+    file until the test writes one), a known bearer token, and the
     anchor_bills table in the per-test obligations DB. Depends on
     obligations_db so the DB path is already repointed when init runs."""
     receipts = tmp_path / "anchor-receipts.jsonl"
     monkeypatch.setattr(main, "ANCHOR_BILLING_ENABLED", True)
-    monkeypatch.setattr(main, "PRICE_MARKUP", 1.5)
+    monkeypatch.setattr(main, "PER_RECORD_SATS", 46)
     monkeypatch.setattr(main, "ANCHOR_RECEIPTS_PATH", str(receipts))
     monkeypatch.setattr(main, "ANCHOR_BILLS_TOKEN", BILLS_TOKEN)
     main.init_obligation_db()
@@ -2581,12 +2703,11 @@ def _set_bill(txid, **cols):
         conn.close()
 
 
-# ── Config validation ────────────────────────────────────────────────────────
-
+# Config validation
 def test_billing_disabled_by_default():
     cfg = main._parse_config()
     assert cfg.anchor_billing_enabled is False
-    assert cfg.price_markup is None
+    assert cfg.per_record_sats is None
     assert cfg.anchor_receipts_path is None
     assert cfg.anchor_bills_token is None
 
@@ -2596,37 +2717,50 @@ def test_billing_enabled_requires_all_three_named():
         with pytest.raises(RuntimeError) as e:
             main._parse_config()
     msg = str(e.value)
-    assert "PRICE_MARKUP" in msg
+    assert "PER_RECORD_SATS" in msg
     assert "ANCHOR_RECEIPTS_PATH" in msg
     assert "ANCHOR_BILLS_TOKEN" in msg
 
 
 def test_billing_enabled_names_only_the_missing():
     with patch.dict(os.environ, {"ANCHOR_BILLING_ENABLED": "true",
-                                 "PRICE_MARKUP": "1.5"}):
+                                 "PER_RECORD_SATS": "46"}):
         with pytest.raises(RuntimeError) as e:
             main._parse_config()
     msg = str(e.value)
-    assert "PRICE_MARKUP" not in msg
+    assert "PER_RECORD_SATS" not in msg
     assert "ANCHOR_RECEIPTS_PATH" in msg
     assert "ANCHOR_BILLS_TOKEN" in msg
 
 
-def test_billing_markup_below_one_fails():
+def test_billing_per_record_negative_fails():
     with patch.dict(os.environ, {"ANCHOR_BILLING_ENABLED": "true",
-                                 "PRICE_MARKUP": "0.9",
+                                 "PER_RECORD_SATS": "-5",
                                  "ANCHOR_RECEIPTS_PATH": "/tmp/r.jsonl",
                                  "ANCHOR_BILLS_TOKEN": "t"}):
-        with pytest.raises(RuntimeError, match=">= 1.0"):
+        with pytest.raises(RuntimeError, match="PER_RECORD_SATS must be >= 1"):
             main._parse_config()
 
 
-def test_billing_markup_non_numeric_fails():
+def test_billing_per_record_non_integer_fails():
     with patch.dict(os.environ, {"ANCHOR_BILLING_ENABLED": "true",
-                                 "PRICE_MARKUP": "half again",
+                                 "PER_RECORD_SATS": "1.5",
                                  "ANCHOR_RECEIPTS_PATH": "/tmp/r.jsonl",
                                  "ANCHOR_BILLS_TOKEN": "t"}):
-        with pytest.raises(RuntimeError, match="PRICE_MARKUP must be a number"):
+        with pytest.raises(RuntimeError, match="PER_RECORD_SATS must be an integer"):
+            main._parse_config()
+
+
+def test_billing_per_record_zero_fails_teaching_billing_off():
+    # Zero is refused with a pointer at the switch that turns billing off.
+    with patch.dict(os.environ, {"ANCHOR_BILLING_ENABLED": "true",
+                                 "PER_RECORD_SATS": "0",
+                                 "ANCHOR_RECEIPTS_PATH": "/tmp/r.jsonl",
+                                 "ANCHOR_BILLS_TOKEN": "t"}):
+        with pytest.raises(
+            RuntimeError,
+            match=r"PER_RECORD_SATS must be >= 1.*ANCHOR_BILLING_ENABLED=false",
+        ):
             main._parse_config()
 
 
@@ -2639,30 +2773,49 @@ def test_billing_enabled_flag_strict_bool():
 def test_billing_disabled_ignores_the_three_silently():
     # Garbage in all three with the feature off: parse succeeds, nothing read.
     with patch.dict(os.environ, {"ANCHOR_BILLING_ENABLED": "false",
-                                 "PRICE_MARKUP": "not a number",
+                                 "PER_RECORD_SATS": "not a number",
                                  "ANCHOR_RECEIPTS_PATH": "",
                                  "ANCHOR_BILLS_TOKEN": ""}):
         cfg = main._parse_config()
     assert cfg.anchor_billing_enabled is False
-    assert cfg.price_markup is None
+    assert cfg.per_record_sats is None
     assert cfg.anchor_receipts_path is None
     assert cfg.anchor_bills_token is None
 
 
 def test_billing_enabled_valid_config():
     with patch.dict(os.environ, {"ANCHOR_BILLING_ENABLED": "true",
-                                 "PRICE_MARKUP": "1.5",
+                                 "PER_RECORD_SATS": "46",
                                  "ANCHOR_RECEIPTS_PATH": "/var/lib/x/r.jsonl",
                                  "ANCHOR_BILLS_TOKEN": "secret-token"}):
         cfg = main._parse_config()
     assert cfg.anchor_billing_enabled is True
-    assert cfg.price_markup == 1.5
+    assert cfg.per_record_sats == 46
     assert cfg.anchor_receipts_path == "/var/lib/x/r.jsonl"
     assert cfg.anchor_bills_token == "secret-token"
 
 
-# ── Receipts reader ──────────────────────────────────────────────────────────
+def test_price_markup_retired_warns_when_set(caplog):
+    # Retired with its own accurate warning (the feerate-era list's text
+    # would misname it): fires only when itself explicitly set, never
+    # fails startup, fires with billing on or off.
+    with patch.dict(os.environ, {"PRICE_MARKUP": "1.5"}):
+        with caplog.at_level(logging.WARNING):
+            cfg = main._parse_config()  # billing off — boots, warns anyway
+    assert cfg.anchor_billing_enabled is False
+    warnings = [r.getMessage() for r in caplog.records
+                if "PRICE_MARKUP" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "PER_RECORD_SATS" in warnings[0]
 
+
+def test_price_markup_retired_silent_when_clean(caplog):
+    with caplog.at_level(logging.WARNING):
+        main._parse_config()
+    assert not any("PRICE_MARKUP" in r.getMessage() for r in caplog.records)
+
+
+# Receipts reader
 def test_receipts_duplicate_txid_lines_dedupe(anchor_billing):
     # The fork's crash semantics allow duplicate lines; INSERT OR IGNORE on
     # txid dedupes them, keeping the first.
@@ -2694,32 +2847,75 @@ def test_receipts_wrong_typed_field_skipped(anchor_billing, caplog):
     assert len([r for r in caplog.records if "skipped" in r.message]) == 2
 
 
+def test_receipts_missing_records_field_malformed(anchor_billing, caplog):
+    # A five-field line from an un-upgraded fork: malformed, skipped with
+    # the existing warning — an old fork never bills, loudly.
+    five_field = json.loads(receipt_line())
+    del five_field["records"]
+    anchor_billing.write_text(json.dumps(five_field) + "\n")
+    with caplog.at_level(logging.WARNING):
+        main._ingest_anchor_receipts()
+    assert _bill_count() == 0
+    assert any("line 1" in r.getMessage() and "skipped" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_receipts_records_wrong_type_malformed(anchor_billing, caplog):
+    # records as a string, a bool, or a negative integer (the fork cannot
+    # produce one) are all malformed; none may ingest.
+    anchor_billing.write_text(
+        receipt_line(records="5")
+        + receipt_line(txid=OTHER_TXID, records=True)
+        + receipt_line(txid="ef" * 32, records=-1))
+    with caplog.at_level(logging.WARNING):
+        main._ingest_anchor_receipts()
+    assert _bill_count() == 0
+    assert len([r for r in caplog.records if "skipped" in r.message]) == 3
+
+
+def test_receipts_records_zero_not_billed_warns_txid(anchor_billing, caplog):
+    # Err-low billing: records=0 means the fork could not prove a count, so
+    # nothing is charged — no row, one warning naming the txid. Distinct
+    # from malformed: the line is well-formed.
+    anchor_billing.write_text(
+        receipt_line(records=0) + receipt_line(txid=OTHER_TXID))
+    with caplog.at_level(logging.WARNING):
+        main._ingest_anchor_receipts()
+    assert _bill_count() == 1
+    assert _bill_row(OTHER_TXID) is not None
+    zero_warnings = [r.getMessage() for r in caplog.records
+                     if "records=0" in r.getMessage()]
+    assert len(zero_warnings) == 1
+    assert ANCHOR_TXID in zero_warnings[0]
+    assert not any("skipped" in r.message for r in caplog.records)
+
+
 def test_receipts_absent_file_is_healthy_zero_rows(anchor_billing):
     main._ingest_anchor_receipts()  # must not raise
     assert _bill_count() == 0
 
 
-# ── Billing math ─────────────────────────────────────────────────────────────
+# Billing math
+def test_amount_sats_is_records_times_rate(anchor_billing):
+    anchor_billing.write_text(receipt_line(records=5))  # 5 × 46 = 230
+    main._ingest_anchor_receipts()
+    row = _bill_row()
+    assert row["amount_sats"] == 230
+    assert row["records"] == 5
 
-def test_amount_sats_ceils_fractional_product(anchor_billing):
-    anchor_billing.write_text(receipt_line(fee_sats=153))  # 153 × 1.5 = 229.5
+
+def test_amount_sats_immutable_across_rate_change(anchor_billing, monkeypatch):
+    anchor_billing.write_text(receipt_line(records=5))
+    main._ingest_anchor_receipts()
+    assert _bill_row()["amount_sats"] == 230
+    # The bill's mint-time amount is fixed, like the quote: a repriced rate
+    # never touches an already-ingested bill.
+    monkeypatch.setattr(main, "PER_RECORD_SATS", 100)
     main._ingest_anchor_receipts()
     assert _bill_row()["amount_sats"] == 230
 
 
-def test_amount_sats_immutable_across_markup_change(anchor_billing, monkeypatch):
-    anchor_billing.write_text(receipt_line(fee_sats=153))
-    main._ingest_anchor_receipts()
-    assert _bill_row()["amount_sats"] == 230
-    # The bill's mint-time amount is law, like the quote: a repriced markup
-    # must never touch an already-ingested bill.
-    monkeypatch.setattr(main, "PRICE_MARKUP", 3.0)
-    main._ingest_anchor_receipts()
-    assert _bill_row()["amount_sats"] == 230
-
-
-# ── GET /anchor-bills ────────────────────────────────────────────────────────
-
+# GET /anchor-bills
 def test_anchor_bills_404_when_disabled():
     resp = bills_get()
     assert resp.status_code == 404
@@ -2747,6 +2943,7 @@ def test_anchor_bills_200_unpaid_with_bolt11(anchor_billing):
     assert bill["fee_sats"] == 153
     assert bill["commitments"] == 5
     assert bill["confirmed_height"] == 850000
+    assert bill["records"] == 5      # the payer audits amount = records × rate
     assert bill["amount_sats"] == 230
     assert bill["status"] == "unpaid"
     assert bill["bolt11"] == FAKE_INVOICE
@@ -2857,11 +3054,107 @@ def test_anchor_bills_rate_limited_by_verify_bucket(anchor_billing, monkeypatch)
     assert "Retry-After" in second.headers
 
 
-# ── /health billing field ────────────────────────────────────────────────────
+def test_anchor_bills_schema_upgrades_additively(anchor_billing):
+    # A markup-era DB (no records column) upgrades by ALTER TABLE ADD COLUMN
+    # only: the old row keeps its stored amount, whatever formula made it,
+    # and reads back with records NULL — served as null, never re-priced.
+    import sqlite3
+    conn = sqlite3.connect(main.OBLIGATIONS_DB_PATH)
+    try:
+        conn.execute("DROP TABLE anchor_bills")
+        conn.execute(
+            """
+            CREATE TABLE anchor_bills (
+                txid               TEXT PRIMARY KEY,
+                fee_sats           INTEGER NOT NULL,
+                commitments        INTEGER NOT NULL,
+                confirmed_height   INTEGER NOT NULL,
+                confirmed_at       INTEGER NOT NULL,
+                amount_sats        INTEGER NOT NULL,
+                payment_hash       TEXT,
+                bolt11             TEXT,
+                invoice_created_at INTEGER,
+                status             TEXT NOT NULL DEFAULT 'unpaid'
+                                   CHECK (status IN ('unpaid', 'paid')),
+                paid_at            INTEGER
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO anchor_bills (txid, fee_sats, commitments, "
+            "confirmed_height, confirmed_at, amount_sats, status) "
+            "VALUES (?, 153, 5, 850000, ?, 230, 'unpaid')",
+            (ANCHOR_TXID, int(time.time())))
+        conn.commit()
+    finally:
+        conn.close()
+    main.init_obligation_db()  # the upgrade path
+    row = _bill_row()
+    assert row["amount_sats"] == 230
+    assert row["records"] is None
+    backend = _bills_backend()
+    with patch("main.PAYMENT_BACKEND", backend):
+        bill = bills_get().json()["bills"][0]
+    assert bill["records"] is None
+    assert bill["amount_sats"] == 230
 
+
+def test_anchor_bills_concurrent_mint_single_invoice_survives(anchor_billing):
+    """Two polls racing one NULL-hash bill must converge on ONE invoice.
+
+    A barrier inside the mocked create_invoice guarantees the interleave the
+    fix exists for: both polls read the bill before either stores, so both
+    mint. The store must be conditional (win = the row still holds what this
+    poll read); the loser re-reads and serves the winner's invoice. On the
+    blind-UPDATE code each racer serves its own mint — the orphaned one, if
+    paid, settles invisibly and the bill gets paid twice."""
+    import threading
+    anchor_billing.write_text(receipt_line())
+    main._ingest_anchor_receipts()
+
+    barrier = threading.Barrier(2)
+    mint_lock = threading.Lock()
+    mints = [(HASH_A, "lnbc-race-a"), (HASH_B, "lnbc-race-b")]
+    minted = []
+
+    def racing_create(memo, amount_sats):
+        with mint_lock:
+            payment_hash, bolt11 = mints[len(minted)]
+            minted.append(payment_hash)
+        barrier.wait(timeout=10)  # both polls have read payment_hash IS NULL
+        return main.Invoice(bolt11=bolt11, payment_hash=payment_hash)
+
+    backend = MagicMock()
+    backend.create_invoice.side_effect = racing_create
+
+    results = []
+    def poll():
+        results.append(bills_get())
+
+    threads = [threading.Thread(target=poll) for _ in range(2)]
+    with patch("main.PAYMENT_BACKEND", backend):
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+    assert [r.status_code for r in results] == [200, 200]
+    assert backend.create_invoice.call_count == 2  # both really minted
+    row = _bill_row()
+    assert row["payment_hash"] in (HASH_A, HASH_B)
+    served = [r.json()["bills"][0] for r in results]
+    for bill in served:
+        # Both pollers are handed the ONE surviving invoice — never the
+        # orphaned loser, which no later poll would ever settle-check.
+        assert bill["payment_hash"] == row["payment_hash"]
+        assert bill["bolt11"] == row["bolt11"]
+
+
+# /health billing field
 def _health_with_billing(backend):
-    """GET /health with the payment backend stubbed healthy and otsd healthy;
-    the billing field is then determined by billing state alone."""
+    """GET /health with otsd healthy and the payment backend stubbed (the
+    passive payment field never touches it); the billing field is then
+    determined by billing state alone."""
     with patch("main.PAYMENT_BACKEND", backend):
         with patch("main.requests.get", return_value=_ok_otsd()):
             return client.get("/health")
@@ -2906,6 +3199,42 @@ def test_health_billing_unreadable_receipts_error_degrades(anchor_billing):
     assert body["status"] == "degraded"
 
 
+def test_health_billing_rejected_receipts_degrade(anchor_billing):
+    # A receipts file whose lines are being rejected as malformed is not
+    # "ok": /health must distinguish it from "no receipts yet" and degrade,
+    # carrying a visible rejected counter.
+    anchor_billing.write_text("not json at all\n")
+    resp = _health_with_billing(_bills_backend())
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["billing"] == "rejected"
+    assert body["billing_rejected"] == 1
+    assert body["status"] == "degraded"
+
+
+def test_health_billing_no_receipts_yet_visibly_ok(anchor_billing):
+    # Absent file stays healthy, visibly: zero bills ingested, zero
+    # rejected, distinguishable from a rejection state.
+    resp = _health_with_billing(_bills_backend())
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["billing"] == "ok"
+    assert body["billing_bills"] == 0
+    assert body["billing_rejected"] == 0
+
+
+def test_health_billing_records_zero_is_not_rejected(anchor_billing):
+    # records=0 is the documented err-low case: well-formed, unbilled —
+    # and permanent in the append-only file, so counting it as
+    # rejected would degrade /health forever on an acceptable state.
+    anchor_billing.write_text(receipt_line(records=0))
+    resp = _health_with_billing(_bills_backend())
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["billing"] == "ok"
+    assert body["billing_rejected"] == 0
+
+
 def test_health_billing_never_mints(anchor_billing):
     # /health ingests (overdue must surface without polls) but minting is
     # poll-only: an unpaid bill with no invoice stays invoice-less.
@@ -2914,3 +3243,218 @@ def test_health_billing_never_mints(anchor_billing):
     _health_with_billing(backend)
     backend.create_invoice.assert_not_called()
     assert _bill_row()["payment_hash"] is None
+
+
+# 19. L402 door switch (free mode)
+# L402_ENABLED=false stamps immediately
+# and returns the proof free of charge: no invoice, no macaroon, no 402, the
+# payment backend never contacted from /timestamp; the per-record cost lands
+# on the anchor bill (records × PER_RECORD_SATS per confirmed anchor).
+
+def test_l402_enabled_default_true():
+    cfg = main._parse_config()
+    assert cfg.l402_enabled is True
+
+
+def test_l402_enabled_strict_bool():
+    # Strict true/false, as GATEWAY_BEHIND_PROXY and ANCHOR_BILLING_ENABLED:
+    # a typo silently read as a mode would change what the door charges.
+    with patch.dict(os.environ, {"L402_ENABLED": "yes"}):
+        with pytest.raises(RuntimeError, match="L402_ENABLED must be 'true' or 'false'"):
+            main._parse_config()
+
+
+def test_l402_disabled_price_and_secret_not_required():
+    with patch.dict(os.environ, {"L402_ENABLED": "false",
+                                 "PRICE_PER_PROOF_SATS": "",
+                                 "L402_SECRET_HEX": ""}):
+        cfg = main._parse_config()
+    assert cfg.l402_enabled is False
+    assert cfg.price_per_proof_sats is None
+    assert cfg.l402_secret is None
+
+
+def test_l402_disabled_ignores_price_and_secret_silently():
+    # Garbage in both with the door off: parse succeeds, nothing read, as
+    # with the billing vars. An .env legitimately holds both modes' vars.
+    with patch.dict(os.environ, {"L402_ENABLED": "false",
+                                 "PRICE_PER_PROOF_SATS": "not a number",
+                                 "L402_SECRET_HEX": "zz-not-hex"}):
+        cfg = main._parse_config()
+    assert cfg.price_per_proof_sats is None
+    assert cfg.l402_secret is None
+
+
+def test_l402_enabled_true_still_requires_price_and_secret():
+    with patch.dict(os.environ, {"L402_ENABLED": "true",
+                                 "PRICE_PER_PROOF_SATS": ""}):
+        with pytest.raises(RuntimeError, match="PRICE_PER_PROOF_SATS is required"):
+            main._parse_config()
+    with patch.dict(os.environ, {"L402_ENABLED": "true",
+                                 "L402_SECRET_HEX": "",
+                                 "L402_ALLOW_EPHEMERAL_SECRET": "false"}):
+        with pytest.raises(RuntimeError, match="L402_SECRET_HEX is required"):
+            main._parse_config()
+
+
+def test_l402_disabled_billing_on_logs_free_door_info(caplog):
+    with patch.dict(os.environ, {"L402_ENABLED": "false",
+                                 "ANCHOR_BILLING_ENABLED": "true",
+                                 "PER_RECORD_SATS": "50",
+                                 "ANCHOR_RECEIPTS_PATH": "/tmp/r.jsonl",
+                                 "ANCHOR_BILLS_TOKEN": "t"}):
+        with caplog.at_level(logging.INFO):
+            cfg = main._parse_config()
+    assert cfg.l402_enabled is False
+    infos = [r for r in caplog.records
+             if r.levelno == logging.INFO and "free door" in r.getMessage()]
+    assert len(infos) == 1
+    assert "anchor billing carries the charges" in infos[0].getMessage()
+
+
+def test_l402_disabled_billing_disabled_warns_nothing_charges(caplog):
+    # Both switches off: a valid choice (a subsidising operator), named once
+    # at WARNING — it replaces the free-door INFO line, so each mode is
+    # announced exactly once.
+    with patch.dict(os.environ, {"L402_ENABLED": "false",
+                                 "ANCHOR_BILLING_ENABLED": "false"}):
+        with caplog.at_level(logging.INFO):
+            main._parse_config()
+    warns = [r for r in caplog.records
+             if r.levelno == logging.WARNING and "nothing charges anywhere" in r.getMessage()]
+    assert len(warns) == 1
+    assert not any("free door" in r.getMessage() for r in caplog.records
+                   if r.levelno == logging.INFO)
+
+
+def test_free_mode_stamps_immediately_and_returns_proof():
+    with patch("main.L402_ENABLED", False):
+        with patch("main.stamp_digest", return_value=FAKE_OTS):
+            resp = client.post("/timestamp", json={"digest": DIGEST})
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/octet-stream"
+    assert resp.content == FAKE_OTS
+    assert f"attachment; filename={DIGEST}.ots" in resp.headers["content-disposition"]
+
+
+def test_free_mode_never_contacts_payment_backend():
+    # Provably no backend call: the whole requests module is replaced, so ANY
+    # network call from the free path would be visible — none occurs.
+    sentinel = MagicMock()
+    with patch("main.L402_ENABLED", False):
+        with patch("main.requests", sentinel):
+            with patch("main.stamp_digest", return_value=FAKE_OTS):
+                resp = client.post("/timestamp", json={"digest": DIGEST})
+    assert resp.status_code == 200
+    assert sentinel.post.call_count == 0
+    assert sentinel.get.call_count == 0
+
+
+def test_free_mode_ignores_valid_auth_header():
+    # A token minted before the flip: the proof is handed over regardless —
+    # settlement-outranks-expiry honored trivially, no invoice lookup at all.
+    token = valid_token()
+    lookup = MagicMock()
+    with patch("main.L402_ENABLED", False):
+        with patch("main.requests.get", lookup):
+            with patch("main.stamp_digest", return_value=FAKE_OTS):
+                resp = client.post("/timestamp", json={"digest": DIGEST},
+                                   headers=auth(token))
+    assert resp.status_code == 200
+    assert resp.content == FAKE_OTS
+    lookup.assert_not_called()
+
+
+def test_free_mode_ignores_garbage_auth_header():
+    # Malformed Authorization is 401 with the door on; with the door off the
+    # header is not even read.
+    with patch("main.L402_ENABLED", False):
+        with patch("main.stamp_digest", return_value=FAKE_OTS):
+            resp = client.post("/timestamp", json={"digest": DIGEST},
+                               headers={"Authorization": "Bearer not-l402"})
+    assert resp.status_code == 200
+    assert resp.content == FAKE_OTS
+
+
+def test_free_mode_writes_no_obligation_row():
+    # The obligation log exists so a PAID customer is never dropped; nothing
+    # is paid here — a failed stamp is the client's 502 to retry.
+    with patch("main.L402_ENABLED", False):
+        with patch("main.stamp_digest", return_value=FAKE_OTS):
+            resp = client.post("/timestamp", json={"digest": DIGEST})
+    assert resp.status_code == 200
+    assert _obligation_count() == 0
+
+
+def test_free_mode_stamp_failure_returns_502_no_obligation():
+    with patch("main.L402_ENABLED", False):
+        with patch("main.stamp_digest", side_effect=RuntimeError("otsd down")):
+            resp = client.post("/timestamp", json={"digest": DIGEST})
+    assert resp.status_code == 502
+    assert resp.json()["detail"] == "OTS error: stamping failed"
+    assert _obligation_count() == 0
+
+
+def test_free_mode_mint_rate_limit_not_consulted(monkeypatch):
+    # Nothing mints, so the invoice-mint bucket does not apply: a limit that
+    # would 429 the second challenge lets every free stamp through, and the
+    # bucket is never even touched.
+    monkeypatch.setattr(main, "RATE_LIMIT_PER_MINUTE", 1)
+    with patch("main.L402_ENABLED", False):
+        with patch("main.stamp_digest", return_value=FAKE_OTS):
+            first = client.post("/timestamp", json={"digest": DIGEST})
+            second = client.post("/timestamp", json={"digest": DIGEST})
+    assert first.status_code == 200 and second.status_code == 200
+    assert main._rate_buckets == {}
+
+
+def test_free_mode_paused_still_full_stops(tmp_path):
+    # The pause gate is app-wide middleware: free mode changes what the door
+    # charges, never whether the gateway is stopped.
+    pause = tmp_path / "PAUSED"
+    pause.touch()
+    with patch("main.L402_ENABLED", False):
+        with patch("main.PAUSE_FILE", str(pause)):
+            resp = client.post("/timestamp", json={"digest": DIGEST})
+    assert resp.status_code == 503
+
+
+def test_free_mode_invalid_digest_still_422():
+    with patch("main.L402_ENABLED", False):
+        resp = client.post("/timestamp", json={"digest": "xyz"})
+    assert resp.status_code == 422
+
+
+def test_free_mode_verify_and_upgrade_unaffected():
+    with patch("main.L402_ENABLED", False):
+        r1 = client.post("/verify", json={"digest": DIGEST, "ots": "not base64!!!"})
+        r2 = client.post("/upgrade", json={"digest": DIGEST, "ots": "not base64!!!"})
+    assert r1.status_code == 200 and r1.json()["status"] == "invalid"
+    assert r2.status_code == 200 and r2.json()["status"] == "invalid"
+
+
+def test_health_l402_field_on():
+    with patch("main.requests.get", side_effect=[_ok_otsd()]):
+        resp = client.get("/health")
+    assert resp.json()["l402"] == "on"
+
+
+def test_health_l402_off_reported_never_degrades():
+    # Same contract as billing "off": a mode, reported, never a degradation.
+    with patch("main.L402_ENABLED", False):
+        with patch("main.requests.get", side_effect=[_ok_otsd()]):
+            resp = client.get("/health")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["l402"] == "off"
+    assert body["status"] == "ok"
+
+
+# 20. Removed /ui route
+# The static payment UI is gone (undocumented, untested, and broken on the
+# free door: it treated only 402 as success). The path must 404 like any
+# unregistered route.
+
+def test_ui_route_removed_404():
+    assert client.get("/ui").status_code == 404
+    assert client.get("/ui/").status_code == 404

@@ -80,7 +80,7 @@ else
 fi
 echo
 
-echo "=== important files ==="
+echo "=== state files ==="
 if [ -d "$PHOENIX_HOME" ]; then
   echo "phoenix_home: $PHOENIX_HOME"
   for f in \

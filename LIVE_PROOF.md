@@ -2,6 +2,23 @@
 
 ---
 
+## Proof 4 — First restore drill (2026-08-21)
+
+On 21 August 2026, the island's first real backup was taken with the completed backup set, restored into a scratch compose stack, and proven — without touching the production project, its volumes, or its `.env`.
+
+- **Date:** 2026-08-21
+- **Archive:** `20260821T151507Z-live-state.tar.gz` (204 MB, plaintext, local-only; state `attention`, naming the three members this layout lacks: the two VPS-era systemd units and the artifacts dir)
+- **Set additions proven in the archive:** Tor hidden-service keys (onion identity + calendar uri name), anchor receipts JSONL, `journal.counts`, the fork checkout with `.git`, `seed.dat`, and a consistent `obligations.db.snapshot` taken through the gateway container's Python (the host has no sqlite3)
+- **Drill:** archive extracted under `/root/restore-drill`, standalone compose project `restore-drill`, gateway + otsd only, loopback ports 18000/24788, Bitcoin RPC pointed at a dead loopback URL so the drill stamper could never see the production wallet. A restored phoenixd was never started — Lightning recovery is by seed, documented, not rehearsed.
+- **Proof 1 — health:** `/health` answered on 127.0.0.1:18000 — `degraded`, each field explained (otsd deliberately Bitcoin-blind; payment backend unreachable by design; `backup: failed` was the restored status file's capture of that afternoon's first failed backup attempt, which proves the state dir round-tripped)
+- **Proof 2 — calendar serves:** drill otsd answered HTTP 200
+- **Proof 3 — anchored proof verifies:** journal entry 0 from the restored calendar was served by the drill otsd, parsed to a `BitcoinBlockHeaderAttestation` at height 959459, and its merkle root `2b39ee25…25b7` matched `bitcoin-cli getblockheader` for block 959459 byte for byte (one read-only RPC — the only production touch)
+- **Proof 4 — obligations:** restored `obligations.db` opened in the drill gateway container — `integrity_check: ok`, 5,779 obligation rows, 1 anchor bill
+- **Teardown:** `down -v --rmi local` + `rm -rf /root/restore-drill`; verified zero drill containers, volumes, or images remain; production containers untouched (up 2–3 days throughout)
+- **Follow-up (not this session):** install `backup-live-state.timer` on the island; fill the `.env` `GATEWAY_URL` placeholder
+
+---
+
 ## Proof 3 — Stranger run: docs-only install, unattended sales (2026-07-27)
 
 Between 24 and 27 July 2026, a stranger run took a fresh VPS from nothing to a live gateway using the documentation alone, and the resulting island made six sales over the onion unattended. The run passed: proofs were anchored in Bitcoin, anchoring amortized across sales as designed, and a customer-side upgrade produced a proof independently verifiable against Bitcoin.

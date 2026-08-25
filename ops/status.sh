@@ -30,19 +30,28 @@ systemctl --no-pager show timestamp-gateway.service \
   -p User || true
 echo
 
-echo "=== gateway safety ==="
+echo "=== gateway config ==="
 if [ -f "$REPO/.env" ]; then
   PRICE="$(grep '^PRICE_PER_PROOF_SATS=' "$REPO/.env" | cut -d= -f2-)"
   PAUSE_FILE="$(grep '^PAUSE_FILE=' "$REPO/.env" | cut -d= -f2-)"
   PAYMENT_BACKEND="$(grep '^PAYMENT_BACKEND_TYPE=' "$REPO/.env" | cut -d= -f2-)"
+  L402_ENABLED="$(grep '^L402_ENABLED=' "$REPO/.env" | cut -d= -f2-)"
 else
   PRICE=""
   PAUSE_FILE=""
   PAYMENT_BACKEND=""
+  L402_ENABLED=""
 fi
 
 echo "payment_backend: ${PAYMENT_BACKEND:-unknown}"
-echo "price_per_proof_sats: ${PRICE:-needs_attention}"
+# A free door (L402_ENABLED=false) legitimately has no per-proof price —
+# the per-record cost lands on the anchor bill. Missing price is
+# needs_attention only with the door on (or unset: on is the default).
+if [ "$L402_ENABLED" = "false" ]; then
+  echo "price_per_proof_sats: n/a (free door)"
+else
+  echo "price_per_proof_sats: ${PRICE:-needs_attention}"
+fi
 echo "pause_file: ${PAUSE_FILE:-unknown}"
 
 if [ -n "$PAUSE_FILE" ] && [ -e "$PAUSE_FILE" ]; then
@@ -96,10 +105,6 @@ for i, a in enumerate(args):
 " 2>/dev/null || echo "unavailable")
 echo "btc_conf_target: ${BTC_TARGET} blocks"
 echo
-
-# No network-fee or margin sections here: under flat pricing the anchor fee
-# cap is otsd's (otsd-status.sh), and billing/float state is in the /health
-# JSON printed under "gateway health" above.
 
 echo "=== proof ledger ==="
 TSV="$ARTIFACTS/proofs.tsv"
