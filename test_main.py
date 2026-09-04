@@ -2916,6 +2916,65 @@ def test_amount_sats_immutable_across_rate_change(anchor_billing, monkeypatch):
 
 
 # GET /anchor-bills
+def test_receipts_overflow_line_rejected_not_fatal(anchor_billing, caplog):
+    # A well-typed line whose records × rate exceeds SQLite's integer used
+    # to raise inside the ingest pass and take every later line down with
+    # it (billing "error", /anchor-bills 500, until the file was edited).
+    # It is malformed: rejected, warned, and the next line bills.
+    anchor_billing.write_text(
+        receipt_line(txid="ee" * 32, records=3074457345618258603)
+        + receipt_line(txid=OTHER_TXID))
+    with caplog.at_level(logging.WARNING):
+        rejected = main._ingest_anchor_receipts()
+    assert rejected == 1
+    assert _bill_row("ee" * 32) is None
+    assert _bill_row(OTHER_TXID)["amount_sats"] == 230
+    assert any("integer range" in r.getMessage() for r in caplog.records)
+    with patch("main.PAYMENT_BACKEND", _bills_backend()):
+        resp = bills_get()
+    assert resp.status_code == 200
+    assert [b["txid"] for b in resp.json()["bills"]] == [OTHER_TXID]
+
+
+def test_receipts_txid_dedupe_is_case_insensitive(anchor_billing):
+    # A re-cased copy of a line is the same anchor: one row, stored
+    # lowercase, never a second bill.
+    anchor_billing.write_text(
+        receipt_line() + receipt_line(txid=ANCHOR_TXID.upper()))
+    main._ingest_anchor_receipts()
+    assert _bill_count() == 1
+    assert _bill_row(ANCHOR_TXID)["txid"] == ANCHOR_TXID
+
+
+def test_receipts_txid_not_hex_malformed(anchor_billing, caplog):
+    anchor_billing.write_text(
+        receipt_line(txid="zz-not-hex") + receipt_line(txid="ab" * 31))
+    with caplog.at_level(logging.WARNING):
+        assert main._ingest_anchor_receipts() == 2
+    assert _bill_count() == 0
+
+
+def test_receipts_negative_fee_empty_tree_bad_clock_malformed(anchor_billing, caplog):
+    # What the fork cannot write: a negative fee, an anchor carrying no
+    # commitment, a negative height, a confirmed_at a day past our clock.
+    anchor_billing.write_text(
+        receipt_line(fee_sats=-1)
+        + receipt_line(txid=OTHER_TXID, commitments=0)
+        + receipt_line(txid="cc" * 32, confirmed_at=int(time.time()) + 3 * 24 * 3600)
+        + receipt_line(txid="dd" * 32, confirmed_height=-1))
+    with caplog.at_level(logging.WARNING):
+        assert main._ingest_anchor_receipts() == 4
+    assert _bill_count() == 0
+
+
+def test_receipts_confirmed_at_within_slack_accepted(anchor_billing):
+    # The fork's wall clock is the same box's: minutes ahead is a clock,
+    # not a bad line.
+    anchor_billing.write_text(receipt_line(confirmed_at=int(time.time()) + 600))
+    assert main._ingest_anchor_receipts() == 0
+    assert _bill_count() == 1
+
+
 def test_anchor_bills_404_when_disabled():
     resp = bills_get()
     assert resp.status_code == 404
@@ -3233,6 +3292,57 @@ def test_health_billing_records_zero_is_not_rejected(anchor_billing):
     body = resp.json()
     assert body["billing"] == "ok"
     assert body["billing_rejected"] == 0
+
+
+def _otsd_page(receipts):
+    """A healthy otsd homepage whose "Anchor receipts" line says on, off, or
+    (None) nothing at all — the fork before the line existed."""
+    m = MagicMock()
+    m.raise_for_status.return_value = None
+    marker = {True: "Anchor receipts: on", False: "Anchor receipts: off", None: ""}[receipts]
+    m.content = ("<html>Best-block: 00000000abc, height 900000 %s</html>" % marker).encode()
+    return m
+
+
+def test_health_billing_receipts_off_degrades(anchor_billing):
+    # The calendar says it is anchoring without writing receipts: every
+    # anchor from here is unbilled. Billing must say so and degrade.
+    with patch("main.PAYMENT_BACKEND", _bills_backend()):
+        with patch("main.requests.get", return_value=_otsd_page(False)):
+            resp = client.get("/health")
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["otsd"] == "ok"
+    assert body["billing"] == "receipts_off"
+    assert body["status"] == "degraded"
+
+
+def test_health_billing_receipts_on_or_unstated_is_ok(anchor_billing):
+    # "on" is healthy; a calendar that does not say (a fork without the
+    # line) is unknown, and unknown never degrades on its own.
+    for page in (_otsd_page(True), _otsd_page(None)):
+        with patch("main.PAYMENT_BACKEND", _bills_backend()):
+            with patch("main.requests.get", return_value=page):
+                resp = client.get("/health")
+        assert resp.status_code == 200
+        assert resp.json()["billing"] == "ok"
+
+
+def test_health_receipts_line_not_read_with_billing_off():
+    with patch("main.PAYMENT_BACKEND", _bills_backend()):
+        with patch("main.requests.get", return_value=_otsd_page(False)):
+            resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json()["billing"] == "off"
+
+
+def test_health_billing_receipts_off_outranks_rejected(anchor_billing):
+    anchor_billing.write_text("not json at all\n")
+    with patch("main.PAYMENT_BACKEND", _bills_backend()):
+        with patch("main.requests.get", return_value=_otsd_page(False)):
+            resp = client.get("/health")
+    assert resp.json()["billing"] == "receipts_off"
+    assert resp.json()["billing_rejected"] == 1
 
 
 def test_health_billing_never_mints(anchor_billing):

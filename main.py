@@ -1658,6 +1658,12 @@ _ANCHOR_RECEIPT_FIELDS = (
     ("confirmed_at", int),
     ("records", int),
 )
+# A receipt's confirmed_at is the fork's wall clock on the same box; a line
+# further ahead of our clock than this is not a clock, it is a bad line.
+_ANCHOR_RECEIPT_FUTURE_SLACK = 24 * 3600
+# SQLite INTEGER is signed 64-bit: a line whose records × rate would not fit
+# is malformed, rejected before it can raise inside the ingest pass.
+_LEDGER_INT_MAX = 2**63 - 1
 
 
 def _ingest_anchor_receipts() -> int:
@@ -1672,10 +1678,14 @@ def _ingest_anchor_receipts() -> int:
     a warning naming the txid — and is not counted as rejected: the line is
     well-formed and permanent in the append-only file. A line missing
     records (an un-upgraded fork) is malformed and skipped with a warning,
-    so an old five-field receipts file never bills. An absent file is
-    healthy (billing on, no anchors yet). Raises only for an
-    unreadable-but-present file or a failing DB — the caller classifies that
-    as billing "error"."""
+    so an old five-field receipts file never bills. The rest of what the
+    fork cannot write is malformed too: a txid that is not 64 hex chars
+    (stored lowercase, so a re-cased copy of a line can never bill an
+    anchor twice), a negative fee, an empty tree, a confirmed_at ahead of
+    our clock, or a records × rate that would not fit the ledger's integer.
+    An absent file is healthy (billing on, no anchors yet). Raises only for
+    an unreadable-but-present file or a failing DB — the caller classifies
+    that as billing "error"."""
     try:
         with open(ANCHOR_RECEIPTS_PATH, "r") as fd:
             lines = fd.readlines()
@@ -1700,6 +1710,19 @@ def _ingest_anchor_receipts() -> int:
                 # The fork cannot produce a negative count: malformed.
                 if receipt["records"] < 0:
                     raise ValueError("bad records")
+                if not re.fullmatch(r"[0-9a-fA-F]{64}", receipt["txid"]):
+                    raise ValueError("bad txid")
+                receipt["txid"] = receipt["txid"].lower()
+                if receipt["fee_sats"] < 0:
+                    raise ValueError("bad fee_sats")
+                if receipt["commitments"] < 1:
+                    raise ValueError("bad commitments")
+                if receipt["confirmed_height"] < 0:
+                    raise ValueError("bad confirmed_height")
+                if not 0 <= receipt["confirmed_at"] <= int(time.time()) + _ANCHOR_RECEIPT_FUTURE_SLACK:
+                    raise ValueError("bad confirmed_at")
+                if receipt["records"] * PER_RECORD_SATS > _LEDGER_INT_MAX:
+                    raise ValueError("records x rate exceeds the ledger's integer range")
             except (ValueError, KeyError) as exp:
                 rejected += 1
                 logging.warning(
@@ -1713,21 +1736,29 @@ def _ingest_anchor_receipts() -> int:
                     receipt["txid"],
                 )
                 continue
-            conn.execute(
-                "INSERT OR IGNORE INTO anchor_bills "
-                "(txid, fee_sats, commitments, confirmed_height, confirmed_at, "
-                "records, amount_sats, status) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'unpaid')",
-                (
-                    receipt["txid"],
-                    receipt["fee_sats"],
-                    receipt["commitments"],
-                    receipt["confirmed_height"],
-                    receipt["confirmed_at"],
-                    receipt["records"],
-                    receipt["records"] * PER_RECORD_SATS,
-                ),
-            )
+            try:
+                conn.execute(
+                    "INSERT OR IGNORE INTO anchor_bills "
+                    "(txid, fee_sats, commitments, confirmed_height, confirmed_at, "
+                    "records, amount_sats, status) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'unpaid')",
+                    (
+                        receipt["txid"],
+                        receipt["fee_sats"],
+                        receipt["commitments"],
+                        receipt["confirmed_height"],
+                        receipt["confirmed_at"],
+                        receipt["records"],
+                        receipt["records"] * PER_RECORD_SATS,
+                    ),
+                )
+            except OverflowError as exp:
+                # Belt and braces behind the range check above: one line can
+                # never take the rest of the file down with it.
+                rejected += 1
+                logging.warning(
+                    "Anchor receipt line %d skipped (malformed): %r", lineno, exp
+                )
         conn.commit()
     finally:
         conn.close()
@@ -1789,20 +1820,27 @@ def _mark_anchor_bill_paid(txid: str, paid_at: int) -> None:
         conn.close()
 
 
-def _billing_status() -> tuple[str, int, int]:
+def _billing_status(receipts_state: bool | None = None) -> tuple[str, int, int]:
     """Classify anchor billing for /health. Returns (status, bills, rejected)
     where bills is the total rows in anchor_bills, rejected the receipt
     lines rejected as malformed this pass, and status one of:
-      off      — ANCHOR_BILLING_ENABLED=false; reported, never degrades
-      ok       — receipts ingestable, nothing rejected, no unpaid bill
-                 older than 24h. With bills 0 this is "no receipts yet",
-                 distinct from rejection.
-      rejected — receipt lines are being rejected as malformed (rejected
-                 > 0); degrades. overdue and error outrank it.
-      overdue  — an unpaid bill has sat >24h past its anchor's confirmed_at
-                 (bookkeeping alarm; sales are never gated by billing state)
-      error    — the receipts file is present but unreadable, or the bills
-                 table cannot be read, with billing on
+      off          — ANCHOR_BILLING_ENABLED=false; reported, never degrades
+      ok           — receipts ingestable, nothing rejected, no unpaid bill
+                     older than 24h. With bills 0 this is "no receipts
+                     yet", distinct from rejection.
+      rejected     — receipt lines are being rejected as malformed
+                     (rejected > 0); degrades. The three below outrank it.
+      receipts_off — the calendar says it is anchoring without writing
+                     receipts (its homepage line "Anchor receipts: off"):
+                     every anchor from here is unbilled. receipts_state
+                     carries that reading — True on, False off, None when
+                     the calendar did not say (unreachable, or a fork
+                     without the line), which never degrades on its own.
+      overdue      — an unpaid bill has sat >24h past its anchor's
+                     confirmed_at (bookkeeping alarm; sales are never gated
+                     by billing state)
+      error        — the receipts file is present but unreadable, or the
+                     bills table cannot be read, with billing on
     Ingests receipts itself so overdue is seen even if the payer never
     polls, but never mints invoices — minting is poll-only.
     Never raises — /health must never crash."""
@@ -1827,6 +1865,8 @@ def _billing_status() -> tuple[str, int, int]:
         return "error", 0, 0
     if overdue:
         return "overdue", bills, rejected
+    if receipts_state is False:
+        return "receipts_off", bills, rejected
     if rejected:
         return "rejected", bills, rejected
     return "ok", bills, rejected
@@ -1857,6 +1897,10 @@ def health():
     else:
         payment_status = "unknown"
 
+    # With billing on, the calendar's homepage also says whether it is
+    # writing receipts ("Anchor receipts: on"/"off"); a calendar restarted
+    # with receipts off is anchoring for free, and billing must say so.
+    receipts_state = None
     if OTS_CALENDAR_URL:
         otsd_status = "ok"
         try:
@@ -1886,6 +1930,16 @@ def health():
                     OTS_CALENDAR_URL,
                 )
                 otsd_status = "error"
+            elif ANCHOR_BILLING_ENABLED:
+                if b"Anchor receipts: on" in resp.content:
+                    receipts_state = True
+                elif b"Anchor receipts: off" in resp.content:
+                    receipts_state = False
+                    logging.warning(
+                        "Health check: billing is on but otsd at %s reports "
+                        "anchor receipts off; anchors are going unbilled",
+                        OTS_CALENDAR_URL,
+                    )
         except Exception:
             logging.warning("Health check: otsd unreachable at %s", OTS_CALENDAR_URL)
             otsd_status = "error"
@@ -1899,7 +1953,7 @@ def health():
     wallet_status = _wallet_status()
     proofs_status = _proofs_status()
     backup_status = _backup_status()
-    billing_status, billing_bills, billing_rejected = _billing_status()
+    billing_status, billing_bills, billing_rejected = _billing_status(receipts_state)
 
     # L402 door: "on"/"off" — a mode, reported, never degrading; the same
     # contract as billing "off". "off" means /timestamp stamps free of charge

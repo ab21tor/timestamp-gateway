@@ -399,6 +399,8 @@ pytest -q
 | Calendar mode never falls back to the public aggregators | `test_calendar_mode_never_falls_back_to_public_calendars` |
 | Duplicate receipt lines bill once; `records: 0` never bills | `test_receipts_duplicate_txid_lines_dedupe`, `test_receipts_records_zero_not_billed_warns_txid` |
 | A bill's amount never changes after ingestion | `test_amount_sats_immutable_across_rate_change` |
+| A malformed receipt line never takes billing down; txid dedupe is case-insensitive | `test_receipts_overflow_line_rejected_not_fatal`, `test_receipts_txid_dedupe_is_case_insensitive` |
+| A calendar anchoring with receipts off degrades `/health` | `test_health_billing_receipts_off_degrades` |
 | The free door never contacts the payment backend | `test_free_mode_never_contacts_payment_backend` |
 
 ---
@@ -477,10 +479,10 @@ curl -X POST http://localhost:8000/upgrade \
 | `proofs` | `ok`; `absent` | `mismatch`, `attention`, `unknown`, `stale` |
 | `backup` | `ok`; `local_only`; `absent` | `attention`, `failed`, `unknown`, `stale` |
 | `float` | `ok`; `inactive` (no balance reading — the backstop is off) | `alarm`, `stop` |
-| `billing` | `off`; `ok` | `rejected`, `overdue`, `error` |
+| `billing` | `off`; `ok` | `rejected`, `receipts_off`, `overdue`, `error` |
 | `l402` | `on` or `off` — the door switch; never degrades | — |
 
-`billing`: `rejected` means receipt lines are being rejected as malformed (the `billing_rejected` and `billing_bills` counters are present only with billing on); `overdue` means an unpaid anchor bill is older than 24 h (a bookkeeping alarm — sales are never gated by billing state); `error` means the receipts file is present but unreadable. Details: operator guide, "Anchor billing".
+`billing`: `rejected` means receipt lines are being rejected as malformed (the `billing_rejected` and `billing_bills` counters are present only with billing on); `receipts_off` means the calendar's status page says it is anchoring without writing receipts (its `Anchor receipts: off` line) — every anchor from then on is unbilled; a calendar without that line (an older fork) reads as unknown and never degrades on its own; `overdue` means an unpaid anchor bill is older than 24 h (a bookkeeping alarm — sales are never gated by billing state); `error` means the receipts file is present but unreadable. Details: operator guide, "Anchor billing".
 
 **PAUSED switch.** A file (default `/var/lib/timestamp-gateway/PAUSED`, path in `PAUSE_FILE`). While it exists the gateway answers `/health` (`"status":"paused"`, HTTP 503) and nothing else: every other endpoint returns 503 and the obligation sweeper skips its cycles. A pause loses nothing: settlement outranks expiry, so paid tokens redeem after unpause and recorded obligations wait in the log. Create the file to stop, delete it to resume.
 
@@ -488,7 +490,7 @@ curl -X POST http://localhost:8000/upgrade \
 
 ### `/anchor-bills`
 
-With `ANCHOR_BILLING_ENABLED=true`, `GET /anchor-bills` (`Authorization: Bearer <ANCHOR_BILLS_TOKEN>`; 404 when billing is off, 401 on a missing or wrong token) returns every unpaid anchor bill with a plain bolt11 — minted on poll, never at ingestion; anchor bills are not L402 — plus the last week's paid bills and a `summary` with `unpaid_count` and `unpaid_sats`. Each bill carries its `records` count, so the standing payer audits `amount_sats` = `records` × the contracted `PER_RECORD_SATS` before paying (`records` is `null` on bills ingested under the retired markup formula; their stored amounts stand). The count errs low, with one bounded exception: a digest re-submitted across a calendar-fork restart, or past the fork's one-hour dedupe horizon, counts twice — and because the bill's record arithmetic is public, the payer's own ledger exposes any such duplicate. **Deploy order: the calendar fork must write the six-field receipt (with `records`) before this gateway version bills anything.** A receipt whose `records` is `0` (the fork could not prove a count) is never billed, with a warning naming the txid; a receipt missing `records` (an un-upgraded fork) is malformed and skipped with a warning. Rate-limited by the `/verify` bucket. Contract and example response: operator guide, "Anchor billing". Size the payer's per-bill ceiling, daily budget, and channel capacity to records-per-anchor-window × the contracted rate — operator guide, "Sizing the payer's ceilings".
+With `ANCHOR_BILLING_ENABLED=true`, `GET /anchor-bills` (`Authorization: Bearer <ANCHOR_BILLS_TOKEN>`; 404 when billing is off, 401 on a missing or wrong token) returns every unpaid anchor bill with a plain bolt11 — minted on poll, never at ingestion; anchor bills are not L402 — plus the last week's paid bills and a `summary` with `unpaid_count` and `unpaid_sats`. Each bill carries its `records` count, so the standing payer audits `amount_sats` = `records` × the contracted `PER_RECORD_SATS` before paying, refuses a count above its plausibility bound, and never pays an anchor whose txid it has paid before, whatever invoice the bill now carries (`auto-anchor/README.md`) — `records` is `null` on bills ingested under the retired markup formula; their stored amounts stand. The count errs low, with one bounded exception: a digest re-submitted across a calendar-fork restart, or past the fork's one-hour dedupe horizon, counts twice — and because the bill's record arithmetic is public, the payer's own ledger exposes any such duplicate. **Deploy order: the calendar fork must write the six-field receipt (with `records`) before this gateway version bills anything.** A receipt whose `records` is `0` (the fork could not prove a count) is never billed, with a warning naming the txid; a receipt missing `records` (an un-upgraded fork) is malformed and skipped with a warning, as is one whose txid is not 64 hex characters (txids are stored lowercase, so a re-cased copy of a line never bills an anchor twice), whose fee is negative, whose tree is empty, whose `confirmed_at` is more than a day ahead of the gateway's clock, or whose `records` × rate would not fit the ledger's 64-bit integer — each skipped with a warning, none able to stop the lines after it. Rate-limited by the `/verify` bucket. Contract and example response: operator guide, "Anchor billing". Size the payer's per-bill ceiling, daily budget, and channel capacity to records-per-anchor-window × the contracted rate — operator guide, "Sizing the payer's ceilings".
 
 **Calendar URI.** The `calendar_url` in pending attestations is the calendar's `uri` identity file, chosen once at first run and written into every attestation the calendar issues — treat it as permanent. It need not resolve: upgrades go through `/upgrade`, not that URL. For a domainless island the gateway's own onion address (`http://<your-onion>.onion/`) is the natural choice: it is already yours and lasts as long as the Tor key. With the onion as the uri, the `tor_keys` backup (operator guide, "Tor hidden service keys") protects both the front door and the name inside every attestation.
 
@@ -505,8 +507,13 @@ The gateway stores nothing for you. Two things are yours to keep:
 depth (6 blocks) returns the reorged commitments to the pending pool, and
 no receipt is written before a transaction has 6 confirmations — so a
 shallow reorg re-anchors once and bills once. That is the code path in the
-fork's `stamper.py`; neither suite has a reorg test and no live reorg is on
-record. A reorg deeper than the confirmation depth would leave
+fork's `stamper.py`, exercised by the fork's dead-cycle test and by the
+billing red-team's reorg cases (2026-09-04, six variants); no live reorg
+is on record. One consequence the fork handles explicitly: a reorg that
+takes the parent of an anchor still in flight leaves that anchor
+unbumpable, and the stamper abandons the dead cycle with one warning and
+starts a fresh one instead of waiting for a restart. A reorg deeper than
+the confirmation depth would leave
 already-written attestations pointing at an orphaned block — invalid, and
 nothing in the gateway or calendar notices (an upstream assumption this
 fork inherits). Re-verifying your anchored proofs against Bitcoin is what
