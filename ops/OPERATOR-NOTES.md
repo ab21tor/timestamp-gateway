@@ -10,7 +10,7 @@ Payment backend:
 
 - Phoenixd
 - host service (`phoenixd.service` where systemd-managed)
-- API: `127.0.0.1:9740`
+- API: `127.0.0.1:9740` by default; the shipped `deploy/phoenixd.service.example` binds `172.17.0.1:9740` (the docker0 bridge) so a container-run gateway can reach it — password-gated, reachable from every container on the host (operator guide, "Neighbours on the bridge")
 
 Local OpenTimestamps calendar:
 
@@ -39,7 +39,7 @@ Phoenixd is the live Lightning payment backend.
 
 It is managed by systemd.
 
-It listens only on localhost.
+It listens on loopback by default, or on the docker0 bridge address (`172.17.0.1`) under the shipped unit — never on a public interface.
 
 The gateway uses Phoenixd through `.env`.
 

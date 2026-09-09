@@ -101,7 +101,7 @@ The complete file list:
 - `journal.counts` — the record-count sidecar (billing evidence; 4 bytes
   per journal entry)
 - `db/` — the LevelDB of per-commitment timestamps (serves upgrades)
-- `backup_cache`
+- `backup_cache` — left behind by fork versions before 2026-09-08 (the removed `/experimental/backup` replication scheme); absent on newer calendars, harmless either way
 
 **Hot-copy consistency:** `journal` and `journal.counts` are append-only
 and copy safely while otsd runs — a torn tail entry is padded out on the
@@ -185,7 +185,7 @@ Prerequisites on the box (the script degrades loudly to `attention` when one is 
 
 Configuration lives in the gitignored `.env` (entries in `.env.example`):
 
-- `BACKUP_AGE_RECIPIENT` — age public key the archive is encrypted to. The matching private key must live off this box: it is the only way to read pushed backups, and losing it makes every one of them unrecoverable. Empty: the archive stays plaintext and is never pushed.
+- `BACKUP_AGE_RECIPIENT` — age public key the archive is encrypted to. The matching private key must live off this box: it is the only way to read pushed backups, and losing it makes every one of them unrecoverable. Empty: the archive stays plaintext, root-owned and mode 600 (it holds the hidden-service keys and macaroons), and is never pushed; only an encrypted archive is handed to the `gateway` user.
 - `BACKUP_REMOTE` — rsync destination (`user@host:path`) for the encrypted archive. Plaintext archives are never pushed. Empty: backups stay on this box. A local-only backup shares fate with the box: whatever takes the box takes every backup of it.
 - `BACKUP_KEEP` — newest archives kept locally (default 7).
 

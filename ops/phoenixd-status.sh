@@ -5,6 +5,14 @@ REPO="${REPO:-/home/gateway/timestamp-gateway}"
 SERVICE="${PHOENIXD_SERVICE:-phoenixd.service}"
 PHOENIX_HOME="${PHOENIX_HOME:-/home/gateway/phoenixd/home/.phoenix}"
 PHOENIX_URL="${PHOENIXD_URL:-http://127.0.0.1:9740}"
+# The process is matched by exact name (pgrep -x): a substring match on the
+# full argv counted this script itself, and anything else mentioning
+# "phoenixd", as a running daemon (full review D9, 2026-09-08).
+PHOENIXD_PROC="${PHOENIXD_PROC:-phoenixd}"
+# The listener check looks for the host:port PHOENIXD_URL names, not a
+# hard-wired loopback address: the shipped unit binds the docker0 bridge.
+PHOENIX_BIND="${PHOENIX_URL#*://}"
+PHOENIX_BIND="${PHOENIX_BIND%%/*}"
 
 echo "=== phoenixd status ==="
 echo "time_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -23,16 +31,16 @@ fi
 
 echo "enabled_on_boot: ${ENABLED:-unknown}"
 
-if pgrep -af phoenixd >/dev/null 2>&1; then
+if pgrep -x "$PHOENIXD_PROC" >/dev/null 2>&1; then
   echo "process: running"
 else
   echo "process: needs_attention"
 fi
 
-if ss -ltnp 2>/dev/null | grep -q '127.0.0.1:9740'; then
-  echo "api: local_only"
+if ss -ltn 2>/dev/null | grep -Fq " $PHOENIX_BIND "; then
+  echo "api: listening ($PHOENIX_BIND)"
 else
-  echo "api: needs_attention"
+  echo "api: needs_attention (nothing listening on $PHOENIX_BIND)"
 fi
 echo
 
@@ -48,9 +56,9 @@ systemctl --no-pager show "$SERVICE" \
 echo
 
 echo "=== process ==="
-# Count only — pgrep -af would echo phoenixd's argv (paths, flags) into
+# Count only — listing argv would echo phoenixd's paths and flags into
 # status output that lands in backup snapshots and journald.
-PROC_COUNT="$(pgrep -fc phoenixd 2>/dev/null || true)"
+PROC_COUNT="$(pgrep -xc "$PHOENIXD_PROC" 2>/dev/null || true)"
 echo "phoenixd_processes: ${PROC_COUNT:-0}"
 echo
 

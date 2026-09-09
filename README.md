@@ -1,6 +1,6 @@
 # timestamp-gateway
 
-timestamp-gateway is portable paid OpenTimestamps calendar-node software. It accepts a SHA-256 digest, charges a configured Lightning price, submits the paid digest to the operator's own OpenTimestamps calendar backend, and returns a raw .ots proof. It stores no files and requires no accounts; once a proof is anchored in Bitcoin it does not need to be trusted at all, and until then the pending receipt depends on the operator's calendar (see "What you must keep, and how to verify without us").
+timestamp-gateway is portable paid OpenTimestamps calendar-node software. It accepts a SHA-256 digest, charges a configured Lightning price, submits the paid digest to the operator's own OpenTimestamps calendar backend, and returns a raw .ots proof. It stores no client files and keeps no client accounts: the client-facing interface is a digest in and a proof out, and the gateway's own bookkeeping (the obligation log and the anchor-bills ledger, SQLite under `OBLIGATIONS_DB_PATH`) is operator-internal, never a client interface. Once a proof is anchored in Bitcoin it does not need to be trusted at all, and until then the pending receipt depends on the operator's calendar (see "What you must keep, and how to verify without us").
 
 This is not a hosted service. It is software for running a Lightning-gated OpenTimestamps calendar node.
 
@@ -34,6 +34,8 @@ Tor, a VPS, and Tor-only operation are each optional.
 - Provide a public calendar — the gateway is the paid front door to the operator's private calendar.
 
 **Proves when.** The digest existed before the Bitcoin block that anchors it.
+
+**Charges before the seal — the one place it does.** The L402 door takes payment at submission: what the payment buys is the calendar's pending receipt and its commitment to carry the digest in the next anchor, hours before the Bitcoin block exists. That is the retail shape, and it is the product's one exception to owing nothing until the work is sealed. The other door is the pay-after shape: with `L402_ENABLED=false` records are free at submission and the operator bills a standing payer per anchor, after it has confirmed and been receipted (operator guide, "Anchor billing"; `auto-anchor/pay-anchor-bills.sh` is the payer that audits those bills).
 
 ---
 
@@ -161,7 +163,9 @@ curl -X POST http://localhost:8000/timestamp \
 | `ANCHOR_RECEIPTS_PATH` | When billing | — | The anchor-receipts JSONL file the calendar fork writes (the path its `OTSD_ANCHOR_RECEIPTS` names). Absent file = billing on, no anchors yet — healthy. Present but unreadable = `/health` reports `billing: error`. Wiring for both deployment shapes: operator guide, "Anchor billing". |
 | `ANCHOR_BILLS_TOKEN` | When billing | — | Opaque bearer token guarding `GET /anchor-bills` (constant-time compare; 401 on missing/wrong). Operational history is not public. Generate like `L402_SECRET_HEX`. |
 | `RATE_LIMIT_PER_MINUTE` | No | `10` | Per-IP cap per minute on unauthenticated invoice minting (402 challenges). Every anonymous request makes phoenixd sign and store an invoice; this bounds what a spammer gets for free. `0` disables. Over-limit requests get 429 with Retry-After. With `L402_ENABLED=false` nothing mints, so this bucket does not apply and no rate limit remains on `/timestamp` — whatever can reach a free door can load the calendar and the anchor bill. |
-| `VERIFY_RATE_LIMIT_PER_MINUTE` | No | `30` | Per-IP cap per minute on the free proof endpoints — one bucket shared by `/verify` and `/upgrade`. Separate from the mint limit so proof polling can never starve the paid path. `0` disables. |
+| `VERIFY_RATE_LIMIT_PER_MINUTE` | No | `30` | Per-IP cap per minute on the free proof endpoints — one bucket shared by `/verify`, `/upgrade` and `/health`. Separate from the mint limit so proof polling can never starve the paid path. `0` disables. Behind the bundled Tor hidden service every onion visitor shares one bucket (the Tor container is the peer); `UPGRADE_CLIENT_TOKEN` exempts a client's `/upgrade` calls. |
+| `HEALTH_PROBE_CACHE_SECONDS` | No | `15` | `/health` caches its calendar probe (one homepage render, four bitcoind RPCs) for this long behind a single-flight lock — an expired answer is served stale while one caller refreshes it, so only a cold start makes callers wait — and `/health` is drawn from the verify bucket per peer. `0` disables the cache. |
+| `UPGRADE_CLIENT_TOKEN` | No | — | Optional bearer token that exempts `/upgrade` (never `/verify`) from the verify bucket for the client that holds it — the client adapter presents it as `GATEWAY_UPGRADE_TOKEN` so it can finish every pending proof the free door hands out (about 20 a second at the demo's rate, against a 30-a-minute anonymous budget). A wrong token is simply anonymous; unset, the header is inert. Generate like `L402_SECRET_HEX`. |
 | `L402_SECRET_HEX` | When L402 on | — | L402 macaroon root signing key (hex, at least 16 bytes; 32 recommended). Generate with `python3 -c 'import secrets; print(secrets.token_hex(32))'`. The gateway refuses to start without it when the door is on (dev-only escape: `L402_ALLOW_EPHEMERAL_SECRET=true`); never read with the door off. |
 | `OTS_BACKEND_MODE` | Yes | — | `calendar` (real mode) or `public` (compatibility/testing only) |
 | `OTS_CALENDAR_URL` | When `calendar` | — | URL of the operator-controlled otsd instance (`http://otsd:14788` for the bundled compose profile; `http://127.0.0.1:14788` on the systemd path) |
@@ -376,7 +380,7 @@ Reasoned expectations, not test results. A row moves up to Verified when a dated
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env   # fill in payment backend vars and set OTS_BACKEND_MODE
-uvicorn main:app --reload
+uvicorn main:app --reload --no-access-log
 ```
 
 ### Running the tests
@@ -426,7 +430,7 @@ Two reference clients live in sibling checkouts. The **reference standing payer*
 
 ## Verifying a proof
 
-After receiving a `.ots` file, the proof is pending calendar confirmation. Once the calendar's anchoring transaction is confirmed (timing: operator guide, "Proof lifecycle"), POST the pending proof (base64) with its digest to the gateway's `/upgrade` endpoint, which fetches the Bitcoin anchoring from the calendar and returns the anchored proof. (Plain `ots upgrade proof.ots` contacts the calendar URL inside the attestation directly, so it works only where the operator serves that URL publicly.) Then verify locally:
+After receiving a `.ots` file, the proof is pending calendar confirmation. Once the calendar's anchoring transaction is confirmed (timing: operator guide, "Proof lifecycle"), POST the pending proof (base64) with its digest to the gateway's `/upgrade` endpoint, which fetches the Bitcoin anchoring from the calendar and returns the anchored proof. A client with many pending proofs presents `UPGRADE_CLIENT_TOKEN` as a bearer on `/upgrade` and is not throttled by the verify bucket (the reference adapter does this with `GATEWAY_UPGRADE_TOKEN`). (Plain `ots upgrade proof.ots` contacts the calendar URL inside the attestation directly, so it works only where the operator serves that URL publicly and the client has whitelisted it with `-l <url>`; the public client talks only to calendars on its whitelist.) Then verify locally:
 
 ```bash
 ots verify proof.ots    # against your own Bitcoin node or a header source you trust
@@ -444,11 +448,11 @@ Both endpoints return HTTP 200 with a JSON body whose `status` field is one of:
 | `pending` | Digest matches; the proof carries a calendar attestation awaiting Bitcoin anchoring. `/upgrade` returns the anchored proof once available. |
 | `mismatch` | Well-formed proof, but it attests a different digest than the one supplied. |
 | `no_attestations` | Well-formed proof, digest matches, but no recognized (bitcoin/pending) attestations — nothing to verify or upgrade. |
-| `invalid` | The `ots` field is not decodable as an OTS proof (bad base64 or malformed bytes). |
+| `invalid` | The `ots` field is not decodable as an OTS proof (bad base64 or malformed bytes) — or a proof nested deeper than the OpenTimestamps library will parse, which gets the same verdict from the public `ots` client. |
 
 `verified` is `true` only for `anchored`.
 
-Both endpoints take the same JSON body: `digest` (64-char hex) and `ots` (the proof bytes, base64-encoded; the `tr` strips the line breaks GNU base64 inserts):
+Both endpoints take the same JSON body: `digest` (64-char hex) and `ots` (the proof bytes, base64-encoded; the `tr` strips the line breaks GNU base64 inserts). Every POST body is capped at 512 KiB — refused with 413 before it is read — and must declare its length (a chunked body is refused with 411); the proof inside is further limited to 256 KiB.
 
 ```bash
 # Verify a proof against the digest it should attest:
@@ -469,7 +473,7 @@ curl -X POST http://localhost:8000/upgrade \
 
 ### `/health`
 
-`GET /health` returns HTTP 200 with `"status":"ok"` when every field below is in its healthy set, and HTTP 503 otherwise — `"status":"degraded"`, or `"paused"` / `"auto_paused"` for the two stops described after the table. The body also carries `paused` (whether the PAUSED file exists), `payment_backend`, and `last_mint_at` (the time of the last real mint attempt; `null` before the first).
+`GET /health` (rate-limited per peer from the verify bucket; its calendar probe is cached for `HEALTH_PROBE_CACHE_SECONDS`, one render however many callers ask, and a stale answer is served while the one refresh runs) returns HTTP 200 with `"status":"ok"` when every field below is in its healthy set, and HTTP 503 otherwise — `"status":"degraded"`, or `"paused"` / `"auto_paused"` for the two stops described after the table. The body also carries `paused` (whether the PAUSED file exists), `payment_backend`, and `last_mint_at` (the time of the last real mint attempt; `null` before the first).
 
 | Field | Healthy | Degrades |
 |---|---|---|

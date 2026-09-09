@@ -186,6 +186,15 @@ def clear_rate_buckets():
 
 
 @pytest.fixture(autouse=True)
+def clear_health_probe_cache():
+    """The otsd probe is cached for HEALTH_PROBE_CACHE_SECONDS; every test
+    starts with an empty cache so its own otsd mock is what /health sees."""
+    if hasattr(main, "_health_probe_cache"):
+        main._health_probe_cache["at"] = None
+    yield
+
+
+@pytest.fixture(autouse=True)
 def clear_last_mint():
     """Reset the last-mint record to the fresh-boot state (/health payment
     'unknown') so tests that mint don't leak into later /health assertions."""
@@ -1038,16 +1047,6 @@ def test_health_fresh_boot_payment_unknown_returns_200():
     }
 
 
-def test_lnd_health_success_and_failure():
-    # The reachability probe survives on the backend for operational use;
-    # /health no longer consults it (payment derives from the last real mint).
-    backend = main.LndPaymentBackend()
-    with patch("main.requests.get", return_value=_ok_lnd()):
-        assert backend.health() is True
-    with patch("main.requests.get", side_effect=Exception("boom")):
-        assert backend.health() is False
-
-
 def test_health_otsd_down_in_calendar_mode_returns_503():
     with patch("main.requests.get", side_effect=[_fail()]):
         resp = client.get("/health")
@@ -1099,21 +1098,6 @@ def test_health_otsd_na_in_public_mode():
         "billing": "off",
         "l402": "on",
     }
-
-
-def test_lnd_health_uses_readonly_macaroon_when_set():
-    readonly = "cd" * 32
-    with patch("main.LND_READONLY_MACAROON_HEX", readonly):
-        with patch("main.requests.get", return_value=_ok_lnd()) as mock_get:
-            assert main.LndPaymentBackend().health() is True
-    assert mock_get.call_args_list[0].kwargs["headers"]["Grpc-Metadata-macaroon"] == readonly
-
-
-def test_lnd_health_falls_back_to_invoice_macaroon_when_readonly_absent():
-    with patch("main.LND_READONLY_MACAROON_HEX", None):
-        with patch("main.requests.get", return_value=_ok_lnd()) as mock_get:
-            assert main.LndPaymentBackend().health() is True
-    assert mock_get.call_args_list[0].kwargs["headers"]["Grpc-Metadata-macaroon"] == main.LND_MACAROON_HEX
 
 
 def test_health_never_raises():
@@ -1256,7 +1240,6 @@ def test_verify_bitcoin_attestation_returns_anchored_status():
         {
             "type": "bitcoin",
             "block_height": 954112,
-            "mempool_block_height_url": "https://mempool.space/block-height/954112",
         }
     ]
 
@@ -1622,16 +1605,6 @@ def test_phoenixd_lookup_invoice_expired_none_when_absent():
     with patch("main.requests.get", return_value=resp):
         status = backend.lookup_invoice(PAYMENT_HASH)
     assert status.expired is None
-
-
-def test_phoenixd_health_success_and_failure():
-    backend = main.PhoenixdPaymentBackend()
-    ok = MagicMock()
-    ok.raise_for_status.return_value = None
-    with patch("main.requests.get", return_value=ok):
-        assert backend.health() is True
-    with patch("main.requests.get", side_effect=Exception("boom")):
-        assert backend.health() is False
 
 
 def test_phoenixd_password_not_logged(caplog):
@@ -2605,6 +2578,229 @@ def test_rate_limit_zero_disables(monkeypatch):
     assert main._rate_buckets == {}  # disabled limiter keeps no state
 
 
+# 17c. /health probe cache and rate limit (D1 landing 2026-09-08)
+# Every unauthenticated GET /health used to render the calendar's homepage
+# (four bitcoind RPCs) and hold a worker for up to 50 s; the review starved
+# the stamping door with 45 concurrent calls. The otsd probe is now cached
+# for HEALTH_PROBE_CACHE_SECONDS behind a single-flight lock, and /health
+# draws from the per-peer verify bucket like /verify.
+
+import threading as _threading
+
+
+def test_health_probe_cache_knob():
+    with patch.dict(os.environ):
+        os.environ.pop("HEALTH_PROBE_CACHE_SECONDS", None)
+        assert main._parse_config().health_probe_cache_seconds == 15
+    with patch.dict(os.environ, {"HEALTH_PROBE_CACHE_SECONDS": "0"}):
+        assert main._parse_config().health_probe_cache_seconds == 0
+    for bad in ("-1", "soon"):
+        with patch.dict(os.environ, {"HEALTH_PROBE_CACHE_SECONDS": bad}):
+            with pytest.raises(RuntimeError, match="HEALTH_PROBE_CACHE_SECONDS"):
+                main._parse_config()
+
+
+def test_health_probe_single_flight_and_cached():
+    calls = []
+    def slow_get(*a, **kw):
+        calls.append(1)
+        time.sleep(0.3)
+        return _ok_otsd()
+    results = []
+    def hit():
+        results.append(client.get("/health").status_code)
+    with patch("main.requests.get", side_effect=slow_get):
+        threads = [_threading.Thread(target=hit) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        # eight concurrent callers, one homepage render
+        assert results == [200] * 8
+        assert len(calls) == 1
+        # and a later caller inside the TTL still costs nothing
+        assert client.get("/health").status_code == 200
+        assert len(calls) == 1
+        # past the TTL the probe runs again
+        main._health_probe_cache["at"] -= main.HEALTH_PROBE_CACHE_SECONDS + 1
+        assert client.get("/health").status_code == 200
+        assert len(calls) == 2
+
+
+def test_health_probe_expired_result_is_served_stale_while_one_refresh_runs():
+    """Past the TTL a flood must not pile up on the lock: one caller renders,
+    the others get the previous answer at once (only a cold start waits)."""
+    calls = []
+    gate = _threading.Event()
+    def slow_get(*a, **kw):
+        calls.append(1)
+        gate.wait(5)
+        return _ok_otsd()
+    with patch("main.requests.get", side_effect=slow_get):
+        gate.set()
+        assert client.get("/health").status_code == 200     # warm the cache
+        assert len(calls) == 1
+        gate.clear()
+        main._health_probe_cache["at"] -= main.HEALTH_PROBE_CACHE_SECONDS + 1
+        timings = []
+        def hit():
+            t0 = time.monotonic()
+            code = client.get("/health").status_code
+            timings.append((code, time.monotonic() - t0))
+        threads = [_threading.Thread(target=hit) for _ in range(8)]
+        for t in threads:
+            t.start()
+        time.sleep(0.5)
+        # seven answered from the stale result while the eighth still renders
+        fast = [t for t in timings if t[1] < 0.4]
+        assert len(fast) == 7 and all(code == 200 for code, _ in fast), timings
+        assert len(calls) == 2
+        gate.set()
+        for t in threads:
+            t.join(10)
+        assert len(timings) == 8 and len(calls) == 2
+
+
+def test_health_probe_cache_zero_probes_every_call():
+    with patch("main.HEALTH_PROBE_CACHE_SECONDS", 0):
+        with patch("main.requests.get", return_value=_ok_otsd()) as g:
+            client.get("/health")
+            client.get("/health")
+    assert g.call_count == 2
+
+
+def test_health_rate_limited_per_peer_like_verify(monkeypatch):
+    monkeypatch.setattr(main, "VERIFY_RATE_LIMIT_PER_MINUTE", 1)
+    with patch("main.requests.get", return_value=_ok_otsd()):
+        first = client.get("/health")
+        second = client.get("/health")
+    assert first.status_code == 200
+    assert second.status_code == 429
+    assert "Retry-After" in second.headers
+
+
+# 17a. Request body cap (D2 landing 2026-09-08)
+# The largest legitimate body is a /verify or /upgrade proof of 256 KiB in
+# base64 inside a small JSON object. Anything bigger is refused with 413 by
+# an ASGI middleware BEFORE the body is read — the review measured a 120 MB
+# body inflating the process by ~600 MB before the old 413 — and a chunked
+# POST (no Content-Length) is refused with 411 on the same routes.
+
+def _run_asgi(scope, body=b""):
+    """Drive main.app once and return (status, body, receive_calls)."""
+    import asyncio
+    calls = []
+    async def receive():
+        calls.append(1)
+        return {"type": "http.request", "body": body, "more_body": False}
+    sent = []
+    async def send(msg):
+        sent.append(msg)
+    asyncio.run(main.app(scope, receive, send))
+    status = next(m["status"] for m in sent if m["type"] == "http.response.start")
+    out = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
+    return status, out, len(calls)
+
+
+def _scope(path, headers, method="POST"):
+    return {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": method,
+            "scheme": "http", "path": path, "raw_path": path.encode(), "query_string": b"",
+            "root_path": "", "headers": [(k.lower().encode(), v.encode()) for k, v in headers],
+            "client": ("testclient", 1234), "server": ("testserver", 80)}
+
+
+def test_body_cap_refuses_before_reading():
+    big = str(main.MAX_REQUEST_BYTES + 1)
+    for path in ("/verify", "/upgrade", "/timestamp"):
+        status, out, receives = _run_asgi(_scope(path, [("content-type", "application/json"),
+                                                        ("content-length", big)]))
+        assert status == 413, path
+        assert receives == 0, "the body was read before the 413"
+        assert b"too large" in out
+
+
+def test_body_cap_refuses_chunked_posts():
+    status, out, receives = _run_asgi(_scope("/verify", [("content-type", "application/json"),
+                                                         ("transfer-encoding", "chunked")]))
+    assert status == 411 and receives == 0
+
+
+def test_body_cap_passes_normal_requests_and_gets():
+    ots_b64 = base64.b64encode(make_detached_ots_bytes()).decode()
+    resp = client.post("/verify", json={"digest": DIGEST, "ots": ots_b64})
+    assert resp.status_code == 200 and resp.json()["status"] == "pending"
+    # A body just under the cap still reaches the endpoint (and its own 256 KiB rule).
+    resp = client.post("/verify", json={"digest": DIGEST, "ots": "A" * (main.MAX_REQUEST_BYTES - 200)})
+    assert resp.status_code in (200, 413) and resp.status_code != 411
+    with patch("main.requests.get", side_effect=[_ok_otsd()]):
+        assert client.get("/health").status_code == 200
+
+
+def test_body_cap_value():
+    assert main.MAX_REQUEST_BYTES == 512 * 1024
+
+
+# 17b. Upgrade client token (D4 landing 2026-09-08)
+# A client that presents UPGRADE_CLIENT_TOKEN as a bearer on /upgrade is not
+# drawn from the per-peer verify bucket: the free door can produce thousands
+# of pending proofs an hour and the client must be able to finish them.
+# The token never exempts /verify, a wrong token is simply anonymous, and an
+# unset token makes the header inert.
+
+UPGRADE_TOKEN = "upgrade-client-token-for-tests"
+
+
+def _upgrade_body():
+    return {"digest": DIGEST, "ots": base64.b64encode(make_detached_ots_bytes()).decode()}
+
+
+def test_upgrade_client_token_optional_in_config():
+    with patch.dict(os.environ):
+        os.environ.pop("UPGRADE_CLIENT_TOKEN", None)
+        assert main._parse_config().upgrade_client_token is None
+    with patch.dict(os.environ, {"UPGRADE_CLIENT_TOKEN": "t0k"}):
+        assert main._parse_config().upgrade_client_token == "t0k"
+
+
+def test_upgrade_client_token_exempts_bucket(monkeypatch):
+    monkeypatch.setattr(main, "VERIFY_RATE_LIMIT_PER_MINUTE", 1)
+    monkeypatch.setattr(main, "UPGRADE_CLIENT_TOKEN", UPGRADE_TOKEN)
+    hdr = {"Authorization": f"Bearer {UPGRADE_TOKEN}"}
+    instance = MagicMock()
+    instance.get_timestamp.side_effect = Exception("not yet")
+    with patch("main.RemoteCalendar", return_value=instance):
+        codes = [client.post("/upgrade", json=_upgrade_body(), headers=hdr).status_code
+                 for _ in range(5)]
+        assert codes == [200] * 5          # never limited
+        # The exempt calls spent nothing: the anonymous budget is intact.
+        assert client.post("/upgrade", json=_upgrade_body()).status_code == 200
+        assert client.post("/upgrade", json=_upgrade_body()).status_code == 429
+
+
+def test_upgrade_wrong_or_unset_client_token_is_anonymous(monkeypatch):
+    monkeypatch.setattr(main, "VERIFY_RATE_LIMIT_PER_MINUTE", 1)
+    instance = MagicMock()
+    instance.get_timestamp.side_effect = Exception("not yet")
+    with patch("main.RemoteCalendar", return_value=instance):
+        monkeypatch.setattr(main, "UPGRADE_CLIENT_TOKEN", UPGRADE_TOKEN)
+        wrong = {"Authorization": "Bearer not-the-token"}
+        assert client.post("/upgrade", json=_upgrade_body(), headers=wrong).status_code == 200
+        assert client.post("/upgrade", json=_upgrade_body(), headers=wrong).status_code == 429
+        main._verify_rate_buckets.clear()
+        monkeypatch.setattr(main, "UPGRADE_CLIENT_TOKEN", None)
+        right = {"Authorization": f"Bearer {UPGRADE_TOKEN}"}
+        assert client.post("/upgrade", json=_upgrade_body(), headers=right).status_code == 200
+        assert client.post("/upgrade", json=_upgrade_body(), headers=right).status_code == 429
+
+
+def test_upgrade_client_token_never_exempts_verify(monkeypatch):
+    monkeypatch.setattr(main, "VERIFY_RATE_LIMIT_PER_MINUTE", 1)
+    monkeypatch.setattr(main, "UPGRADE_CLIENT_TOKEN", UPGRADE_TOKEN)
+    hdr = {"Authorization": f"Bearer {UPGRADE_TOKEN}"}
+    assert client.post("/verify", json=_upgrade_body(), headers=hdr).status_code == 200
+    assert client.post("/verify", json=_upgrade_body(), headers=hdr).status_code == 429
+
+
 # 18. Anchor billing
 # Part two of the pricing model: the calendar fork writes anchor receipts;
 # the gateway ingests them into anchor_bills and bills the standing payer
@@ -2656,7 +2852,6 @@ def _bills_backend(payment_hash=HASH_A, settled=False, expired=False):
     """A PAYMENT_BACKEND stand-in for billing tests. lookup/create behavior is
     mutated mid-test to walk an invoice through live -> expired -> settled."""
     backend = MagicMock()
-    backend.health.return_value = True
     backend.create_invoice.return_value = main.Invoice(
         bolt11=FAKE_INVOICE, payment_hash=payment_hash)
     backend.lookup_invoice.return_value = main.InvoiceStatus(
@@ -3568,3 +3763,53 @@ def test_health_l402_off_reported_never_degrades():
 def test_ui_route_removed_404():
     assert client.get("/ui").status_code == 404
     assert client.get("/ui/").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# 17d. ops/phoenixd-status.sh matches the daemon by exact process name (D9)
+# ---------------------------------------------------------------------------
+def test_phoenixd_status_matches_exact_process_name_and_configured_bind(tmp_path):
+    """Pre-fix the script ran `pgrep -af phoenixd`, which matched its own
+    argv (and any process mentioning phoenixd) so "process: running" could
+    never go red, and it looked for 127.0.0.1:9740 whatever PHOENIXD_URL
+    said. Now: pgrep -x on PHOENIXD_PROC, and the bind PHOENIXD_URL names."""
+    import subprocess
+    import stat
+
+    stubs = tmp_path / "bin"
+    stubs.mkdir()
+    calls = tmp_path / "pgrep.calls"
+
+    def stub(name, body):
+        path = stubs / name
+        path.write_text("#!/bin/sh\n" + body)
+        path.chmod(path.stat().st_mode | stat.S_IEXEC)
+
+    # The stub records its arguments and reports "one daemon" only when
+    # asked by exact name (-x: a pid; -xc: a count).
+    stub("pgrep", f'echo "$@" >> "{calls}"\n'
+                  '[ "$2" = phoenixd ] || exit 1\n'
+                  'case "$1" in -x) echo 4242 ;; -xc) echo 1 ;; *) exit 1 ;; esac\n')
+    stub("ss", 'echo "LISTEN 0 4096 172.17.0.1:9740 0.0.0.0:*"\nexit 0\n')
+    stub("systemctl", 'case "$*" in *is-active*) echo active ;; *is-enabled*) echo enabled ;; *) echo ActiveState=active ;; esac\n')
+    stub("curl", 'exit 1\n')
+
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ops", "phoenixd-status.sh")
+    env = {"PATH": f"{stubs}:{os.environ['PATH']}", "HOME": str(tmp_path),
+           "REPO": str(tmp_path / "no-repo"), "PHOENIX_HOME": str(tmp_path / "no-home"),
+           "PHOENIXD_URL": "http://172.17.0.1:9740"}
+    out = subprocess.run(["/bin/bash", script], env=env, capture_output=True, text=True, timeout=60).stdout
+
+    assert "process: running" in out
+    assert "phoenixd_processes: 1" in out
+    assert "api: listening (172.17.0.1:9740)" in out
+    recorded = calls.read_text().splitlines()
+    assert recorded and all("-x" in c for c in recorded), recorded
+    assert all("-a" not in c.split() and "-f" not in c.split() and "-af" not in c.split() for c in recorded), recorded
+
+    # The knob: a differently named binary is what gets matched.
+    env["PHOENIXD_PROC"] = "phoenixd-arm64"
+    out = subprocess.run(["/bin/bash", script], env=env, capture_output=True, text=True, timeout=60).stdout
+    assert "process: needs_attention" in out
+    assert "phoenixd-arm64" in calls.read_text()
+

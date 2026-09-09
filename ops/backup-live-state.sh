@@ -255,9 +255,10 @@ if [ -s "$OUTDIR/tar-warnings.txt" ]; then
     "tar warnings: $(head -1 "$OUTDIR/tar-warnings.txt")" || true
 fi
 
-if [ "$(id -u)" -eq 0 ] && id -u gateway >/dev/null 2>&1; then
-  chown gateway:gateway "$ARCHIVE"
-fi
+# The plaintext archive holds root-only material (hidden-service keys,
+# macaroons): it stays root-owned, mode 600, for as long as it exists.
+# Ownership is handed to the gateway user only for the encrypted archive,
+# below — a plaintext archive is never made readable to a service account.
 chmod 600 "$ARCHIVE"
 # $OUTDIR's contents travel inside the archive; drop the loose copy so
 # BACKUP_ROOT accumulates archives only.
@@ -269,6 +270,9 @@ if [ -n "$BACKUP_AGE_RECIPIENT" ]; then
   if command -v age >/dev/null 2>&1; then
     age -r "$BACKUP_AGE_RECIPIENT" -o "$ARCHIVE.age" "$ARCHIVE"
     chmod 600 "$ARCHIVE.age"
+    if [ "$(id -u)" -eq 0 ] && id -u gateway >/dev/null 2>&1; then
+      chown gateway:gateway "$ARCHIVE.age"
+    fi
     rm -f "$ARCHIVE"
     FINAL_ARCHIVE="$ARCHIVE.age"
   else

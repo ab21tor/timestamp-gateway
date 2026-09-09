@@ -51,7 +51,6 @@ class GatewayConfig:
     lnd_tls_verify: bool
     ots_backend_mode: str
     ots_calendar_url: str | None
-    lnd_readonly_macaroon_hex: str | None
     l402_enabled: bool
     l402_secret: bytes | None
     l402_token_expiry_seconds: int
@@ -75,6 +74,8 @@ class GatewayConfig:
     per_record_sats: int | None
     anchor_receipts_path: str | None
     anchor_bills_token: str | None
+    upgrade_client_token: str | None
+    health_probe_cache_seconds: int
 
 
 def _parse_config() -> GatewayConfig:
@@ -353,6 +354,24 @@ def _parse_config() -> GatewayConfig:
             f"got {verify_rate_limit_per_minute}"
         )
 
+    # Upgrade client token (optional). A client presenting it as a bearer on
+    # /upgrade is not drawn from the per-peer verify bucket: the free door
+    # can hand out thousands of pending proofs an hour, and the client that
+    # owns them must be able to finish them. It exempts /upgrade only — a
+    # wrong token is simply anonymous, and unset makes the header inert.
+    upgrade_client_token = os.getenv("UPGRADE_CLIENT_TOKEN") or None
+
+    # /health's calendar probe is cached for this many seconds behind a
+    # single-flight lock: however many callers hit /health at once, the
+    # calendar renders its homepage (four bitcoind RPCs) at most once per
+    # window. 0 disables the cache (every call probes).
+    try:
+        health_probe_cache_seconds = int(os.getenv("HEALTH_PROBE_CACHE_SECONDS", "15"))
+    except ValueError:
+        raise RuntimeError("HEALTH_PROBE_CACHE_SECONDS must be an integer")
+    if health_probe_cache_seconds < 0:
+        raise RuntimeError("HEALTH_PROBE_CACHE_SECONDS must be >= 0 (0 disables the cache)")
+
     # Whether a reverse proxy the OPERATOR controls sits in front of the
     # gateway. Only then is X-Forwarded-For consulted for the client address —
     # the header is client-forgeable and must never be trusted by default.
@@ -446,8 +465,6 @@ def _parse_config() -> GatewayConfig:
         lnd_tls_verify=os.getenv("LND_TLS_VERIFY", "false").lower() == "true",
         ots_backend_mode=mode,
         ots_calendar_url=calendar_url,
-        # optional; falls back to LND_MACAROON_HEX
-        lnd_readonly_macaroon_hex=os.getenv("LND_READONLY_MACAROON_HEX") or None,
         l402_enabled=l402_enabled,
         l402_secret=l402_secret,
         l402_token_expiry_seconds=l402_expiry,
@@ -471,6 +488,8 @@ def _parse_config() -> GatewayConfig:
         per_record_sats=per_record_sats,
         anchor_receipts_path=anchor_receipts_path,
         anchor_bills_token=anchor_bills_token,
+        upgrade_client_token=upgrade_client_token,
+        health_probe_cache_seconds=health_probe_cache_seconds,
     )
 
 
@@ -490,7 +509,6 @@ PAUSE_FILE = _CONFIG.pause_file
 LND_TLS_VERIFY = _CONFIG.lnd_tls_verify
 OTS_BACKEND_MODE = _CONFIG.ots_backend_mode
 OTS_CALENDAR_URL = _CONFIG.ots_calendar_url
-LND_READONLY_MACAROON_HEX = _CONFIG.lnd_readonly_macaroon_hex
 L402_ENABLED = _CONFIG.l402_enabled
 L402_SECRET = _CONFIG.l402_secret
 L402_TOKEN_EXPIRY_SECONDS = _CONFIG.l402_token_expiry_seconds
@@ -514,6 +532,8 @@ ANCHOR_BILLING_ENABLED = _CONFIG.anchor_billing_enabled
 PER_RECORD_SATS = _CONFIG.per_record_sats
 ANCHOR_RECEIPTS_PATH = _CONFIG.anchor_receipts_path
 ANCHOR_BILLS_TOKEN = _CONFIG.anchor_bills_token
+UPGRADE_CLIENT_TOKEN = _CONFIG.upgrade_client_token
+HEALTH_PROBE_CACHE_SECONDS = _CONFIG.health_probe_cache_seconds
 
 if not LND_TLS_VERIFY:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -827,6 +847,45 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
+# Request body cap
+# The largest legitimate body is a /verify or /upgrade proof: 256 KiB of
+# proof, base64-encoded, inside a small JSON object. Everything else is a
+# 64-hex digest. Without a cap, uvicorn buffers whatever a client sends
+# before pydantic sees it (a 120 MB body inflated the process by ~600 MB
+# before the 413 in the 2026-09-08 review), so the cap is answered by a pure
+# ASGI middleware before a single body byte is read: 413 above the cap, and
+# 411 for a body that declares no length (chunked) on the POST routes.
+MAX_REQUEST_BYTES = 512 * 1024
+
+
+class _BodyCap:
+    def __init__(self, app):
+        self.app = app
+
+    async def _answer(self, send, status: int, detail: str) -> None:
+        body = json.dumps({"detail": detail}).encode()
+        await send({"type": "http.response.start", "status": status,
+                    "headers": [(b"content-type", b"application/json"),
+                                (b"content-length", str(len(body)).encode())]})
+        await send({"type": "http.response.body", "body": body})
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope.get("method") in ("POST", "PUT", "PATCH"):
+            headers = {k.decode("latin-1").lower(): v.decode("latin-1")
+                       for k, v in scope.get("headers", [])}
+            length = headers.get("content-length")
+            if length is None or not re.fullmatch(r"[0-9]+", length):
+                await self._answer(send, 411, "Content-Length is required; chunked bodies are not accepted")
+                return
+            if int(length) > MAX_REQUEST_BYTES:
+                await self._answer(send, 413, "Request body too large")
+                return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(_BodyCap)
+
+
 def is_paused() -> bool:
     return bool(PAUSE_FILE and Path(PAUSE_FILE).exists())
 
@@ -1039,13 +1098,7 @@ def _extract_attestations(timestamp) -> list:
             )
         elif isinstance(attestation, BitcoinBlockHeaderAttestation):
             height = attestation.height
-            attestations.append(
-                {
-                    "type": "bitcoin",
-                    "block_height": height,
-                    "mempool_block_height_url": f"https://mempool.space/block-height/{height}",
-                }
-            )
+            attestations.append({"type": "bitcoin", "block_height": height})
         else:
             attestations.append(
                 {
@@ -1056,12 +1109,31 @@ def _extract_attestations(timestamp) -> list:
     return attestations
 
 
+def _undecodable_result(digest: str, upgrade: bool = False) -> dict:
+    """The /verify (and, with upgrade=True, /upgrade) answer for an ``ots``
+    field that is not even base64: the same "invalid" shape the parsers
+    return for malformed bytes, so a client sees one vocabulary."""
+    result = {
+        "digest": digest,
+        "proof_digest": None,
+        "status": "invalid",
+        "valid_ots": False,
+        "digest_match": False,
+        "bitcoin_anchored": False,
+        "verified": False,
+    }
+    if upgrade:
+        result["ots"] = None
+    result["attestations"] = []
+    return result
+
+
 def _verify_ots_bytes(digest: str, ots_bytes: bytes) -> dict:
     try:
         ctx = StreamDeserializationContext(io.BytesIO(ots_bytes))
         detached = DetachedTimestampFile.deserialize(ctx)
     except Exception:
-        logging.info("Verify failed: invalid OTS proof", exc_info=True)
+        logging.info("Verify failed: invalid OTS proof")
         return {
             "digest": digest,
             "proof_digest": None,
@@ -1117,7 +1189,7 @@ def _upgrade_pending_against_operator(timestamp, timeout) -> None:
         try:
             upgraded = calendar.get_timestamp(sub_stamp.msg, timeout=timeout)
         except Exception:
-            logging.info("Upgrade: no operator attestation available", exc_info=True)
+            logging.info("Upgrade: no operator attestation available")
             continue
         try:
             sub_stamp.merge(upgraded)
@@ -1130,7 +1202,7 @@ def _upgrade_ots_bytes(digest: str, ots_bytes: bytes) -> dict:
         ctx = StreamDeserializationContext(io.BytesIO(ots_bytes))
         detached = DetachedTimestampFile.deserialize(ctx)
     except Exception:
-        logging.info("Upgrade failed: invalid OTS proof", exc_info=True)
+        logging.info("Upgrade failed: invalid OTS proof")
         return {
             "digest": digest,
             "proof_digest": None,
@@ -1372,10 +1444,6 @@ class PaymentBackend(Protocol):
         """Look up the current state of the invoice for ``payment_hash``."""
         ...
 
-    def health(self) -> bool:
-        """Return True iff the backing node is reachable and responding."""
-        ...
-
 
 class LndPaymentBackend:
     """PaymentBackend backed by the LND REST API.
@@ -1432,22 +1500,6 @@ class LndPaymentBackend:
             memo=data.get("memo"),
             expired=None,
         )
-
-    def health(self) -> bool:
-        headers = {"Grpc-Metadata-macaroon": LND_READONLY_MACAROON_HEX or LND_MACAROON_HEX}
-        try:
-            resp = requests.get(
-                f"https://{LND_HOST}:{LND_PORT}/v1/getinfo",
-                headers=headers,
-                proxies=self._proxies(),
-                verify=LND_TLS_VERIFY,
-                timeout=5,
-            )
-            resp.raise_for_status()
-            return True
-        except Exception:
-            logging.warning("Health check: LND unreachable")
-            return False
 
 
 class PhoenixdPaymentBackend:
@@ -1510,19 +1562,6 @@ class PhoenixdPaymentBackend:
             memo=data.get("description"),
             expired=data.get("isExpired") if "isExpired" in data else None,
         )
-
-    def health(self) -> bool:
-        try:
-            resp = requests.get(
-                f"{PHOENIXD_URL}/getinfo",
-                auth=self._auth(),
-                timeout=5,
-            )
-            resp.raise_for_status()
-            return True
-        except Exception:
-            logging.warning("Health check: phoenixd unreachable")
-            return False
 
 
 def _make_payment_backend(backend_type: str) -> PaymentBackend:
@@ -1620,7 +1659,7 @@ def verify_payment(payment_hash: str, digest: str, price_sats: int) -> bool:
     if status.settled and status.amount_received_sat < status.amount_requested_sat:
         logging.warning(
             "Liquidity fee observed on %s: requested %d sat, received %d sat",
-            payment_hash,
+            _hash8(payment_hash),
             status.amount_requested_sat,
             status.amount_received_sat,
         )
@@ -1877,8 +1916,110 @@ def root():
     return {"status": "running"}
 
 
+def _probe_otsd() -> tuple[str, bool | None]:
+    """One homepage render of the calendar: (otsd_status, receipts_state).
+    otsd_status is "ok", "error", or "n/a" (no calendar URL); receipts_state
+    True/False when the page carries the "Anchor receipts" line and billing
+    is on, else None."""
+    if not OTS_CALENDAR_URL:
+        return "n/a", None
+    receipts_state = None
+    otsd_status = "ok"
+    try:
+        # (5, 45): connect is local (compose network / localhost) — 5s is
+        # generous. The read leg races otsd's FULL homepage render: otsd
+        # commits headers instantly and writes the body in ONE shot after
+        # ~4 Bitcoin RPCs over Tor, each allowed up to a 30s stall by the
+        # fork's make_proxy(timeout=30) — so a single-stall render can
+        # take ~34s. A plain 5 here timed out ~11% of such renders
+        # (2026-07-17). Paired with the fork homepage timeout: change the
+        # two together.
+        resp = requests.get(OTS_CALENDAR_URL, timeout=(5, 45))
+        resp.raise_for_status()
+        # A 200 from otsd proves nothing: its homepage (fork rpc.py,
+        # do_GET) commits the status line BEFORE any Bitcoin call, and both
+        # failure shapes — make_proxy() raising, or the first RPC call dying
+        # after the headers went out — yield an empty 200 body. "Best-block"
+        # renders only after getbestblockhash and getblockcount both
+        # succeed, so its presence is the only external proof that otsd's
+        # Bitcoin RPC path is alive. Residual: this proves RPC reachability,
+        # not that the stamper thread is unwedged — that class surfaces in
+        # the proofs-status field, with hours of latency.
+        if b"Best-block" not in resp.content:
+            logging.warning(
+                "Health check: otsd HTTP up but Bitcoin-blind at %s "
+                "(homepage lacks the Best-block marker)",
+                OTS_CALENDAR_URL,
+            )
+            otsd_status = "error"
+        elif ANCHOR_BILLING_ENABLED:
+            if b"Anchor receipts: on" in resp.content:
+                receipts_state = True
+            elif b"Anchor receipts: off" in resp.content:
+                receipts_state = False
+                logging.warning(
+                    "Health check: billing is on but otsd at %s reports "
+                    "anchor receipts off; anchors are going unbilled",
+                    OTS_CALENDAR_URL,
+                )
+    except Exception:
+        logging.warning("Health check: otsd unreachable at %s", OTS_CALENDAR_URL)
+        otsd_status = "error"
+    return otsd_status, receipts_state
+
+
+# The probe's cache: one homepage render per HEALTH_PROBE_CACHE_SECONDS,
+# however many callers ask. The lock makes concurrent callers wait for the
+# one render in flight instead of starting their own (single flight), so a
+# flood of /health can no longer hold every worker on the calendar or make
+# bitcoind answer four RPCs per hit (2026-09-08 review, D1).
+_health_probe_lock = threading.Lock()
+_health_probe_cache: dict = {"at": None, "result": None}
+
+
+def _otsd_probe_cached() -> tuple[str, bool | None]:
+    """The calendar probe, at most one render in flight and at most one per
+    HEALTH_PROBE_CACHE_SECONDS. A result inside the TTL is served as is. An
+    expired result is served stale while one caller refreshes it, so a
+    flood of /health during a slow render costs one render and holds one
+    worker thread, not one per caller. Only the cold start — no result yet
+    — makes concurrent callers wait for the first render (bounded by the
+    per-peer bucket /health draws from)."""
+    if HEALTH_PROBE_CACHE_SECONDS <= 0:
+        return _probe_otsd()
+    now = time.monotonic()
+    at = _health_probe_cache["at"]
+    if at is not None and now - at < HEALTH_PROBE_CACHE_SECONDS:
+        return _health_probe_cache["result"]
+    if at is not None and not _health_probe_lock.acquire(blocking=False):
+        # A refresh is in flight: the stale answer, now.
+        return _health_probe_cache["result"]
+    if at is None:
+        _health_probe_lock.acquire()
+    try:
+        now = time.monotonic()
+        at = _health_probe_cache["at"]
+        if at is not None and now - at < HEALTH_PROBE_CACHE_SECONDS:
+            return _health_probe_cache["result"]
+        result = _probe_otsd()
+        _health_probe_cache["at"] = time.monotonic()
+        _health_probe_cache["result"] = result
+        return result
+    finally:
+        _health_probe_lock.release()
+
+
 @app.get("/health")
-def health():
+def health(request: Request):
+    # The same per-peer budget as /verify: /health used to be the one
+    # unlimited, unauthenticated route, and each hit cost a calendar render.
+    retry_after = _verify_rate_limit_retry_after(_client_ip(request))
+    if retry_after is not None:
+        raise HTTPException(
+            status_code=429,
+            headers={"Retry-After": str(retry_after)},
+            detail={"status": "rate_limited", "retry_after_seconds": retry_after},
+        )
     paused = is_paused()
     # Float backstop: ok / alarm / stop / inactive. "stop" is the gateway's
     # own full stop (overall "auto_paused"); the operator's PAUSED file wins
@@ -1900,51 +2041,7 @@ def health():
     # With billing on, the calendar's homepage also says whether it is
     # writing receipts ("Anchor receipts: on"/"off"); a calendar restarted
     # with receipts off is anchoring for free, and billing must say so.
-    receipts_state = None
-    if OTS_CALENDAR_URL:
-        otsd_status = "ok"
-        try:
-            # (5, 45): connect is local (compose network / localhost) — 5s is
-            # generous. The read leg races otsd's FULL homepage render: otsd
-            # commits headers instantly and writes the body in ONE shot after
-            # ~4 Bitcoin RPCs over Tor, each allowed up to a 30s stall by the
-            # fork's make_proxy(timeout=30) — so a single-stall render can
-            # take ~34s. A plain 5 here timed out ~11% of such renders
-            # (2026-07-17). Paired with the fork homepage timeout: change the
-            # two together.
-            resp = requests.get(OTS_CALENDAR_URL, timeout=(5, 45))
-            resp.raise_for_status()
-            # A 200 from otsd proves nothing: its homepage (fork rpc.py,
-            # do_GET) commits the status line BEFORE any Bitcoin call, and both
-            # failure shapes — make_proxy() raising, or the first RPC call dying
-            # after the headers went out — yield an empty 200 body. "Best-block"
-            # renders only after getbestblockhash and getblockcount both
-            # succeed, so its presence is the only external proof that otsd's
-            # Bitcoin RPC path is alive. Residual: this proves RPC reachability,
-            # not that the stamper thread is unwedged — that class surfaces in
-            # the proofs-status field, with hours of latency.
-            if b"Best-block" not in resp.content:
-                logging.warning(
-                    "Health check: otsd HTTP up but Bitcoin-blind at %s "
-                    "(homepage lacks the Best-block marker)",
-                    OTS_CALENDAR_URL,
-                )
-                otsd_status = "error"
-            elif ANCHOR_BILLING_ENABLED:
-                if b"Anchor receipts: on" in resp.content:
-                    receipts_state = True
-                elif b"Anchor receipts: off" in resp.content:
-                    receipts_state = False
-                    logging.warning(
-                        "Health check: billing is on but otsd at %s reports "
-                        "anchor receipts off; anchors are going unbilled",
-                        OTS_CALENDAR_URL,
-                    )
-        except Exception:
-            logging.warning("Health check: otsd unreachable at %s", OTS_CALENDAR_URL)
-            otsd_status = "error"
-    else:
-        otsd_status = "n/a"
+    otsd_status, receipts_state = _otsd_probe_cached()
 
     # File-mediated fields (wallet, proofs, backup) and billing: each
     # classifier's docstring lists its vocabulary. "absent", "local_only",
@@ -2137,19 +2234,7 @@ def verify(body: VerifyRequest, request: Request):
     try:
         ots_bytes = base64.b64decode(body.ots, validate=True)
     except Exception:
-        return JSONResponse(
-            status_code=200,
-            content={
-                "digest": body.digest,
-                "proof_digest": None,
-                "status": "invalid",
-                "valid_ots": False,
-                "digest_match": False,
-                "bitcoin_anchored": False,
-                "verified": False,
-                "attestations": [],
-            },
-        )
+        return JSONResponse(status_code=200, content=_undecodable_result(body.digest))
 
     if len(ots_bytes) > MAX_VERIFY_OTS_BYTES:
         raise HTTPException(status_code=413, detail="OTS proof too large")
@@ -2157,10 +2242,27 @@ def verify(body: VerifyRequest, request: Request):
     return JSONResponse(content=_verify_ots_bytes(body.digest, ots_bytes))
 
 
+def _has_upgrade_client_token(request: Request) -> bool:
+    """True when the request carries UPGRADE_CLIENT_TOKEN as a bearer
+    (constant-time compare). False when the token is unset, absent, or wrong
+    — the request is then an anonymous one, drawn from the verify bucket."""
+    if not UPGRADE_CLIENT_TOKEN:
+        return False
+    auth = request.headers.get("Authorization", "")
+    provided = auth[len("Bearer "):] if auth.startswith("Bearer ") else ""
+    return bool(provided) and secrets.compare_digest(
+        provided.encode(), UPGRADE_CLIENT_TOKEN.encode()
+    )
+
+
 @app.post("/upgrade")
 def upgrade(body: VerifyRequest, request: Request):
-    # Same pre-decode gate as /verify — one shared bucket for both.
-    retry_after = _verify_rate_limit_retry_after(_client_ip(request))
+    # Same pre-decode gate as /verify — one shared bucket for both — unless
+    # the caller is the client the operator issued UPGRADE_CLIENT_TOKEN to.
+    retry_after = (
+        None if _has_upgrade_client_token(request)
+        else _verify_rate_limit_retry_after(_client_ip(request))
+    )
     if retry_after is not None:
         raise HTTPException(
             status_code=429,
@@ -2170,20 +2272,7 @@ def upgrade(body: VerifyRequest, request: Request):
     try:
         ots_bytes = base64.b64decode(body.ots, validate=True)
     except Exception:
-        return JSONResponse(
-            status_code=200,
-            content={
-                "digest": body.digest,
-                "proof_digest": None,
-                "status": "invalid",
-                "valid_ots": False,
-                "digest_match": False,
-                "bitcoin_anchored": False,
-                "verified": False,
-                "ots": None,
-                "attestations": [],
-            },
-        )
+        return JSONResponse(status_code=200, content=_undecodable_result(body.digest, upgrade=True))
     if len(ots_bytes) > MAX_VERIFY_OTS_BYTES:
         raise HTTPException(status_code=413, detail="OTS proof too large")
     return JSONResponse(content=_upgrade_ots_bytes(body.digest, ots_bytes))
