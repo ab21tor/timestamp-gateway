@@ -4,6 +4,8 @@ timestamp-gateway is portable paid OpenTimestamps calendar-node software. It acc
 
 This is not a hosted service. It is software for running a Lightning-gated OpenTimestamps calendar node.
 
+Two shapes share the calendar. This repo, with the `auto-anchor` payer and the `api-endpoint` adapter in its `GATEWAY_URL` mode, is the **hosted** shape: a door sold across a trust boundary. The **appliance** shape runs the calendar alone on one box with its own bitcoind, the adapter in its `CALENDAR_URL` mode, the self-stamper and the watcher — no gateway, no Lightning, no payer — and is installed from the fork's README, "The appliance shape" (`docker-compose.enterprise.yml`; its `Dockerfile` is a copy of `otsd/Dockerfile` here, kept in step by hand).
+
 ```
 client
   → Lightning-gated gateway       (this repo)

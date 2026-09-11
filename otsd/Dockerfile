@@ -9,6 +9,11 @@
 # docker compose provides it automatically via additional_contexts and
 # OTSD_FORK_PATH (Compose v2.17+ / BuildKit required).
 # Known-good resolved versions: opentimestamps 0.4.5, python-bitcoinlib 0.11.2.
+#
+# A COPY of this file lives at the fork's root (opentimestamps-server/
+# Dockerfile, 2026-09-11) for the appliance shape, where the fork checkout is
+# the build context and requirements.txt is read from "." instead of the
+# named context. Keep the two in step: base digest, the bitcoinlib pin, CMD.
 FROM python:3.11-slim@sha256:b27df5841f3355e9473f9a516d38a6783b6c8dfeacaf2d14a240f443b368ddb6
 
 RUN apt-get update -qq && apt-get install -y -qq build-essential libleveldb-dev \
