@@ -1916,69 +1916,119 @@ def root():
     return {"status": "running"}
 
 
-def _probe_otsd() -> tuple[str, bool | None]:
-    """One homepage render of the calendar: (otsd_status, receipts_state).
-    otsd_status is "ok", "error", or "n/a" (no calendar URL); receipts_state
-    True/False when the page carries the "Anchor receipts" line and billing
-    is on, else None."""
+def _probe_otsd() -> tuple[str, bool | None, list[str]]:
+    """One read of the calendar's status line: (otsd_status, receipts_state,
+    attention). otsd_status is "ok", "needs_attention", "error", or "n/a"
+    (no calendar URL); receipts_state True/False when the status says
+    anchor receipts are on/off and billing is on, else None; attention is
+    the calendar's deep-reorg findings (fork stamper.check_anchors), empty
+    when none or unstated.
+
+    The contract (fork rpc.py get_status, since c1db4dd, 2026-09-14): GET /
+    answers one JSON object. best_block is the tip as the calendar sees
+    it, null when its Bitcoin RPC path is down — the one external proof
+    that otsd can see Bitcoin, so null (or any body that is not the JSON
+    status) reads as error, exactly as the retired page's missing
+    "Best-block" marker did. anchor_receipts is "on"/"off". needs_attention
+    lists receipted anchors that left the chain: the saved proofs name a
+    block that no longer holds them, nothing is re-anchored automatically,
+    the operator decides — so it degrades. Residual, unchanged: this proves
+    RPC reachability, not that the stamper thread is unwedged; the health
+    monitor's stall alarm covers that class.
+
+    Transitional: a fork older than c1db4dd still serves the retired page.
+    Its two markers are read as before and the log names it, so the hosted
+    box can take this gateway before the fork (never the other way round).
+    Remove the fallback once no calendar serves the page."""
     if not OTS_CALENDAR_URL:
-        return "n/a", None
+        return "n/a", None, []
     receipts_state = None
+    attention: list[str] = []
     otsd_status = "ok"
     try:
         # (5, 45): connect is local (compose network / localhost) — 5s is
-        # generous. The read leg races otsd's FULL homepage render: otsd
-        # commits headers instantly and writes the body in ONE shot after
-        # ~4 Bitcoin RPCs over Tor, each allowed up to a 30s stall by the
-        # fork's make_proxy(timeout=30) — so a single-stall render can
-        # take ~34s. A plain 5 here timed out ~11% of such renders
-        # (2026-07-17). Paired with the fork homepage timeout: change the
-        # two together.
+        # generous. The read leg waits for the status to be built in full:
+        # three Bitcoin RPCs, each allowed up to a 30s stall by the fork's
+        # make_proxy(timeout=30) — a single-stall status can take ~34s. A
+        # plain 5 here timed out ~11% of such reads when the page did four
+        # RPCs over Tor (2026-07-17). Paired with the fork's status timeout:
+        # change the two together.
         resp = requests.get(OTS_CALENDAR_URL, timeout=(5, 45))
         resp.raise_for_status()
-        # A 200 from otsd proves nothing: its homepage (fork rpc.py,
-        # do_GET) commits the status line BEFORE any Bitcoin call, and both
-        # failure shapes — make_proxy() raising, or the first RPC call dying
-        # after the headers went out — yield an empty 200 body. "Best-block"
-        # renders only after getbestblockhash and getblockcount both
-        # succeed, so its presence is the only external proof that otsd's
-        # Bitcoin RPC path is alive. Residual: this proves RPC reachability,
-        # not that the stamper thread is unwedged — that class surfaces in
-        # the proofs-status field, with hours of latency.
-        if b"Best-block" not in resp.content:
-            logging.warning(
-                "Health check: otsd HTTP up but Bitcoin-blind at %s "
-                "(homepage lacks the Best-block marker)",
-                OTS_CALENDAR_URL,
-            )
-            otsd_status = "error"
-        elif ANCHOR_BILLING_ENABLED:
-            if b"Anchor receipts: on" in resp.content:
-                receipts_state = True
-            elif b"Anchor receipts: off" in resp.content:
-                receipts_state = False
+        content = resp.content or b""
+        try:
+            status = json.loads(content)
+        except ValueError:
+            status = None
+        if isinstance(status, dict):
+            if not status.get("best_block"):
                 logging.warning(
-                    "Health check: billing is on but otsd at %s reports "
-                    "anchor receipts off; anchors are going unbilled",
+                    "Health check: otsd HTTP up but Bitcoin-blind at %s "
+                    "(status best_block is null)",
                     OTS_CALENDAR_URL,
                 )
+                otsd_status = "error"
+            raw_attention = status.get("needs_attention")
+            if isinstance(raw_attention, list) and all(isinstance(f, str) for f in raw_attention):
+                attention = list(raw_attention)
+            if attention:
+                logging.warning(
+                    "Health check: otsd at %s reports %d anchor(s) needing attention "
+                    "(a receipted anchor left the chain; nothing is re-anchored "
+                    "automatically): %s",
+                    OTS_CALENDAR_URL, len(attention), "; ".join(attention),
+                )
+                if otsd_status == "ok":
+                    otsd_status = "needs_attention"
+            if ANCHOR_BILLING_ENABLED:
+                receipts = status.get("anchor_receipts")
+                if receipts == "on":
+                    receipts_state = True
+                elif receipts == "off":
+                    receipts_state = False
+        elif b"Best-block" in content:
+            # The retired page (fork before c1db4dd): read its markers, say so.
+            logging.warning(
+                "Health check: otsd at %s answers the retired status page; "
+                "its fork predates c1db4dd — upgrade it (the gateway reads the "
+                "JSON status line)",
+                OTS_CALENDAR_URL,
+            )
+            if ANCHOR_BILLING_ENABLED:
+                if b"Anchor receipts: on" in content:
+                    receipts_state = True
+                elif b"Anchor receipts: off" in content:
+                    receipts_state = False
+        else:
+            logging.warning(
+                "Health check: otsd HTTP up at %s but the body is not the JSON "
+                "status (%d bytes): Bitcoin-blind on an old fork, or a foreign page",
+                OTS_CALENDAR_URL, len(content),
+            )
+            otsd_status = "error"
+        if receipts_state is False:
+            logging.warning(
+                "Health check: billing is on but otsd at %s reports "
+                "anchor receipts off; anchors are going unbilled",
+                OTS_CALENDAR_URL,
+            )
     except Exception:
         logging.warning("Health check: otsd unreachable at %s", OTS_CALENDAR_URL)
         otsd_status = "error"
-    return otsd_status, receipts_state
+    return otsd_status, receipts_state, attention
 
 
-# The probe's cache: one homepage render per HEALTH_PROBE_CACHE_SECONDS,
+# The probe's cache: one status read per HEALTH_PROBE_CACHE_SECONDS,
 # however many callers ask. The lock makes concurrent callers wait for the
 # one render in flight instead of starting their own (single flight), so a
 # flood of /health can no longer hold every worker on the calendar or make
-# bitcoind answer four RPCs per hit (2026-09-08 review, D1).
+# bitcoind answer three RPCs per hit (2026-09-08 review, D1).
 _health_probe_lock = threading.Lock()
 _health_probe_cache: dict = {"at": None, "result": None}
 
 
-def _otsd_probe_cached() -> tuple[str, bool | None]:
-    """The calendar probe, at most one render in flight and at most one per
+def _otsd_probe_cached() -> tuple[str, bool | None, list[str]]:
+    """The calendar probe, at most one read in flight and at most one per
     HEALTH_PROBE_CACHE_SECONDS. A result inside the TTL is served as is. An
     expired result is served stale while one caller refreshes it, so a
     flood of /health during a slow render costs one render and holds one
@@ -2038,10 +2088,12 @@ def health(request: Request):
     else:
         payment_status = "unknown"
 
-    # With billing on, the calendar's homepage also says whether it is
-    # writing receipts ("Anchor receipts: on"/"off"); a calendar restarted
+    # With billing on, the calendar's status also says whether it is
+    # writing receipts (anchor_receipts "on"/"off"); a calendar restarted
     # with receipts off is anchoring for free, and billing must say so.
-    otsd_status, receipts_state = _otsd_probe_cached()
+    # otsd_attention is the calendar's deep-reorg findings, surfaced below
+    # only when there are any.
+    otsd_status, receipts_state, otsd_attention = _otsd_probe_cached()
 
     # File-mediated fields (wallet, proofs, backup) and billing: each
     # classifier's docstring lists its vocabulary. "absent", "local_only",
@@ -2093,6 +2145,10 @@ def health(request: Request):
     if ANCHOR_BILLING_ENABLED:
         content["billing_bills"] = billing_bills
         content["billing_rejected"] = billing_rejected
+    # The calendar's findings, verbatim: which receipted anchors left the
+    # chain, so the operator can act on them without opening the calendar.
+    if otsd_attention:
+        content["otsd_attention"] = otsd_attention
 
     return JSONResponse(
         status_code=200 if overall == "ok" else 503,

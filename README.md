@@ -166,7 +166,7 @@ curl -X POST http://localhost:8000/timestamp \
 | `ANCHOR_BILLS_TOKEN` | When billing | — | Opaque bearer token guarding `GET /anchor-bills` (constant-time compare; 401 on missing/wrong). Operational history is not public. Generate like `L402_SECRET_HEX`. |
 | `RATE_LIMIT_PER_MINUTE` | No | `10` | Per-IP cap per minute on unauthenticated invoice minting (402 challenges). Every anonymous request makes phoenixd sign and store an invoice; this bounds what a spammer gets for free. `0` disables. Over-limit requests get 429 with Retry-After. With `L402_ENABLED=false` nothing mints, so this bucket does not apply and no rate limit remains on `/timestamp` — whatever can reach a free door can load the calendar and the anchor bill. |
 | `VERIFY_RATE_LIMIT_PER_MINUTE` | No | `30` | Per-IP cap per minute on the free proof endpoints — one bucket shared by `/verify`, `/upgrade` and `/health`. Separate from the mint limit so proof polling can never starve the paid path. `0` disables. Behind the bundled Tor hidden service every onion visitor shares one bucket (the Tor container is the peer); `UPGRADE_CLIENT_TOKEN` exempts a client's `/upgrade` calls. |
-| `HEALTH_PROBE_CACHE_SECONDS` | No | `15` | `/health` caches its calendar probe (one homepage render, four bitcoind RPCs) for this long behind a single-flight lock — an expired answer is served stale while one caller refreshes it, so only a cold start makes callers wait — and `/health` is drawn from the verify bucket per peer. `0` disables the cache. |
+| `HEALTH_PROBE_CACHE_SECONDS` | No | `15` | `/health` caches its calendar probe (one status read, three bitcoind RPCs) for this long behind a single-flight lock — an expired answer is served stale while one caller refreshes it, so only a cold start makes callers wait — and `/health` is drawn from the verify bucket per peer. `0` disables the cache. |
 | `UPGRADE_CLIENT_TOKEN` | No | — | Optional bearer token that exempts `/upgrade` (never `/verify`) from the verify bucket for the client that holds it — the client adapter presents it as `GATEWAY_UPGRADE_TOKEN` so it can finish every pending proof the free door hands out (about 20 a second at the demo's rate, against a 30-a-minute anonymous budget). A wrong token is simply anonymous; unset, the header is inert. Generate like `L402_SECRET_HEX`. |
 | `L402_SECRET_HEX` | When L402 on | — | L402 macaroon root signing key (hex, at least 16 bytes; 32 recommended). Generate with `python3 -c 'import secrets; print(secrets.token_hex(32))'`. The gateway refuses to start without it when the door is on (dev-only escape: `L402_ALLOW_EPHEMERAL_SECRET=true`); never read with the door off. |
 | `OTS_BACKEND_MODE` | Yes | — | `calendar` (real mode) or `public` (compatibility/testing only) |
@@ -414,7 +414,7 @@ pytest -q
 ## Dependencies posture
 
 - **pymacaroons 0.13.0** (last upstream release 2018) — the L402 token core. Pure Python; its cryptography is PyNaCl, which is maintained. The pinned version is treated as code we own: the verify/reject surface (signature, digest binding, capability, tamper cases) is covered by `test_verify_token_*`, `test_malformed_authorization_returns_401`, and `test_garbage_token_logs_single_warning_no_traceback` in `test_main.py`.
-- **python-bitcoinlib** (0.12.x here; the otsd image pins 0.11.2) — upstream releases are years apart. The calendar fork codes to the 0.11.x–0.12.x intersection (`stamper.py` avoids `calc_weight()`, absent in 0.11.x); the RPC calls the fork makes are exercised by its `test_rpc_homepage.py` and `test_anchor_records.py`. Any Bitcoin Core RPC drift or CVE in this window is ours to patch.
+- **python-bitcoinlib** (0.12.x here; the otsd image pins 0.11.2) — upstream releases are years apart. The calendar fork codes to the 0.11.x–0.12.x intersection (`stamper.py` avoids `calc_weight()`, absent in 0.11.x); the RPC calls the fork makes are exercised by its `test_rpc_status.py` and `test_anchor_records.py`. Any Bitcoin Core RPC drift or CVE in this window is ours to patch.
 - **py-leveldb 0.201** (2019) — its C extension uses `PyUnicode_AS_UNICODE`, removed in CPython 3.12, which is why the calendar runs on `python:3.11-slim` (security support ends October 2027). Planned replacement: a plyvel port before mid-2027. plyvel wraps the same libleveldb, so the on-disk calendar database carries over unchanged — a code-only migration (~four call sites plus a KeyError-semantics shim).
 - **Base images** — all three Dockerfiles pin bases by digest, which also freezes CVEs. Refresh the digests and rebuild quarterly, and after any Debian or Python security advisory naming a pinned base.
 
@@ -480,7 +480,7 @@ curl -X POST http://localhost:8000/upgrade \
 | Field | Healthy | Degrades |
 |---|---|---|
 | `payment` | `ok`; `unknown` (no real mint since start) | `degraded` (the last mint failed) |
-| `otsd` | `ok`; `n/a` (public mode) | `error` (unreachable, or up but Bitcoin-blind) |
+| `otsd` | `ok`; `n/a` (public mode) | `error` (unreachable, up but Bitcoin-blind, or not answering the JSON status); `needs_attention` (the calendar's deep-reorg detector reports a receipted anchor that left the chain — the findings are in `otsd_attention`) |
 | `wallet` | `ok`; `absent` (alarm timer not installed) | `low`, `unknown`, `stale` |
 | `proofs` | `ok`; `absent` | `mismatch`, `attention`, `unknown`, `stale` |
 | `backup` | `ok`; `local_only`; `absent` | `attention`, `failed`, `unknown`, `stale` |
@@ -488,7 +488,7 @@ curl -X POST http://localhost:8000/upgrade \
 | `billing` | `off`; `ok` | `rejected`, `receipts_off`, `overdue`, `error` |
 | `l402` | `on` or `off` — the door switch; never degrades | — |
 
-`billing`: `rejected` means receipt lines are being rejected as malformed (the `billing_rejected` and `billing_bills` counters are present only with billing on); `receipts_off` means the calendar's status page says it is anchoring without writing receipts (its `Anchor receipts: off` line) — every anchor from then on is unbilled; a calendar without that line (an older fork) reads as unknown and never degrades on its own; `overdue` means an unpaid anchor bill is older than 24 h (a bookkeeping alarm — sales are never gated by billing state); `error` means the receipts file is present but unreadable. Details: operator guide, "Anchor billing".
+`otsd`: the probe reads the calendar's status line — since fork c1db4dd `GET /` on otsd is one JSON object (`best_block`, `anchor_receipts`, `needs_attention`, the queue) — and `otsd_attention` carries the calendar's findings verbatim, present only when there are any. A calendar still serving the retired status page is read through its old markers and named in the gateway log as behind; upgrade it. `billing`: `rejected` means receipt lines are being rejected as malformed (the `billing_rejected` and `billing_bills` counters are present only with billing on); `receipts_off` means the calendar's status says it is anchoring without writing receipts (`anchor_receipts: "off"`) — every anchor from then on is unbilled; a calendar that does not say (an older fork) reads as unknown and never degrades on its own; `overdue` means an unpaid anchor bill is older than 24 h (a bookkeeping alarm — sales are never gated by billing state); `error` means the receipts file is present but unreadable. Details: operator guide, "Anchor billing".
 
 **PAUSED switch.** A file (default `/var/lib/timestamp-gateway/PAUSED`, path in `PAUSE_FILE`). While it exists the gateway answers `/health` (`"status":"paused"`, HTTP 503) and nothing else: every other endpoint returns 503 and the obligation sweeper skips its cycles. A pause loses nothing: settlement outranks expiry, so paid tokens redeem after unpause and recorded obligations wait in the log. Create the file to stop, delete it to resume.
 
@@ -519,10 +519,17 @@ is on record. One consequence the fork handles explicitly: a reorg that
 takes the parent of an anchor still in flight leaves that anchor
 unbumpable, and the stamper abandons the dead cycle with one warning and
 starts a fresh one instead of waiting for a restart. A reorg deeper than
-the confirmation depth would leave
-already-written attestations pointing at an orphaned block — invalid, and
-nothing in the gateway or calendar notices (an upstream assumption this
-fork inherits). Re-verifying your anchored proofs against Bitcoin is what
-would expose it; 6-deep reorgs are historically extraordinary events.
+the confirmation depth would leave already-written attestations pointing
+at an orphaned block — invalid. The calendar's deep-reorg detector (fork
+README, "Deep-reorg detector", 2026-09-14) asks the wallet hourly about
+the last hundred receipted anchors and reports one that left the chain in
+its status line's `needs_attention`, logged at ERROR, never re-anchored
+automatically; the gateway's `/health` carries it as `otsd:
+needs_attention` (503) with the findings in `otsd_attention`, and the
+health monitor alerts on the transition like any other degradation. What
+the detector cannot see: an anchor re-mined at the same height after a
+calendar restart (fork README, "Deep-reorg detector"). Re-verifying your
+anchored proofs against Bitcoin remains the check of last resort; 6-deep
+reorgs are historically extraordinary events.
 
 **Verifying needs no vendor.** An anchored proof verifies with `ots verify` — open-source client, no account, no API of ours — against your own Bitcoin node or a block-header source you chose to trust. That choice is the whole trust decision: with your own node, verification is fully independent of this gateway, the calendar, and every third party; with someone else's headers or a web verifier, you are trusting that party for the verdict, not us. Nothing in the anchored proof references any service that needs to stay alive.

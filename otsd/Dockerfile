@@ -8,13 +8,18 @@
 #   docker build -t otsd-local --build-context fork=/path/to/opentimestamps-server otsd/
 # docker compose provides it automatically via additional_contexts and
 # OTSD_FORK_PATH (Compose v2.17+ / BuildKit required).
-# Known-good resolved versions: opentimestamps 0.4.5, python-bitcoinlib 0.11.2.
+# Known-good resolved versions: opentimestamps 0.4.5, plyvel 1.5.1 (built
+# from source against Debian 13's libleveldb 1.23), python-bitcoinlib 0.11.2.
+# python:3.13-slim (2026-09-14, mirroring fork ce8a63e): the 3.11 pin went
+# with py-leveldb; plyvel reads the same LevelDB files, no calendar
+# migration. A fork checkout older than ce8a63e still lists py-leveldb in
+# its requirements.txt and will not build on this base.
 #
 # A COPY of this file lives at the fork's root (opentimestamps-server/
 # Dockerfile, 2026-09-11) for the appliance shape, where the fork checkout is
 # the build context and requirements.txt is read from "." instead of the
 # named context. Keep the two in step: base digest, the bitcoinlib pin, CMD.
-FROM python:3.11-slim@sha256:b27df5841f3355e9473f9a516d38a6783b6c8dfeacaf2d14a240f443b368ddb6
+FROM python:3.13-slim@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285
 
 RUN apt-get update -qq && apt-get install -y -qq build-essential libleveldb-dev \
     && rm -rf /var/lib/apt/lists/*

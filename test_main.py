@@ -145,17 +145,15 @@ def _ok_lnd():
 
 
 def _ok_otsd():
-    m = MagicMock()
-    m.raise_for_status.return_value = None
-    # Minimal healthy homepage: the Best-block marker renders only after
+    # The calendar's healthy status line: best_block is set only after
     # otsd's Bitcoin RPC calls succeed (see the /health probe comment).
-    m.content = b"<html>Best-block: 00000000abc, height 900000</html>"
-    return m
+    return _otsd_status()
 
 
 def _blind_otsd(body):
-    """otsd's Bitcoin-blind shape: the 200 was committed before any Bitcoin
-    call, so the body is empty (or at least missing the Best-block marker)."""
+    """A 200 whose body is not the JSON status: an old fork's Bitcoin-blind
+    shape (its 200 was committed before any Bitcoin call, so the body was
+    empty or lacked the page marker), or a foreign page."""
     m = MagicMock()
     m.raise_for_status.return_value = None
     m.content = body
@@ -1056,9 +1054,9 @@ def test_health_otsd_down_in_calendar_mode_returns_503():
 
 
 def test_health_otsd_bitcoin_blind_empty_200_returns_503(caplog):
-    # otsd commits its 200 before any Bitcoin call, so a dead Bitcoin RPC
-    # yields an empty 200 body. That must read as error, not ok — and the
-    # log line must name the condition.
+    # An old fork committed its 200 before any Bitcoin call, so a dead
+    # Bitcoin RPC yielded an empty 200 body. That must read as error, not
+    # ok — and the log line must name the condition.
     with patch("main.requests.get", side_effect=[_blind_otsd(b"")]):
         with caplog.at_level(logging.WARNING):
             resp = client.get("/health")
@@ -1069,8 +1067,9 @@ def test_health_otsd_bitcoin_blind_empty_200_returns_503(caplog):
 
 
 def test_health_otsd_markerless_200_returns_503():
-    # A rendered body without the Best-block marker (template drift, partial
-    # render) fails loud rather than passing as healthy.
+    # A page that is neither the JSON status nor the retired page with its
+    # marker (template drift, partial render) fails loud rather than
+    # passing as healthy.
     with patch("main.requests.get",
                side_effect=[_blind_otsd(b"<html>calendar</html>")]):
         resp = client.get("/health")
@@ -1108,12 +1107,11 @@ def test_health_never_raises():
 
 
 def test_health_otsd_probe_timeout_pairs_with_fork_homepage():
-    """The otsd probe's read leg races otsd's FULL homepage render (headers
-    commit instantly; the body arrives in one write after ~4 Bitcoin RPCs over
-    Tor, each allowed a 30s stall by the fork's make_proxy(timeout=30)), so a
-    single-stall render can take ~34s. A plain timeout=5 marked ~11% of
-    such renders red (2026-07-17). Pin (5, 45) so neither side of the pair
-    moves alone."""
+    """The otsd probe's read leg waits for the status to be built in full
+    (three Bitcoin RPCs, each allowed a 30s stall by the fork's
+    make_proxy(timeout=30)), so a single-stall read can take ~34s. A plain
+    timeout=5 marked ~11% of the old page's renders red (2026-07-17). Pin
+    (5, 45) so neither side of the pair moves alone."""
     with patch("main.requests.get", side_effect=[_ok_otsd()]) as mock_get:
         resp = client.get("/health")
     assert resp.status_code == 200
@@ -3490,8 +3488,21 @@ def test_health_billing_records_zero_is_not_rejected(anchor_billing):
 
 
 def _otsd_page(receipts):
-    """A healthy otsd homepage whose "Anchor receipts" line says on, off, or
-    (None) nothing at all — the fork before the line existed."""
+    """A healthy otsd status whose anchor_receipts says on, off, or (None)
+    nothing at all — a fork before the field existed."""
+    value = {True: "on", False: "off", None: None}[receipts]
+    m = _otsd_status(receipts=value)
+    if value is None:
+        import json as _json
+        body = _json.loads(m.content)
+        del body["anchor_receipts"]
+        m.content = (_json.dumps(body) + "\n").encode()
+    return m
+
+
+def _otsd_legacy_page(receipts):
+    """The retired donation page (fork before c1db4dd) with its two markers:
+    what a hosted box still serves until it takes the fork."""
     m = MagicMock()
     m.raise_for_status.return_value = None
     marker = {True: "Anchor receipts: on", False: "Anchor receipts: off", None: ""}[receipts]
@@ -3548,6 +3559,138 @@ def test_health_billing_never_mints(anchor_billing):
     _health_with_billing(backend)
     backend.create_invoice.assert_not_called()
     assert _bill_row()["payment_hash"] is None
+
+
+# 18b. The calendar's status line. Since fork c1db4dd (2026-09-14) GET / on
+# otsd is one JSON object — best_block, anchor_receipts, needs_attention and
+# the queue — not the retired donation page with its "Best-block" and
+# "Anchor receipts:" markers. The probe reads the JSON contract; the retired
+# page is still read, logged as retired, while the hosted box waits for the
+# fork (the gateway must take this change BEFORE the fork).
+
+def _otsd_status(best_block="00" * 31 + "aa", receipts="on", attention=(), **extra):
+    """otsd's status line as the fork now sends it (rpc.py get_status)."""
+    import json as _json
+    m = MagicMock()
+    m.raise_for_status.return_value = None
+    body = {"version": "0.7.1+fork", "pending_commitments": 3, "txs_waiting_for_confirmation": 0,
+            "most_recent_tx": None, "prior_versions": 0, "tip": None,
+            "best_block": best_block, "block_height": 965870 if best_block else None,
+            "balance": 212015 if best_block else None,
+            "anchor_receipts": receipts, "needs_attention": list(attention)}
+    body.update(extra)
+    if "needs_attention" in extra and extra["needs_attention"] is None:
+        del body["needs_attention"]
+    m.content = (_json.dumps(body) + "\n").encode()
+    return m
+
+
+def test_health_otsd_reads_the_json_status():
+    with patch("main.requests.get", side_effect=[_otsd_status()]):
+        resp = client.get("/health")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["otsd"] == "ok"
+    assert "otsd_attention" not in body
+
+
+def test_health_otsd_json_bitcoin_blind_is_error(caplog):
+    # best_block null: the calendar answered but cannot see Bitcoin.
+    with patch("main.requests.get", side_effect=[_otsd_status(best_block=None)]):
+        with caplog.at_level(logging.WARNING):
+            resp = client.get("/health")
+    assert resp.status_code == 503
+    assert resp.json()["otsd"] == "error"
+    assert any("Bitcoin-blind" in r.message for r in caplog.records)
+
+
+def test_health_otsd_needs_attention_degrades_and_surfaces(caplog):
+    finding = "anchor " + "3f" * 32 + " left the chain (confirmations 0, receipted at height 965866)"
+    with patch("main.requests.get", side_effect=[_otsd_status(attention=[finding])]):
+        with caplog.at_level(logging.WARNING):
+            resp = client.get("/health")
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["status"] == "degraded"
+    assert body["otsd"] == "needs_attention"
+    assert body["otsd_attention"] == [finding]
+    assert any("3f" * 32 in r.message and "attention" in r.message.lower() for r in caplog.records)
+
+
+def test_health_otsd_attention_outranked_by_bitcoin_blind():
+    # A blind calendar cannot be trusted about anything else; the finding is
+    # still surfaced in the list.
+    finding = "anchor 11aa mined again at height 10, receipted at height 2"
+    with patch("main.requests.get", side_effect=[_otsd_status(best_block=None, attention=[finding])]):
+        resp = client.get("/health")
+    body = resp.json()
+    assert body["otsd"] == "error"
+    assert body["otsd_attention"] == [finding]
+
+
+def test_health_otsd_malformed_status_is_error(caplog):
+    # Not the JSON status and not the retired page either: broken JSON, a
+    # JSON array, an empty body, a foreign page. All read as error, and the
+    # log names what came back.
+    for body in (b"{", b'["not", "an object"]', b"", b"<html>calendar</html>", b"null"):
+        caplog.clear()
+        main._health_probe_cache["at"] = None
+        with patch("main.requests.get", side_effect=[_blind_otsd(body)]):
+            with caplog.at_level(logging.WARNING):
+                resp = client.get("/health")
+        assert resp.status_code == 503, body
+        assert resp.json()["otsd"] == "error", body
+        assert any("not the JSON status" in r.message for r in caplog.records), body
+
+
+def test_health_otsd_status_without_attention_field_is_ok():
+    # A fork between the status line and the detector: no field, no finding.
+    with patch("main.requests.get", side_effect=[_otsd_status(needs_attention=None)]):
+        resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json()["otsd"] == "ok"
+
+
+def test_health_otsd_attention_must_be_a_list_of_strings():
+    # A malformed needs_attention never crashes /health: it reads as unknown.
+    for bad in ("a string", 7, {"x": 1}, [1, 2]):
+        main._health_probe_cache["at"] = None
+        with patch("main.requests.get", side_effect=[_otsd_status(needs_attention=bad)]):
+            resp = client.get("/health")
+        assert resp.status_code == 200, bad
+        assert resp.json()["otsd"] == "ok", bad
+
+
+def test_health_billing_reads_anchor_receipts_from_the_json(anchor_billing):
+    for receipts, expected, code in (("off", "receipts_off", 503), ("on", "ok", 200), (None, "ok", 200), (7, "ok", 200)):
+        main._health_probe_cache["at"] = None
+        with patch("main.PAYMENT_BACKEND", _bills_backend()):
+            with patch("main.requests.get", return_value=_otsd_status(receipts=receipts)):
+                resp = client.get("/health")
+        assert resp.status_code == code, receipts
+        assert resp.json()["billing"] == expected, receipts
+
+
+def test_health_otsd_retired_page_still_read_and_named(caplog, anchor_billing):
+    # Transitional: the hosted box takes this gateway before the fork, so the
+    # retired page must still read as healthy — and be named in the log so
+    # the operator knows the fork is behind.
+    with patch("main.PAYMENT_BACKEND", _bills_backend()):
+        with patch("main.requests.get", return_value=_otsd_legacy_page(False)):
+            with caplog.at_level(logging.WARNING):
+                resp = client.get("/health")
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["otsd"] == "ok"
+    assert body["billing"] == "receipts_off"
+    assert any("retired" in r.message for r in caplog.records)
+    # Its page without the receipts line is still healthy and unknown.
+    main._health_probe_cache["at"] = None
+    with patch("main.PAYMENT_BACKEND", _bills_backend()):
+        with patch("main.requests.get", return_value=_otsd_legacy_page(None)):
+            resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json()["billing"] == "ok"
 
 
 # 19. L402 door switch (free mode)
