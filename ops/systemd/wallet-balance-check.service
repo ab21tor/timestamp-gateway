@@ -3,6 +3,18 @@
 # A nonexistent User= fails silently — 217/USER in systemctl status, the
 # status file never appears, and /health reports this check "absent"
 # (which does not degrade health).
+#
+# Credential: the check reads WALLET_RPC_URL from
+# /etc/systemd/system/wallet-balance-check.env — a Bitcoin Core RPC user of
+# its own, whitelisted to getbalances (operator guide, "Wallet liquidity
+# alarm"), owned by User= below, mode 600. It is never the otsd wallet
+# credential (otsd.env, readable by the otsd user only) and never in the
+# gateway's .env. The script loads that file itself (WALLET_RPC_ENV_FILE);
+# the EnvironmentFile line below is the same file, so the unit and the
+# script agree, and the `-` tolerates its absence (the check then reports
+# "WALLET_RPC_URL not set" as status unknown, which /health degrades on).
+# Every other setting (WALLET_MIN_SATS, WALLET_STATUS_PATH) comes from the
+# repo .env, resolved after it is loaded (ops/lib/env.sh).
 [Unit]
 Description=timestamp-gateway otsd wallet balance check
 After=network.target
@@ -11,4 +23,5 @@ After=network.target
 Type=oneshot
 User=gateway
 WorkingDirectory=/home/gateway/timestamp-gateway
+EnvironmentFile=-/etc/systemd/system/wallet-balance-check.env
 ExecStart=/home/gateway/timestamp-gateway/ops/wallet-balance-check.sh

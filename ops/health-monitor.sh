@@ -20,14 +20,11 @@ if [ ! -x "$NOTIFY" ]; then
   exit 1
 fi
 
-# Source the gitignored .env (optional here — notify.sh enforces its own
-# requirements), then resolve settings.
-if [ -f "$REPO/.env" ]; then
-  set -a
-  # shellcheck disable=SC1091
-  . "$REPO/.env"
-  set +a
-fi
+# Load the gitignored .env (optional here — notify.sh enforces its own
+# requirements) through the shared loader, then resolve every setting.
+# shellcheck source=lib/env.sh
+. "$(cd "$(dirname "$0")" && pwd)/lib/env.sh"
+load_env
 HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:8000/health}"
 STATE_FILE="${HEALTH_MONITOR_STATE_PATH:-/var/lib/timestamp-gateway/health-monitor-state}"
 REALERT="${HEALTH_REALERT_SECONDS:-14400}"

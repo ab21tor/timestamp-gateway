@@ -128,8 +128,8 @@ client-facing API vocabulary is different and lives in the README
 | `waiting_for_payment` | — (no proof exists yet; the client holds only a 402 challenge) |
 | `receipt_issued` | `pending` |
 | `waiting_for_bitcoin` | `pending` (the API cannot distinguish these two — the split is ops-side: receipt just issued vs. anchor transaction awaiting confirmations) |
-| `bitcoin_backed` | `anchored` |
-| `needs_attention` | `mismatch`, `no_attestations`, or `invalid` — or `pending` for longer than the anchoring policy explains |
+| `bitcoin_backed` | `bitcoin_attestation_present` (structural on both sides: the ops state comes from `ots info`, the API's from the attestation node; `ots verify` against a node is the verification) |
+| `needs_attention` | `mismatch`, `no_attestations`, or `invalid` — or `pending` for longer than the anchoring policy explains; a 503 `calendar_unavailable` from `/upgrade` is the calendar not answering, not a proof state |
 
 ## Product boundary
 

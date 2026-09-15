@@ -44,7 +44,7 @@ Also present:
 
 - `PAUSED` (only when the operator has paused the gateway)
 
-For a consistent copy, back it up while the gateway is stopped, or use a `sqlite3 .backup` snapshot. `ops/backup-live-state.sh` does both protections automatically: it snapshots the database with `sqlite3 .backup` before archiving, and archives the whole `/var/lib/timestamp-gateway` directory, which captures the database and both sidecars together.
+A consistent copy is one of two things: a SQLite online snapshot (`sqlite3 .backup`, or the same API through the gateway container's python), or the raw files copied while no writer runs. A raw copy of the three files while the gateway runs is neither: the 2026-09-15 review copied the database, let a WAL checkpoint run, then copied the WAL, and the restored copy had lost the committed obligations table. `ops/backup-live-state.sh` takes the online snapshot, checks it (`ops/verify-obligations-snapshot.sh`: `PRAGMA integrity_check`, the obligations table, and the newest obligation row it read from the live database just before — that row's payment hash is written to the archive's `metadata.txt` as `obligations_newest_payment_hash`), and archives the whole `/var/lib/timestamp-gateway` directory as well. Only a snapshot that passes is usable; without one the run is `failed` while the gateway runs and `attention` (a stopped-writer copy) when it is stopped. The restore below restores the checked snapshot, not the raw files.
 
 ### Phoenixd
 
@@ -106,13 +106,14 @@ The complete file list:
 **Hot-copy consistency:** `journal` and `journal.counts` are append-only
 and copy safely while otsd runs — a torn tail entry is padded out on the
 next writer open (the journal is written fsync-per-entry). `db/` is a
-LevelDB with no online-backup method, so its copy in the archive is
-**crash-consistent at best**. The recovery implication: a torn `db/` may
-fail to open or miss entries, which costs the calendar its served-upgrade
-path for the affected old commitments — while client-held anchored proofs
-verify against Bitcoin regardless, and pending commitments re-enter
-stamping from the journal scan. For a clean `db/` copy, back up while otsd
-is stopped.
+LevelDB with no online-backup method, so its copy in the archive, taken
+while otsd runs, is **not a consistent snapshot of any instant** and may
+not open. The recovery implication: a torn `db/` may fail to open or miss
+entries, which costs the calendar its served-upgrade path for the
+affected old commitments — while client-held anchored proofs verify
+against Bitcoin regardless, and pending commitments re-enter stamping
+from the journal scan and are anchored again, in a later block, under new
+paths. For a consistent `db/` copy, back up while otsd is stopped.
 
 The running Docker container is:
 
@@ -125,7 +126,7 @@ Docker shape (the installed unit matches `deploy/otsd.service.example`):
 - working dir: `/app`
 - app mount: `/home/gateway/opentimestamps-server:/app`
 - calendar mount: `/var/lib/otsd/calendar:/calendar`
-- env: via `--env-file /etc/systemd/system/otsd.env` (holds `BITCOIN_RPC_SERVICE_URL`; owned by the service user, mode 600 — a root-owned file fails EACCES, see the template header)
+- env: via `--env-file /etc/systemd/system/otsd.env` (holds `BITCOIN_RPC_SERVICE_URL`; owned by the `otsd` service user, mode 600 — a root-owned file fails EACCES, see the template header; the `gateway` user cannot read it, by design)
 - command: `python3 otsd --calendar /calendar --btc-conf-target 12 --btc-max-fee 0.0002` (no `-v`: INFO log level)
 
 Anchoring policy: see OPERATOR-NOTES.md, "otsd boundary" (the reference
@@ -173,7 +174,7 @@ Keep artifact directories private.
 
 `ops/backup-live-state.sh` runs daily under `backup-live-state.timer` (templates in `ops/systemd/`, install command in the unit's header comment). It runs as root — parts of the backup set are readable by root only.
 
-Each run snapshots the obligation log with `sqlite3 .backup` (where the host has no sqlite3, the same online-backup API runs through the gateway container's python — read-locked, staged in the container's ephemeral `/tmp`, never writing production state), archives the critical set above (including the opentimestamps-server checkout, the Tor hidden-service keys, the anchor receipts, and the installed socat unit), encrypts the archive to `BACKUP_AGE_RECIPIENT`, pushes it to `BACKUP_REMOTE`, prunes to the `BACKUP_KEEP` newest archives — matched by archive-name pattern only, nothing else in `BACKUP_ROOT` is ever deleted — and writes `backup-status` to the state directory.
+Each run snapshots the obligation log with `sqlite3 .backup` (where the host has no sqlite3, the same online-backup API runs through the gateway container's python — read-locked, staged in the container's ephemeral `/tmp`, never writing production state) and checks the snapshot before it counts (`ops/verify-obligations-snapshot.sh`; the log line `snapshot check: usable ...` and the metadata line `obligations_snapshot_check`), archives the critical set above (including the opentimestamps-server checkout, the Tor hidden-service keys, the anchor receipts, and the installed socat unit), encrypts the archive to `BACKUP_AGE_RECIPIENT`, pushes it to `BACKUP_REMOTE`, prunes to the `BACKUP_KEEP` newest archives — matched by archive-name pattern only, nothing else in `BACKUP_ROOT` is ever deleted — and writes `backup-status` to the state directory.
 
 Layouts differ (systemd VPS vs compose island); a member's disposition follows its configured path — present, absent (degrades the run to `attention`, naming it; the archive is made without it), or declared **explicitly empty** (not applicable to this deployment shape; skipped silently) — as documented in the script header. Use empty only for a member absent *by design* here, never to paper over one that should exist. On the compose island, pass the layout as invocation env (`REPO_DIR=/root/timestamp-gateway`, `STATE_DIR=/var/lib/docker/volumes/timestamp-gateway_gateway_data/_data`, `PHOENIX_HOME=/root/.phoenix`; leaving `TOR_KEYS_DIR`/`ANCHOR_RECEIPTS_DIR` **unset** falls through to the compose-volume defaults) — the gitignored `.env` wins only for the keys it actually sets. On a bare-metal/systemd box with no inbound onion, set `TOR_KEYS_DIR=` empty (N/A) and point `ANCHOR_RECEIPTS_DIR` at the real host receipts file (`ANCHOR_RECEIPTS_PATH`, e.g. `/var/lib/otsd/calendar/anchor-receipts.jsonl`) so the billing evidence is captured by name.
 
@@ -189,7 +190,7 @@ Configuration lives in the gitignored `.env` (entries in `.env.example`):
 - `BACKUP_REMOTE` — rsync destination (`user@host:path`) for the encrypted archive. Plaintext archives are never pushed. Empty: backups stay on this box. A local-only backup shares fate with the box: whatever takes the box takes every backup of it.
 - `BACKUP_KEEP` — newest archives kept locally (default 7).
 
-Status file: `backup-status` in the state directory, one JSON line written atomically (same pattern as `wallet-status`). `status` is `ok` (encrypted and pushed), `local_only` (archive created, nothing pushed — `detail` says whether it is plaintext), `attention` (a backup exists but degraded — `detail` says why), or `failed` (no usable archive).
+Status file: `backup-status` in the state directory (`BACKUP_STATUS_PATH`), one JSON line written atomically (same pattern as `wallet-status`). `status` is `ok` (encrypted and pushed), `local_only` (archive created, nothing pushed — `detail` says whether it is plaintext), `attention` (a backup exists but degraded — `detail` says why; this includes "no usable snapshot, gateway stopped, the raw copy is a stopped-writer copy"), or `failed` (no usable archive, or no usable obligation-log snapshot while the gateway was running — the archive is still made for the other members, but the obligation log in it is not a snapshot of any instant, and `/health` degrades until a run succeeds).
 
 ## Capacity and the recovery hierarchy
 
@@ -199,7 +200,7 @@ Status file: `backup-status` in the state directory, one JSON line written atomi
 
 1. **Irreplaceable, small, and constant-size:** the phoenixd seed, the Tor hidden-service keys (the calendar's onion identity), `.env`, the calendar's `uri`/`hmac-key`, and the obligation log snapshot. Losing these loses identity or money.
 2. **The journal (and `journal.counts`) is the record.** Append-only flat files, cheap to copy, trivially consistent. Every commitment ever accepted is in the journal; the record-count sidecar can only undercount, never invent.
-3. **The LevelDB `db/` is rebuildable.** It is derived state — completed timestamps assembled from journal entries plus Bitcoin. The live-tar'd copy in the archive is best-effort (LevelDB is copied while running and a mid-compaction snapshot may not open); that is acceptable **because** it sits below the journal in this hierarchy. If a restored `db/` will not open, restore the journal and let the stamper re-derive pending state; already-anchored commitments remain provable via the Bitcoin attestations already handed to clients and the calendar's re-served history.
+3. **The LevelDB `db/` is the served history, and only partly rebuildable.** It holds the completed timestamps — each commitment's original anchor path. The live-tar'd copy in the archive is best-effort (LevelDB is copied while running and a mid-compaction snapshot may not open); if a restored `db/` will not open, restore the journal and let the stamper re-derive pending state: commitments not yet anchored are anchored again, in a later block, under new paths. Already-anchored commitments remain provable only through the attestations already handed to clients — a rebuilt `db/` does not reconstruct their original anchor paths, so a client who never upgraded a proof that had been anchored can upgrade it only to the later re-anchor.
 
 ## Minimum restore checklist
 
@@ -208,13 +209,19 @@ On a replacement box:
 1. Restore the repository.
 2. Restore `.env`.
 3. Restore `timestamp-gateway.service`.
-   - Also restore `/var/lib/timestamp-gateway` (obligation log + `PAUSED`). The gateway initialises an empty obligation log at startup only if the directory exists and is writable by the service user — it refuses to start otherwise — so on a fresh box create the directory (owned by the service user) even when not restoring old contents. Restore the contents when recovering pending obligations from the old box.
+   - Also restore `/var/lib/timestamp-gateway` (obligation log + `PAUSED`). The gateway initialises an empty obligation log at startup only if the directory exists and is writable by the service user — it refuses to start otherwise — so on a fresh box create the directory (owned by the service user) even when not restoring old contents. When recovering obligations from the old box, restore the **checked snapshot**, not the raw trio: copy the archive's `obligations.db.snapshot` to `/var/lib/timestamp-gateway/obligations.db` (no `-wal`/`-shm` beside it), then run
+
+     ```bash
+     ops/verify-obligations-snapshot.sh /var/lib/timestamp-gateway/obligations.db --expect-payment-hash <obligations_newest_payment_hash from the archive's metadata.txt>
+     ```
+
+     A `usable:` answer is the restore; an `unusable:` answer means the copy is torn or predates the run's newest obligation — the restore has failed, and the next-older archive is the one to try. Only when the archive holds no snapshot (its `backup-status` was `attention` with the stopped-writer note) do the raw files stand in, checked the same way.
 4. Restore Phoenixd binary directory.
 5. Restore Phoenixd home/state directory.
 6. Restore `phoenixd.service`.
 7. Restore `/var/lib/otsd/calendar`.
 8. Restore the `opentimestamps-server` checkout **from the archive** — never by re-cloning from GitHub. The deployed fork carries uncommitted work by design; a re-clone silently loses it and deploys different code than the calendar was running.
-9. Install `otsd.service` from `deploy/otsd.service.example` and recreate its companion `/etc/systemd/system/otsd.env` (owned by the service user, mode 600; it holds `BITCOIN_RPC_SERVICE_URL` and is NOT part of the automated backup archive — recreate it from the restored `.env`'s value). Enable the unit; it recreates the `otsd` container with the shape recorded above.
+9. Create the `otsd` system user (docker group; the lines are in `deploy/otsd.service.example`'s header), install `otsd.service` from that template and recreate its companion `/etc/systemd/system/otsd.env` (owned by `otsd`, mode 600; it holds `BITCOIN_RPC_SERVICE_URL` and is NOT part of the automated backup archive — recreate it from your credential store; on this path the URL is never in `.env`). Recreate `/etc/systemd/system/wallet-balance-check.env` (`WALLET_RPC_URL`, the alarm's whitelisted RPC user) the same way. Enable the unit; it recreates the `otsd` container with the shape recorded above.
 10. Restore `socat-bitcoin-rpc.service` from the backup archive (the installed unit carries the substituted node onion; the repo ships only the template) and enable it — without it otsd has no Bitcoin path.
 11. Restore proof artifacts if needed.
 12. Reinstall the timers and their services from `ops/systemd/` (install commands in each unit's header): `wallet-balance-check`, `health-monitor`, `timestamp-gateway-upgrade-proofs`, `backup-live-state`. Without them the restored box has no wallet alarm, no health alarms, no proof sweeper, and no backups.
@@ -235,6 +242,8 @@ Run:
 `./ops/otsd-status.sh`
 
 `./ops/list-proofs.sh`
+
+`./ops/verify-obligations-snapshot.sh /var/lib/timestamp-gateway/obligations.db --expect-payment-hash <hash from metadata.txt>` — `usable:`
 
 A healthy restored box should show:
 

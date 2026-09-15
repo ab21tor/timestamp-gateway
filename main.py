@@ -12,7 +12,6 @@ import threading
 import time
 import uuid
 import requests
-import urllib3
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -27,7 +26,7 @@ from pymacaroons.exceptions import MacaroonException
 from opentimestamps.core.op import OpSHA256
 from opentimestamps.core.timestamp import DetachedTimestampFile, Timestamp
 from opentimestamps.core.serialize import StreamSerializationContext, StreamDeserializationContext
-from opentimestamps.calendar import RemoteCalendar, DEFAULT_AGGREGATORS
+from opentimestamps.calendar import RemoteCalendar, DEFAULT_AGGREGATORS, CommitmentNotFoundError
 from opentimestamps.core.notary import PendingAttestation, BitcoinBlockHeaderAttestation
 
 
@@ -41,14 +40,9 @@ L402_CAPABILITY = "timestamp"
 class GatewayConfig:
     """Validated gateway configuration. One field per module global, named as
     the lowercase of the global it populates. Built only by _parse_config()."""
-    lnd_host: str | None
-    lnd_port: str | None
-    lnd_macaroon_hex: str | None
-    tor_proxy: str | None
     price_per_proof_sats: int | None
     stamper_fee_cap_sats: int
     pause_file: str
-    lnd_tls_verify: bool
     ots_backend_mode: str
     ots_calendar_url: str | None
     l402_enabled: bool
@@ -78,19 +72,25 @@ class GatewayConfig:
     health_probe_cache_seconds: int
 
 
+def _env(name: str, default: str | None = None) -> str | None:
+    """Read one environment variable, treating an empty value as unset.
+
+    The compose file passes the gateway container an explicit allowlist of
+    variables interpolated from .env (never the whole file), and a variable
+    the operator left out of .env arrives as the empty string. Empty and
+    absent must therefore mean the same thing everywhere in config parsing,
+    or a bare `${VAR-}` would defeat every default below."""
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return default
+    return value
+
+
 def _parse_config() -> GatewayConfig:
     """Parse and validate all required env vars. Raises RuntimeError on misconfiguration."""
-    # Determine payment backend type early so we know which vars are required.
-    # phoenixd is the live default; lnd is the test payer / alternative backend.
-    payment_backend_type_early = os.getenv("PAYMENT_BACKEND_TYPE", "phoenixd").lower()
-
     required = {
-        "OTS_BACKEND_MODE": os.getenv("OTS_BACKEND_MODE"),
+        "OTS_BACKEND_MODE": _env("OTS_BACKEND_MODE"),
     }
-    if payment_backend_type_early == "lnd":
-        required["LND_HOST"] = os.getenv("LND_HOST")
-        required["LND_PORT"] = os.getenv("LND_PORT")
-        required["LND_MACAROON_HEX"] = os.getenv("LND_MACAROON_HEX")
 
     missing = [name for name, val in required.items() if not val]
     if missing:
@@ -114,7 +114,7 @@ def _parse_config() -> GatewayConfig:
             "PRICE_CONF_TARGET",
             "PRICE_RPC_URL",
         )
-        if os.getenv(name) not in (None, "")
+        if _env(name) is not None
     ]
     if retired_present:
         logging.warning(
@@ -127,7 +127,7 @@ def _parse_config() -> GatewayConfig:
     # PRICE_MARKUP retired separately: its successor is the anchor-bill rate,
     # not the quote, so the feerate-era message above would misname it. Same
     # mechanics — fires only when itself explicitly set, never a failure.
-    if os.getenv("PRICE_MARKUP") not in (None, ""):
+    if _env("PRICE_MARKUP") is not None:
         logging.warning(
             "PRICE_MARKUP present and ignored: anchor bills are now "
             "records × PER_RECORD_SATS. Remove it from .env."
@@ -138,7 +138,7 @@ def _parse_config() -> GatewayConfig:
     # the anchor bill (records × PER_RECORD_SATS per confirmed anchor, when
     # billing is on). Strict true/false: a typo silently read as a mode would
     # change what the door charges.
-    l402_enabled_raw = os.getenv("L402_ENABLED", "true").lower()
+    l402_enabled_raw = _env("L402_ENABLED", "true").lower()
     if l402_enabled_raw not in ("true", "false"):
         raise RuntimeError(
             f"L402_ENABLED must be 'true' or 'false', got {l402_enabled_raw!r}"
@@ -152,7 +152,7 @@ def _parse_config() -> GatewayConfig:
     # the free door is L402_ENABLED=false.
     price_per_proof: int | None = None
     if l402_enabled:
-        price_per_proof_raw = os.getenv("PRICE_PER_PROOF_SATS")
+        price_per_proof_raw = _env("PRICE_PER_PROOF_SATS")
         if price_per_proof_raw is None or price_per_proof_raw == "":
             raise RuntimeError(
                 "PRICE_PER_PROOF_SATS is required — the flat price in sats every "
@@ -170,15 +170,15 @@ def _parse_config() -> GatewayConfig:
                 "For a free door set L402_ENABLED=false."
             )
 
-    pause_file = os.getenv("PAUSE_FILE", "/var/lib/timestamp-gateway/PAUSED")
+    pause_file = _env("PAUSE_FILE", "/var/lib/timestamp-gateway/PAUSED")
 
-    mode = os.getenv("OTS_BACKEND_MODE").lower()
+    mode = _env("OTS_BACKEND_MODE").lower()
     if mode not in ("calendar", "public"):
         raise RuntimeError(
             f"OTS_BACKEND_MODE must be 'calendar' or 'public', got {mode!r}"
         )
 
-    calendar_url = os.getenv("OTS_CALENDAR_URL") or None
+    calendar_url = _env("OTS_CALENDAR_URL") or None
     if mode == "calendar" and not calendar_url:
         raise RuntimeError(
             "OTS_CALENDAR_URL is required when OTS_BACKEND_MODE=calendar"
@@ -198,8 +198,8 @@ def _parse_config() -> GatewayConfig:
     # verified there.
     l402_secret: bytes | None = None
     if l402_enabled:
-        secret_hex = os.getenv("L402_SECRET_HEX") or None
-        allow_ephemeral = os.getenv("L402_ALLOW_EPHEMERAL_SECRET", "false").lower() == "true"
+        secret_hex = _env("L402_SECRET_HEX") or None
+        allow_ephemeral = _env("L402_ALLOW_EPHEMERAL_SECRET", "false").lower() == "true"
         if secret_hex:
             try:
                 l402_secret = bytes.fromhex(secret_hex)
@@ -223,7 +223,7 @@ def _parse_config() -> GatewayConfig:
             )
 
     try:
-        l402_expiry = int(os.getenv("L402_TOKEN_EXPIRY_SECONDS", "3600"))
+        l402_expiry = int(_env("L402_TOKEN_EXPIRY_SECONDS", "3600"))
     except ValueError:
         raise RuntimeError("L402_TOKEN_EXPIRY_SECONDS must be an integer")
     if l402_expiry <= 0:
@@ -231,27 +231,39 @@ def _parse_config() -> GatewayConfig:
 
     # OTS submission retry (otsd-not-ready resilience)
     try:
-        ots_max_attempts = int(os.getenv("OTS_SUBMIT_MAX_ATTEMPTS", "5"))
+        ots_max_attempts = int(_env("OTS_SUBMIT_MAX_ATTEMPTS", "5"))
     except ValueError:
         raise RuntimeError("OTS_SUBMIT_MAX_ATTEMPTS must be an integer")
     if ots_max_attempts < 1:
         raise RuntimeError("OTS_SUBMIT_MAX_ATTEMPTS must be >= 1")
 
     try:
-        ots_backoff = float(os.getenv("OTS_SUBMIT_BACKOFF_SECONDS", "2"))
+        ots_backoff = float(_env("OTS_SUBMIT_BACKOFF_SECONDS", "2"))
     except ValueError:
         raise RuntimeError("OTS_SUBMIT_BACKOFF_SECONDS must be a number")
     if ots_backoff < 0:
         raise RuntimeError("OTS_SUBMIT_BACKOFF_SECONDS must be >= 0")
 
-    payment_backend_type = os.getenv("PAYMENT_BACKEND_TYPE", "phoenixd").lower()
-    if payment_backend_type not in ("lnd", "phoenixd"):
-        raise RuntimeError("PAYMENT_BACKEND_TYPE must be 'lnd' or 'phoenixd'")
-    phoenixd_url = os.getenv("PHOENIXD_URL", "http://127.0.0.1:9740")
+    # phoenixd is the only payment backend. The LND backend was removed on
+    # 2026-09-15 (ruling: not carried unless someone actually needs it): its
+    # adapter reported no expiry, so an anchor bill whose first invoice
+    # expired was served forever without renewal, and no deployment used it.
+    # PAYMENT_BACKEND_TYPE is still read so an existing .env keeps working;
+    # any value but phoenixd is a startup failure that says why.
+    payment_backend_type = _env("PAYMENT_BACKEND_TYPE", "phoenixd").lower()
+    if payment_backend_type == "lnd":
+        raise RuntimeError(
+            "PAYMENT_BACKEND_TYPE=lnd: the LND backend was removed on 2026-09-15; "
+            "phoenixd is the only payment backend. Remove PAYMENT_BACKEND_TYPE and "
+            "the LND_* / TOR_PROXY lines from .env."
+        )
+    if payment_backend_type != "phoenixd":
+        raise RuntimeError("PAYMENT_BACKEND_TYPE must be 'phoenixd' (or unset)")
+    phoenixd_url = _env("PHOENIXD_URL", "http://127.0.0.1:9740")
     phoenixd_http_password_limited = (
-        os.getenv("PHOENIXD_HTTP_PASSWORD_LIMITED")
+        _env("PHOENIXD_HTTP_PASSWORD_LIMITED")
         # Pre-rename alias: an existing .env keeps working until swapped.
-        or os.getenv("PHOENIXD_HTTP_PASSWORD")
+        or _env("PHOENIXD_HTTP_PASSWORD")
         or None
     )
 
@@ -259,11 +271,11 @@ def _parse_config() -> GatewayConfig:
     # Path to the SQLite obligation store and how often the backstop sweeper
     # retries obligations left in needs_stamp. The store is what guarantees a
     # settled payment is never lost if calendar submission fails.
-    obligations_db_path = os.getenv(
+    obligations_db_path = _env(
         "OBLIGATIONS_DB_PATH", "/var/lib/timestamp-gateway/obligations.db"
     )
     try:
-        obligation_sweep_interval = int(os.getenv("OBLIGATION_SWEEP_INTERVAL", "1800"))
+        obligation_sweep_interval = int(_env("OBLIGATION_SWEEP_INTERVAL", "1800"))
     except ValueError:
         raise RuntimeError("OBLIGATION_SWEEP_INTERVAL must be an integer")
     if obligation_sweep_interval <= 0:
@@ -277,11 +289,11 @@ def _parse_config() -> GatewayConfig:
     # phoenixd's http-password-limited-access key — the gateway calls only
     # createinvoice, payments/incoming, and getinfo (PhoenixdPaymentBackend),
     # all covered by the limited key, which cannot reach /payinvoice.
-    wallet_status_path = os.getenv(
+    wallet_status_path = _env(
         "WALLET_STATUS_PATH", "/var/lib/timestamp-gateway/wallet-status"
     )
     try:
-        wallet_status_max_age = int(os.getenv("WALLET_STATUS_MAX_AGE_SECONDS", "3600"))
+        wallet_status_max_age = int(_env("WALLET_STATUS_MAX_AGE_SECONDS", "3600"))
     except ValueError:
         raise RuntimeError("WALLET_STATUS_MAX_AGE_SECONDS must be an integer")
     if wallet_status_max_age <= 0:
@@ -289,11 +301,11 @@ def _parse_config() -> GatewayConfig:
 
     # /health reads the status file written by ops/upgrade-all-proofs.sh (the
     # proof sweep). Same file-mediated pattern as the wallet alarm.
-    proofs_status_path = os.getenv(
+    proofs_status_path = _env(
         "PROOFS_STATUS_PATH", "/var/lib/timestamp-gateway/proofs-status"
     )
     try:
-        proofs_status_max_age = int(os.getenv("PROOFS_STATUS_MAX_AGE_SECONDS", "3600"))
+        proofs_status_max_age = int(_env("PROOFS_STATUS_MAX_AGE_SECONDS", "3600"))
     except ValueError:
         raise RuntimeError("PROOFS_STATUS_MAX_AGE_SECONDS must be an integer")
     if proofs_status_max_age <= 0:
@@ -302,11 +314,11 @@ def _parse_config() -> GatewayConfig:
     # /health reads the status file written by ops/backup-live-state.sh (the
     # backup timer). Same file-mediated pattern as the wallet alarm. Max age
     # defaults to 2x the daily timer.
-    backup_status_path = os.getenv(
+    backup_status_path = _env(
         "BACKUP_STATUS_PATH", "/var/lib/timestamp-gateway/backup-status"
     )
     try:
-        backup_status_max_age = int(os.getenv("BACKUP_STATUS_MAX_AGE_SECONDS", "172800"))
+        backup_status_max_age = int(_env("BACKUP_STATUS_MAX_AGE_SECONDS", "172800"))
     except ValueError:
         raise RuntimeError("BACKUP_STATUS_MAX_AGE_SECONDS must be an integer")
     if backup_status_max_age <= 0:
@@ -318,7 +330,7 @@ def _parse_config() -> GatewayConfig:
     # the two in sync). The gateway uses it only
     # to derive the float backstop thresholds; it makes no Bitcoin RPC calls.
     try:
-        stamper_fee_cap = int(os.getenv("STAMPER_FEE_CAP_SATS", "20000"))
+        stamper_fee_cap = int(_env("STAMPER_FEE_CAP_SATS", "20000"))
     except ValueError:
         raise RuntimeError("STAMPER_FEE_CAP_SATS must be an integer")
     if stamper_fee_cap <= 0:
@@ -331,7 +343,7 @@ def _parse_config() -> GatewayConfig:
     # request makes phoenixd sign AND durably store an invoice, so minting is
     # the one request whose backend cost is not bounded by payment. 0 disables.
     try:
-        rate_limit_per_minute = int(os.getenv("RATE_LIMIT_PER_MINUTE", "10"))
+        rate_limit_per_minute = int(_env("RATE_LIMIT_PER_MINUTE", "10"))
     except ValueError:
         raise RuntimeError("RATE_LIMIT_PER_MINUTE must be an integer")
     if rate_limit_per_minute < 0:
@@ -345,7 +357,7 @@ def _parse_config() -> GatewayConfig:
     # and a client legitimately polls /upgrade while an anchor pends — free
     # traffic must never be able to starve the paid mint path.
     try:
-        verify_rate_limit_per_minute = int(os.getenv("VERIFY_RATE_LIMIT_PER_MINUTE", "30"))
+        verify_rate_limit_per_minute = int(_env("VERIFY_RATE_LIMIT_PER_MINUTE", "30"))
     except ValueError:
         raise RuntimeError("VERIFY_RATE_LIMIT_PER_MINUTE must be an integer")
     if verify_rate_limit_per_minute < 0:
@@ -359,14 +371,14 @@ def _parse_config() -> GatewayConfig:
     # can hand out thousands of pending proofs an hour, and the client that
     # owns them must be able to finish them. It exempts /upgrade only — a
     # wrong token is simply anonymous, and unset makes the header inert.
-    upgrade_client_token = os.getenv("UPGRADE_CLIENT_TOKEN") or None
+    upgrade_client_token = _env("UPGRADE_CLIENT_TOKEN") or None
 
     # /health's calendar probe is cached for this many seconds behind a
     # single-flight lock: however many callers hit /health at once, the
     # calendar renders its homepage (four bitcoind RPCs) at most once per
     # window. 0 disables the cache (every call probes).
     try:
-        health_probe_cache_seconds = int(os.getenv("HEALTH_PROBE_CACHE_SECONDS", "15"))
+        health_probe_cache_seconds = int(_env("HEALTH_PROBE_CACHE_SECONDS", "15"))
     except ValueError:
         raise RuntimeError("HEALTH_PROBE_CACHE_SECONDS must be an integer")
     if health_probe_cache_seconds < 0:
@@ -377,7 +389,7 @@ def _parse_config() -> GatewayConfig:
     # the header is client-forgeable and must never be trusted by default.
     # Strict parse: a typo silently treated as false would bucket every client
     # under the proxy's address and rate-limit them collectively.
-    behind_proxy_raw = os.getenv("GATEWAY_BEHIND_PROXY", "false").lower()
+    behind_proxy_raw = _env("GATEWAY_BEHIND_PROXY", "false").lower()
     if behind_proxy_raw not in ("true", "false"):
         raise RuntimeError(
             f"GATEWAY_BEHIND_PROXY must be 'true' or 'false', got {behind_proxy_raw!r}"
@@ -388,7 +400,7 @@ def _parse_config() -> GatewayConfig:
     # Off by default: disabled means the three billing vars are never read and
     # every behavior stays byte-identical. Strict true/false: a typo silently
     # treated as false would turn billing off without a word.
-    anchor_billing_raw = os.getenv("ANCHOR_BILLING_ENABLED", "false").lower()
+    anchor_billing_raw = _env("ANCHOR_BILLING_ENABLED", "false").lower()
     if anchor_billing_raw not in ("true", "false"):
         raise RuntimeError(
             f"ANCHOR_BILLING_ENABLED must be 'true' or 'false', got {anchor_billing_raw!r}"
@@ -402,17 +414,17 @@ def _parse_config() -> GatewayConfig:
         # All three are operator decisions with no sane default. Every missing
         # one is named in a single error so the operator fixes them in one pass.
         missing_billing = []
-        if not os.getenv("PER_RECORD_SATS"):
+        if not _env("PER_RECORD_SATS"):
             missing_billing.append(
                 "PER_RECORD_SATS — the price in sats per record inside each "
                 "anchor (a bill is records × this rate)"
             )
-        if not os.getenv("ANCHOR_RECEIPTS_PATH"):
+        if not _env("ANCHOR_RECEIPTS_PATH"):
             missing_billing.append(
                 "ANCHOR_RECEIPTS_PATH — the anchor-receipts JSONL file the "
                 "calendar fork writes (the path its OTSD_ANCHOR_RECEIPTS names)"
             )
-        if not os.getenv("ANCHOR_BILLS_TOKEN"):
+        if not _env("ANCHOR_BILLS_TOKEN"):
             missing_billing.append(
                 "ANCHOR_BILLS_TOKEN — the bearer token guarding GET "
                 "/anchor-bills; operational history is not public"
@@ -423,7 +435,7 @@ def _parse_config() -> GatewayConfig:
             )
         # Same rule as PRICE_PER_PROOF_SATS: integer >= 1; zero is refused.
         try:
-            per_record_sats = int(os.getenv("PER_RECORD_SATS"))
+            per_record_sats = int(_env("PER_RECORD_SATS"))
         except ValueError:
             raise RuntimeError("PER_RECORD_SATS must be an integer")
         if per_record_sats < 1:
@@ -431,8 +443,8 @@ def _parse_config() -> GatewayConfig:
                 f"PER_RECORD_SATS must be >= 1, got {per_record_sats}. "
                 "To bill nothing set ANCHOR_BILLING_ENABLED=false."
             )
-        anchor_receipts_path = os.getenv("ANCHOR_RECEIPTS_PATH")
-        anchor_bills_token = os.getenv("ANCHOR_BILLS_TOKEN")
+        anchor_receipts_path = _env("ANCHOR_RECEIPTS_PATH")
+        anchor_bills_token = _env("ANCHOR_BILLS_TOKEN")
 
     # Mode announcement (free door)
     # One line at startup naming what charges. Free door with billing on is
@@ -455,14 +467,9 @@ def _parse_config() -> GatewayConfig:
             )
 
     return GatewayConfig(
-        lnd_host=os.getenv("LND_HOST"),
-        lnd_port=os.getenv("LND_PORT"),
-        lnd_macaroon_hex=os.getenv("LND_MACAROON_HEX"),
-        tor_proxy=os.getenv("TOR_PROXY") or None,  # optional; None = direct connection
         price_per_proof_sats=price_per_proof,
         stamper_fee_cap_sats=stamper_fee_cap,
         pause_file=pause_file,
-        lnd_tls_verify=os.getenv("LND_TLS_VERIFY", "false").lower() == "true",
         ots_backend_mode=mode,
         ots_calendar_url=calendar_url,
         l402_enabled=l402_enabled,
@@ -499,14 +506,9 @@ _CONFIG = _parse_config()
 # Module globals mirror the config fields one-to-one. Kept as globals (not
 # attribute reads at call sites) so tests can patch individual values via
 # patch("main.<NAME>", ...) — the established seam throughout the suite.
-LND_HOST = _CONFIG.lnd_host
-LND_PORT = _CONFIG.lnd_port
-LND_MACAROON_HEX = _CONFIG.lnd_macaroon_hex
-TOR_PROXY = _CONFIG.tor_proxy
 PRICE_PER_PROOF_SATS = _CONFIG.price_per_proof_sats
 STAMPER_FEE_CAP_SATS = _CONFIG.stamper_fee_cap_sats
 PAUSE_FILE = _CONFIG.pause_file
-LND_TLS_VERIFY = _CONFIG.lnd_tls_verify
 OTS_BACKEND_MODE = _CONFIG.ots_backend_mode
 OTS_CALENDAR_URL = _CONFIG.ots_calendar_url
 L402_ENABLED = _CONFIG.l402_enabled
@@ -534,9 +536,6 @@ ANCHOR_RECEIPTS_PATH = _CONFIG.anchor_receipts_path
 ANCHOR_BILLS_TOKEN = _CONFIG.anchor_bills_token
 UPGRADE_CLIENT_TOKEN = _CONFIG.upgrade_client_token
 HEALTH_PROBE_CACHE_SECONDS = _CONFIG.health_probe_cache_seconds
-
-if not LND_TLS_VERIFY:
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # "L402 <macaroon>:<preimage>" — the macaroon is base64 (urlsafe or standard,
 # padded or not) and never contains a colon; the preimage is 64 hex chars.
@@ -853,9 +852,26 @@ app = FastAPI(lifespan=lifespan)
 # 64-hex digest. Without a cap, uvicorn buffers whatever a client sends
 # before pydantic sees it (a 120 MB body inflated the process by ~600 MB
 # before the 413 in the 2026-09-08 review), so the cap is answered by a pure
-# ASGI middleware before a single body byte is read: 413 above the cap, and
-# 411 for a body that declares no length (chunked) on the POST routes.
+# ASGI middleware before a single body byte is read.
+#
+# Two rules, because a header check alone was bypassed (2026-09-15 review):
+# the pinned h11 accepts `Content-Length: 1` beside `Transfer-Encoding:
+# chunked`, frames the body by the chunks, and keeps both headers in the
+# request — so a middleware that trusted Content-Length let a 525 KB JSON
+# body through to a 200. Now (1) any Transfer-Encoding header is refused
+# with 411 before routing, a missing or non-numeric Content-Length with
+# 411, disagreeing repeated Content-Length headers with 400, and a declared
+# length above the cap with 413; and (2) the ASGI receive is wrapped with a
+# byte counter, so whatever the parser frames, the app never sees more than
+# the declared length: the middleware answers 413 itself and ends the
+# request. (2) is the defence in depth for a parser that frames the body by
+# something other than the header (1) checked.
 MAX_REQUEST_BYTES = 512 * 1024
+
+
+class _BodyTooLarge(Exception):
+    """Raised inside the counted receive; caught by _BodyCap, never seen by
+    the app (Starlette's ServerErrorMiddleware sits outside _BodyCap)."""
 
 
 class _BodyCap:
@@ -866,21 +882,60 @@ class _BodyCap:
         body = json.dumps({"detail": detail}).encode()
         await send({"type": "http.response.start", "status": status,
                     "headers": [(b"content-type", b"application/json"),
-                                (b"content-length", str(len(body)).encode())]})
+                                (b"content-length", str(len(body)).encode()),
+                                (b"connection", b"close")]})
         await send({"type": "http.response.body", "body": body})
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and scope.get("method") in ("POST", "PUT", "PATCH"):
-            headers = {k.decode("latin-1").lower(): v.decode("latin-1")
-                       for k, v in scope.get("headers", [])}
-            length = headers.get("content-length")
-            if length is None or not re.fullmatch(r"[0-9]+", length):
-                await self._answer(send, 411, "Content-Length is required; chunked bodies are not accepted")
-                return
-            if int(length) > MAX_REQUEST_BYTES:
-                await self._answer(send, 413, "Request body too large")
-                return
-        await self.app(scope, receive, send)
+        if scope["type"] != "http" or scope.get("method") not in ("POST", "PUT", "PATCH"):
+            await self.app(scope, receive, send)
+            return
+        headers = [(k.decode("latin-1").lower(), v.decode("latin-1").strip())
+                   for k, v in scope.get("headers", [])]
+        if any(k == "transfer-encoding" for k, _ in headers):
+            await self._answer(send, 411, "Transfer-Encoding is not accepted; send Content-Length")
+            return
+        lengths = [v for k, v in headers if k == "content-length"]
+        if not lengths:
+            await self._answer(send, 411, "Content-Length is required; chunked bodies are not accepted")
+            return
+        if len(set(lengths)) > 1 or not re.fullmatch(r"[0-9]+", lengths[0]):
+            await self._answer(send, 400, "Content-Length is ambiguous")
+            return
+        declared = int(lengths[0])
+        if declared > MAX_REQUEST_BYTES:
+            await self._answer(send, 413, "Request body too large")
+            return
+
+        state = {"received": 0, "started": False, "refused": False}
+
+        async def counted_receive():
+            if state["refused"]:
+                return {"type": "http.disconnect"}
+            message = await receive()
+            if message["type"] == "http.request":
+                state["received"] += len(message.get("body", b""))
+                if state["received"] > declared:
+                    state["refused"] = True
+                    raise _BodyTooLarge()
+            return message
+
+        async def guarded_send(message):
+            if state["refused"]:
+                return  # dropped: the 413 below is the whole answer
+            if message["type"] == "http.response.start":
+                state["started"] = True
+            await send(message)
+
+        # FastAPI wraps a body-read failure into its own 400 ("error parsing
+        # the body"), so _BodyTooLarge may surface as a dropped response
+        # rather than an exception; either way the refusal is answered here.
+        try:
+            await self.app(scope, counted_receive, guarded_send)
+        except _BodyTooLarge:
+            pass
+        if state["refused"] and not state["started"]:
+            await self._answer(send, 413, "Request body too large")
 
 
 app.add_middleware(_BodyCap)
@@ -1109,23 +1164,79 @@ def _extract_attestations(timestamp) -> list:
     return attestations
 
 
+# Structural inspection, never verification
+# /verify and /upgrade read a proof's structure: its encoding, the digest it
+# is about, and which attestation nodes it carries. Neither checks the
+# attested merkle root against a Bitcoin block header. The gateway holds no
+# Bitcoin view by design (no RPC credential: operator guide, "Privilege
+# boundary"), so it cannot tell a genuine attestation from a fabricated one
+# naming a real block height — the 2026-09-15 review built exactly that (a
+# proof attesting to block 0 whose root the genesis header does not carry)
+# and both endpoints called it verified. So: the state is
+# `bitcoin_attestation_present`, and `verified` is null for it — not
+# checked here — and false for every other state. The verifier is whatever
+# holds a Bitcoin view: `ots verify` against the client's own node, or the
+# calendar fork's ops/verify_claim.py against an authenticated headers file.
+STATUS_BITCOIN_ATTESTATION_PRESENT = "bitcoin_attestation_present"
+STATUS_CALENDAR_UNAVAILABLE = "calendar_unavailable"
+VERIFICATION_NOTE = (
+    "structural: the proof's encoding, digest and attestation nodes were read; "
+    "the attested merkle root was not checked against a Bitcoin block header. "
+    "Verify with `ots verify` against your own Bitcoin node."
+)
+
+
+def _proof_answer(digest: str, status: str, proof_digest: str | None = None,
+                  attestations: list | None = None, valid_ots: bool = True,
+                  upgrade: bool = False, ots_b64: str | None = None,
+                  upgrade_info: dict | None = None) -> dict:
+    """The one answer shape of /verify and /upgrade."""
+    attestations = attestations or []
+    present = any(a["type"] == "bitcoin" for a in attestations)
+    answer = {
+        "digest": digest,
+        "proof_digest": proof_digest,
+        "status": status,
+        "valid_ots": valid_ots,
+        "digest_match": proof_digest == digest,
+        "bitcoin_attestation_present": present,
+        # The same structural flag under its pre-2026-09-15 name, kept for
+        # clients built against it (the api-endpoint adapter reads it). It
+        # never meant more than "a Bitcoin attestation node is present".
+        "bitcoin_anchored": present,
+        # null: a Bitcoin attestation is present and was NOT checked against
+        # Bitcoin here. false: nothing to verify, or the structure fails.
+        "verified": None if status == STATUS_BITCOIN_ATTESTATION_PRESENT else False,
+        "verification": "structural",
+        "verification_note": VERIFICATION_NOTE,
+    }
+    if upgrade:
+        answer["ots"] = ots_b64
+        if upgrade_info is not None:
+            answer["upgrade"] = upgrade_info
+    answer["attestations"] = attestations
+    return answer
+
+
 def _undecodable_result(digest: str, upgrade: bool = False) -> dict:
     """The /verify (and, with upgrade=True, /upgrade) answer for an ``ots``
     field that is not even base64: the same "invalid" shape the parsers
     return for malformed bytes, so a client sees one vocabulary."""
-    result = {
-        "digest": digest,
-        "proof_digest": None,
-        "status": "invalid",
-        "valid_ots": False,
-        "digest_match": False,
-        "bitcoin_anchored": False,
-        "verified": False,
-    }
-    if upgrade:
-        result["ots"] = None
-    result["attestations"] = []
-    return result
+    return _proof_answer(digest, "invalid", valid_ots=False, upgrade=upgrade)
+
+
+def _structural_status(digest_match: bool, attestations: list) -> str:
+    if not digest_match:
+        return "mismatch"
+    if any(a["type"] == "bitcoin" for a in attestations):
+        return STATUS_BITCOIN_ATTESTATION_PRESENT
+    if any(a["type"] == "pending_calendar" for a in attestations):
+        return "pending"
+    # Well-formed OTS proof, digest matches, but no recognized (bitcoin/
+    # pending) attestations — distinct from "invalid" (undecodable bytes).
+    # An empty timestamp can't serialize, so in practice this means only
+    # unknown attestation types are present.
+    return "no_attestations"
 
 
 def _verify_ots_bytes(digest: str, ots_bytes: bytes) -> dict:
@@ -1134,67 +1245,81 @@ def _verify_ots_bytes(digest: str, ots_bytes: bytes) -> dict:
         detached = DetachedTimestampFile.deserialize(ctx)
     except Exception:
         logging.info("Verify failed: invalid OTS proof")
-        return {
-            "digest": digest,
-            "proof_digest": None,
-            "status": "invalid",
-            "valid_ots": False,
-            "digest_match": False,
-            "bitcoin_anchored": False,
-            "verified": False,
-            "attestations": [],
-        }
-
+        return _proof_answer(digest, "invalid", valid_ots=False)
     proof_digest = detached.file_digest.hex()
-    digest_match = proof_digest == digest
     attestations = _extract_attestations(detached.timestamp)
-
-    bitcoin_anchored = any(a["type"] == "bitcoin" for a in attestations)
-    has_pending = any(a["type"] == "pending_calendar" for a in attestations)
-
-    if not digest_match:
-        status = "mismatch"
-    elif bitcoin_anchored:
-        status = "anchored"
-    elif has_pending:
-        status = "pending"
-    else:
-        # Well-formed OTS proof, digest matches, but no recognized
-        # (bitcoin/pending) attestations — distinct from "invalid"
-        # (undecodable bytes). An empty timestamp can't serialize, so in
-        # practice this means only unknown attestation types are present.
-        status = "no_attestations"
-
-    return {
-        "digest": digest,
-        "proof_digest": proof_digest,
-        "status": status,
-        "valid_ots": True,
-        "digest_match": digest_match,
-        "bitcoin_anchored": bitcoin_anchored,
-        "verified": status == "anchored",
-        "attestations": attestations,
-    }
+    status = _structural_status(proof_digest == digest, attestations)
+    return _proof_answer(digest, status, proof_digest, attestations)
 
 
-def _upgrade_pending_against_operator(timestamp, timeout) -> None:
+# Bounds on one /upgrade's calendar work (2026-09-15 review: a 3.5 KB proof
+# with 100 pending sub-stamps made 100 sequential calendar calls at
+# timeout=10 each — up to ~1000 s of one worker per accepted request, every
+# failure reported as an ordinary "pending"). Per request: at most
+# UPGRADE_MAX_CALENDAR_QUERIES lookups, at most UPGRADE_MAX_SECONDS in all,
+# each lookup no longer than UPGRADE_QUERY_TIMEOUT; commitments are queried
+# once each, and the walk stops as soon as a Bitcoin attestation is in hand.
+UPGRADE_MAX_CALENDAR_QUERIES = 8
+UPGRADE_MAX_SECONDS = 15.0
+UPGRADE_QUERY_TIMEOUT = 5.0
+
+
+def _has_bitcoin_attestation(timestamp) -> bool:
+    return any(isinstance(a, BitcoinBlockHeaderAttestation)
+               for _msg, a in timestamp.all_attestations())
+
+
+def _upgrade_pending_against_operator(timestamp) -> dict:
+    """Ask the operator's calendar for each pending commitment, within the
+    bounds above. Returns the tally: queries made, commitments found /
+    not found / failed (transport or any other error — the calendar did
+    not answer), whether the query budget ran out, and whether a Bitcoin
+    attestation was obtained. A not-found answer is a successful lookup
+    (the calendar has not anchored that commitment yet); a failure is not."""
     calendar = RemoteCalendar(OTS_CALENDAR_URL)
+    tally = {"queries": 0, "found": 0, "not_found": 0, "failed": 0,
+             "budget_exhausted": False, "anchored": False}
+    seen: set[bytes] = set()
+    started = time.monotonic()
+
     def walk(stamp):
         yield stamp
         for sub in stamp.ops.values():
             yield from walk(sub)
+
     for sub_stamp in walk(timestamp):
         if not any(isinstance(a, PendingAttestation) for a in sub_stamp.attestations):
             continue
+        if sub_stamp.msg in seen:
+            continue  # the same commitment twice in one proof: one lookup
+        seen.add(sub_stamp.msg)
+        elapsed = time.monotonic() - started
+        if tally["queries"] >= UPGRADE_MAX_CALENDAR_QUERIES or elapsed >= UPGRADE_MAX_SECONDS:
+            tally["budget_exhausted"] = True
+            break
+        tally["queries"] += 1
         try:
-            upgraded = calendar.get_timestamp(sub_stamp.msg, timeout=timeout)
-        except Exception:
-            logging.info("Upgrade: no operator attestation available")
+            upgraded = calendar.get_timestamp(
+                sub_stamp.msg, timeout=min(UPGRADE_QUERY_TIMEOUT, UPGRADE_MAX_SECONDS - elapsed))
+        except CommitmentNotFoundError:
+            tally["not_found"] += 1
+            continue
+        except Exception as exc:
+            # Fixed text plus the class: never the exception's own message,
+            # which can carry the URL or the response body.
+            tally["failed"] += 1
+            logging.info("Upgrade: calendar query failed (%s)", type(exc).__name__)
             continue
         try:
             sub_stamp.merge(upgraded)
-        except Exception:
-            logging.warning("Upgrade: failed to merge operator attestation", exc_info=True)
+            tally["found"] += 1
+        except Exception as exc:
+            logging.warning("Upgrade: failed to merge operator attestation (%s)", type(exc).__name__)
+            continue
+        if _has_bitcoin_attestation(timestamp):
+            tally["anchored"] = True
+            break
+    return tally
 
 
 def _upgrade_ots_bytes(digest: str, ots_bytes: bytes) -> dict:
@@ -1203,57 +1328,37 @@ def _upgrade_ots_bytes(digest: str, ots_bytes: bytes) -> dict:
         detached = DetachedTimestampFile.deserialize(ctx)
     except Exception:
         logging.info("Upgrade failed: invalid OTS proof")
-        return {
-            "digest": digest,
-            "proof_digest": None,
-            "status": "invalid",
-            "valid_ots": False,
-            "digest_match": False,
-            "bitcoin_anchored": False,
-            "verified": False,
-            "ots": None,
-            "attestations": [],
-        }
+        return _proof_answer(digest, "invalid", valid_ots=False, upgrade=True)
     proof_digest = detached.file_digest.hex()
-    digest_match = proof_digest == digest
     original_b64 = base64.b64encode(ots_bytes).decode()
-    def result(status: str, ots_b64: str | None) -> dict:
-        attestations = _extract_attestations(detached.timestamp)
-        bitcoin_anchored = any(a["type"] == "bitcoin" for a in attestations)
-        return {
-            "digest": digest,
-            "proof_digest": proof_digest,
-            "status": status,
-            "valid_ots": True,
-            "digest_match": digest_match,
-            "bitcoin_anchored": bitcoin_anchored,
-            "verified": status == "anchored",
-            "ots": ots_b64,
-            "attestations": attestations,
-        }
-    if not digest_match:
-        return result("mismatch", original_b64)
     attestations = _extract_attestations(detached.timestamp)
-    bitcoin_anchored = any(a["type"] == "bitcoin" for a in attestations)
-    has_pending = any(a["type"] == "pending_calendar" for a in attestations)
-    if bitcoin_anchored:
-        return result("anchored", original_b64)
-    if not has_pending:
-        # Well-formed proof, digest matches, but no recognized (bitcoin/
-        # pending) attestations to upgrade — distinct from "invalid"
-        # (undecodable bytes).
-        return result("no_attestations", original_b64)
+    status = _structural_status(proof_digest == digest, attestations)
+    if status != "pending":
+        # mismatch, already carrying a Bitcoin attestation, or nothing to
+        # upgrade: no calendar contact.
+        return _proof_answer(digest, status, proof_digest, attestations,
+                             upgrade=True, ots_b64=original_b64)
+    tally = {"queries": 0, "found": 0, "not_found": 0, "failed": 0,
+             "budget_exhausted": False, "anchored": False}
     if OTS_CALENDAR_URL:
-        _upgrade_pending_against_operator(detached.timestamp, timeout=10)
-    now_anchored = any(
-        a["type"] == "bitcoin" for a in _extract_attestations(detached.timestamp)
-    )
-    if now_anchored:
+        tally = _upgrade_pending_against_operator(detached.timestamp)
+    info = {"calendar_queries": tally["queries"], "budget_exhausted": tally["budget_exhausted"]}
+    attestations = _extract_attestations(detached.timestamp)
+    if tally["anchored"]:
         buf = io.BytesIO()
         detached.serialize(StreamSerializationContext(buf))
-        upgraded_b64 = base64.b64encode(buf.getvalue()).decode()
-        return result("anchored", upgraded_b64)
-    return result("pending", original_b64)
+        return _proof_answer(digest, STATUS_BITCOIN_ATTESTATION_PRESENT, proof_digest,
+                             attestations, upgrade=True,
+                             ots_b64=base64.b64encode(buf.getvalue()).decode(),
+                             upgrade_info=info)
+    if tally["queries"] and tally["failed"] == tally["queries"]:
+        # Every lookup failed: the calendar did not answer. Not "pending" —
+        # that word is for a calendar that answered "not anchored yet".
+        return _proof_answer(digest, STATUS_CALENDAR_UNAVAILABLE, proof_digest,
+                             attestations, upgrade=True, ots_b64=original_b64,
+                             upgrade_info=info)
+    return _proof_answer(digest, "pending", proof_digest, attestations,
+                         upgrade=True, ots_b64=original_b64, upgrade_info=info)
 
 
 # L402 token (macaroon)
@@ -1318,16 +1423,20 @@ def verify_l402_token(macaroon_b64: str, digest: str) -> tuple[str, int]:
     try:
         m = Macaroon.deserialize(macaroon_b64)
     except Exception as exc:
-        # Unauthenticated input: one WARNING, no traceback — a stranger must not
-        # be able to write ERROR-level stack traces into the journal at will.
-        logging.warning("L402 macaroon could not be parsed: %r", exc)
+        # Unauthenticated input: one WARNING naming the exception class and
+        # nothing else. No traceback (a stranger must not be able to write
+        # ERROR-level stack traces into the journal at will) and no exception
+        # text: a parse error's message carries the bytes it choked on, which
+        # are whatever the sender put in the token (2026-09-15 review: a
+        # malformed token's payload was echoed verbatim into the log).
+        logging.warning("L402 macaroon could not be parsed (%s)", type(exc).__name__)
         raise HTTPException(status_code=401, detail="Invalid L402 token")
 
     try:
         payment_hash = _caveat_value(m, "payment_hash")
         price_str = _caveat_value(m, "price")
     except Exception as exc:
-        logging.warning("L402 macaroon caveats could not be read: %r", exc)
+        logging.warning("L402 macaroon caveats could not be read (%s)", type(exc).__name__)
         raise HTTPException(status_code=401, detail="Invalid L402 token")
 
     if not payment_hash or not re.fullmatch(r"[0-9a-f]{64}", payment_hash):
@@ -1391,8 +1500,13 @@ class Invoice:
 class InvoiceStatus:
     """The current state of a previously created invoice, as reported by the node.
 
-    ``expired`` is ``None`` when the backend exposes no expiry signal,
-    distinguishing "not expired" from "unknown".
+    ``expired`` comes from phoenixd's ``isExpired`` on
+    ``GET /payments/incoming/{paymentHash}``: checked against the phoenixd
+    sources at v0.8.0 (the deployed release) and v0.9.1 — both compute it
+    as now > createdAt + the bolt11 expiry (JsonSerializers.kt,
+    ``IncomingPayment``), and both always emit the field. ``None`` is kept
+    for a response without it (an older or foreign phoenixd) and means
+    "unknown", which anchor billing treats as live rather than re-minting.
 
     Two amounts, not one: phoenixd reports the credited amount net of any
     ACINQ liquidity fee, so a fully paid invoice would look underpaid if the
@@ -1400,11 +1514,10 @@ class InvoiceStatus:
     """
     settled: bool
     # The invoice's face amount — what the gateway itself minted at quote
-    # time. phoenixd: requestedSat. LND: value.
+    # time (phoenixd: requestedSat).
     amount_requested_sat: int
-    # Sats actually credited to our wallet. phoenixd: receivedSat (net of any
-    # ACINQ liquidity fee). LND: amt_paid_sat (gross; LND has no receive-side
-    # deduction, so credited = paid).
+    # Sats actually credited to our wallet (phoenixd: receivedSat, net of
+    # any ACINQ liquidity fee).
     amount_received_sat: int
     memo: str | None
     expired: bool | None
@@ -1443,63 +1556,6 @@ class PaymentBackend(Protocol):
     def lookup_invoice(self, payment_hash: str) -> InvoiceStatus:
         """Look up the current state of the invoice for ``payment_hash``."""
         ...
-
-
-class LndPaymentBackend:
-    """PaymentBackend backed by the LND REST API.
-
-    Reads the ``LND_*`` / ``TOR_PROXY`` / ``LND_TLS_VERIFY`` module globals at call
-    time (not construction) so configuration stays patchable and the backend never
-    holds a stale copy of connection settings.
-    """
-
-    def _proxies(self):
-        return {"https": f"socks5h://{TOR_PROXY}"} if TOR_PROXY else None
-
-    def create_invoice(self, digest: str, amount_sats: int) -> Invoice:
-        headers = {"Grpc-Metadata-macaroon": LND_MACAROON_HEX}
-        url = f"https://{LND_HOST}:{LND_PORT}/v1/invoices"
-        try:
-            resp = requests.post(
-                url,
-                headers=headers,
-                json={"memo": digest, "value": amount_sats, "private": True},
-                proxies=self._proxies(),
-                verify=LND_TLS_VERIFY,
-                timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            payment_request = data["payment_request"]
-            # LND returns r_hash as standard base64 over REST; normalize to hex.
-            payment_hash = base64.b64decode(data["r_hash"]).hex()
-            invoice = Invoice(bolt11=payment_request, payment_hash=payment_hash)
-            _record_mint("ok")
-            return invoice
-        except Exception as exc:
-            _record_mint("failed", type(exc).__name__)
-            logging.exception("LND invoice creation failed")
-            raise HTTPException(status_code=502, detail="LND error: could not create invoice")
-
-    def lookup_invoice(self, payment_hash: str) -> InvoiceStatus:
-        headers = {"Grpc-Metadata-macaroon": LND_MACAROON_HEX}
-        url = f"https://{LND_HOST}:{LND_PORT}/v1/invoice/{payment_hash}"
-        try:
-            resp = requests.get(
-                url, headers=headers, proxies=self._proxies(), verify=LND_TLS_VERIFY, timeout=30
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception:
-            logging.exception("LND invoice lookup failed")
-            raise HTTPException(status_code=502, detail="LND error: could not verify payment")
-        return InvoiceStatus(
-            settled=bool(data.get("settled", False)),
-            amount_requested_sat=int(data.get("value") or 0),
-            amount_received_sat=int(data.get("amt_paid_sat") or 0),
-            memo=data.get("memo"),
-            expired=None,
-        )
 
 
 class PhoenixdPaymentBackend:
@@ -1565,15 +1621,13 @@ class PhoenixdPaymentBackend:
 
 
 def _make_payment_backend(backend_type: str) -> PaymentBackend:
-    if backend_type == "lnd":
-        return LndPaymentBackend()
     if backend_type == "phoenixd":
         return PhoenixdPaymentBackend()
     raise RuntimeError(f"Unknown PAYMENT_BACKEND_TYPE: {backend_type!r}")
 
 
-# Phoenixd is the live default backend; PAYMENT_BACKEND_TYPE=lnd selects the
-# LND test payer / alternative backend.
+# phoenixd is the only payment backend (the LND backend was removed on
+# 2026-09-15; see _parse_config).
 PAYMENT_BACKEND: PaymentBackend = _make_payment_backend(PAYMENT_BACKEND_TYPE)
 
 
@@ -2331,7 +2385,12 @@ def upgrade(body: VerifyRequest, request: Request):
         return JSONResponse(status_code=200, content=_undecodable_result(body.digest, upgrade=True))
     if len(ots_bytes) > MAX_VERIFY_OTS_BYTES:
         raise HTTPException(status_code=413, detail="OTS proof too large")
-    return JSONResponse(content=_upgrade_ots_bytes(body.digest, ots_bytes))
+    answer = _upgrade_ots_bytes(body.digest, ots_bytes)
+    # A calendar that did not answer is a 503: the client retries later,
+    # exactly as for a paused gateway, and never mistakes it for "not
+    # anchored yet".
+    status_code = 503 if answer["status"] == STATUS_CALENDAR_UNAVAILABLE else 200
+    return JSONResponse(status_code=status_code, content=answer)
 
 
 @app.post("/timestamp")

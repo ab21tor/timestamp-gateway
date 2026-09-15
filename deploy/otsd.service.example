@@ -4,13 +4,26 @@
 #
 # Companion file /etc/systemd/system/otsd.env holds BITCOIN_RPC_SERVICE_URL
 # — the full RPC URL including credentials. It must be owned by the SERVICE
-# USER below (User=gateway), mode 600 — NOT root: --env-file is read by the
+# USER below (User=otsd), mode 600 — NOT root: --env-file is read by the
 # docker client, which runs as that user, so a root-owned 600 file fails
-# with EACCES. Docker reads the
-# file directly (--env-file below), so the URL never appears on a command
-# line (ps/argv) and never in tracked files. Residual: `docker inspect
-# otsd` still shows the container's env to local root — unavoidable for
-# container env, and why backup archives must stay encrypted.
+# with EACCES. Docker reads the file directly (--env-file below), so the URL
+# never appears on a command line (ps/argv) and never in tracked files.
+# Residual: `docker inspect otsd` still shows the container's env to local
+# root — unavoidable for container env, and why backup archives must stay
+# encrypted.
+#
+# Privilege boundary (operator guide, "Privilege boundary"): this unit runs
+# as its own user, `otsd`, the one identity on the box in the docker group
+# and the one that can read otsd.env. The gateway's user (`gateway`,
+# deploy/timestamp-gateway.service.example) is in neither position, so the
+# internet-facing process can reach neither the wallet's RPC credential nor
+# the Docker socket. Create the user once:
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin otsd
+#   sudo usermod -aG docker otsd
+#   sudo chown otsd:otsd /etc/systemd/system/otsd.env && sudo chmod 600 /etc/systemd/system/otsd.env
+#   sudo chown -R otsd:otsd /var/lib/otsd
+# The fork checkout mounted at /app must be readable by otsd (a world-
+# readable checkout is; `sudo chgrp -R otsd` it otherwise).
 #
 # The otsd-local image is built per otsd/Dockerfile with the
 # opentimestamps-server fork checkout as the named "fork" build context
@@ -33,8 +46,9 @@ After=docker.service socat-bitcoin-rpc.service
 Requires=docker.service socat-bitcoin-rpc.service
 
 [Service]
-# The service user needs docker group membership; or run as root and omit this line.
-User=gateway
+# The otsd user: docker group member, owner of otsd.env and /var/lib/otsd.
+# Never the gateway's user (see the header).
+User=otsd
 ExecStartPre=-/usr/bin/docker rm -f otsd
 ExecStart=/usr/bin/docker run --name otsd --network host \
   -v /var/lib/otsd/calendar:/calendar \

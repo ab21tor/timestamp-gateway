@@ -23,12 +23,12 @@ fail() {
 MSG="$(cat)"
 [ -n "$MSG" ] || fail "empty message on stdin; nothing to deliver"
 
-# Source the gitignored .env for NTFY_URL (used whole — no parsing).
-[ -f "$REPO/.env" ] || fail "env file not found"
-set -a
-# shellcheck disable=SC1091
-. "$REPO/.env"
-set +a
+# Load the gitignored .env for NTFY_URL (used whole — no parsing) through
+# the shared loader (ops/lib/env.sh).
+# shellcheck source=lib/env.sh
+. "$(cd "$(dirname "$0")" && pwd)/lib/env.sh"
+load_env
+[ -n "$ENV_LOADED" ] || fail "env file not found"
 [ -n "${NTFY_URL:-}" ] || fail "NTFY_URL not set; alarm channel unconfigured"
 
 # POST the message to the ntfy topic. -f makes an HTTP error a delivery

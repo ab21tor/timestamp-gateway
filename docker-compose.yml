@@ -28,7 +28,58 @@ x-logging: &bounded-logging
 services:
   gateway:
     build: .
-    env_file: .env
+    # An explicit allowlist, never `env_file: .env` (2026-09-15 review: the
+    # whole file gave the internet-facing gateway container the otsd
+    # wallet's Bitcoin RPC URL and password — `docker compose config`
+    # showed BITCOIN_RPC_SERVICE_URL inside gateway.environment). Each
+    # line is interpolated from .env; a name absent there arrives as the
+    # empty string, which the gateway reads as unset (main.py, _env). What
+    # is NOT here never reaches the container: BITCOIN_RPC_SERVICE_URL and
+    # BITCOIN_RPC_ONION (otsd's and the bridge's), the ops/ timer settings
+    # (WALLET_*, BACKUP_*, NTFY_URL, HEALTH_*), the compose-level paths
+    # (GATEWAY_STATE_DIR, OTSD_*). test_review_compose_gateway_environment_
+    # is_an_allowlist in test_main.py resolves this file with dummy values
+    # and checks both directions: every variable main.py reads is listed,
+    # and the RPC credential is in otsd's environment only. (The retired
+    # pricing names main.py warns about are deliberately absent too: under
+    # compose they cannot reach the process, so that warning never fires.)
+    environment:
+      - OTS_BACKEND_MODE=${OTS_BACKEND_MODE-}
+      - OTS_CALENDAR_URL=${OTS_CALENDAR_URL-}
+      - OTS_SUBMIT_MAX_ATTEMPTS=${OTS_SUBMIT_MAX_ATTEMPTS-}
+      - OTS_SUBMIT_BACKOFF_SECONDS=${OTS_SUBMIT_BACKOFF_SECONDS-}
+      - L402_ENABLED=${L402_ENABLED-}
+      - PRICE_PER_PROOF_SATS=${PRICE_PER_PROOF_SATS-}
+      - L402_SECRET_HEX=${L402_SECRET_HEX-}
+      - L402_ALLOW_EPHEMERAL_SECRET=${L402_ALLOW_EPHEMERAL_SECRET-}
+      - L402_TOKEN_EXPIRY_SECONDS=${L402_TOKEN_EXPIRY_SECONDS-}
+      - PAYMENT_BACKEND_TYPE=${PAYMENT_BACKEND_TYPE-}
+      - PHOENIXD_URL=${PHOENIXD_URL-}
+      - PHOENIXD_HTTP_PASSWORD_LIMITED=${PHOENIXD_HTTP_PASSWORD_LIMITED-}
+      - PHOENIXD_HTTP_PASSWORD=${PHOENIXD_HTTP_PASSWORD-}
+      - PAUSE_FILE=${PAUSE_FILE-}
+      - OBLIGATIONS_DB_PATH=${OBLIGATIONS_DB_PATH-}
+      - OBLIGATION_SWEEP_INTERVAL=${OBLIGATION_SWEEP_INTERVAL-}
+      - STAMPER_FEE_CAP_SATS=${STAMPER_FEE_CAP_SATS-}
+      - WALLET_STATUS_PATH=${WALLET_STATUS_PATH-}
+      - WALLET_STATUS_MAX_AGE_SECONDS=${WALLET_STATUS_MAX_AGE_SECONDS-}
+      - PROOFS_STATUS_PATH=${PROOFS_STATUS_PATH-}
+      - PROOFS_STATUS_MAX_AGE_SECONDS=${PROOFS_STATUS_MAX_AGE_SECONDS-}
+      - BACKUP_STATUS_PATH=${BACKUP_STATUS_PATH-}
+      - BACKUP_STATUS_MAX_AGE_SECONDS=${BACKUP_STATUS_MAX_AGE_SECONDS-}
+      - RATE_LIMIT_PER_MINUTE=${RATE_LIMIT_PER_MINUTE-}
+      - VERIFY_RATE_LIMIT_PER_MINUTE=${VERIFY_RATE_LIMIT_PER_MINUTE-}
+      - HEALTH_PROBE_CACHE_SECONDS=${HEALTH_PROBE_CACHE_SECONDS-}
+      - GATEWAY_BEHIND_PROXY=${GATEWAY_BEHIND_PROXY-}
+      - UPGRADE_CLIENT_TOKEN=${UPGRADE_CLIENT_TOKEN-}
+      - ANCHOR_BILLING_ENABLED=${ANCHOR_BILLING_ENABLED-}
+      - PER_RECORD_SATS=${PER_RECORD_SATS-}
+      # Anchor billing under compose: the container path is fixed by the
+      # anchor_receipts mount below, so set
+      # ANCHOR_RECEIPTS_PATH=/anchor-receipts/anchor-receipts.jsonl in .env
+      # when you uncomment that mount (operator guide, "Anchor billing").
+      - ANCHOR_RECEIPTS_PATH=${ANCHOR_RECEIPTS_PATH-}
+      - ANCHOR_BILLS_TOKEN=${ANCHOR_BILLS_TOKEN-}
     logging: *bounded-logging
     restart: unless-stopped
     depends_on:
@@ -55,13 +106,11 @@ services:
       # Anchor billing (operator guide, "Anchor billing"): the receipts
       # file the calendar fork writes, read-only — a dedicated volume,
       # deliberately NOT otsd_calendar, which holds the hmac key.
-      # Uncomment here, in otsd, and under top-level volumes; nothing
-      # switches on while these stay commented (and ANCHOR_BILLING_ENABLED
-      # stays false in .env).
+      # Uncomment here, in otsd, and under top-level volumes, and set
+      # ANCHOR_RECEIPTS_PATH=/anchor-receipts/anchor-receipts.jsonl in
+      # .env; nothing switches on while these stay commented (and
+      # ANCHOR_BILLING_ENABLED stays false in .env).
       # - anchor_receipts:/anchor-receipts:ro
-    # environment:
-    #   # Container path fixed by the mount above — pinned here, not .env.
-    #   - ANCHOR_RECEIPTS_PATH=/anchor-receipts/anchor-receipts.jsonl
     # Loopback-only publish: reachable from this host (curl, ops scripts,
     # the health monitor) but not from the network — Tor is the public
     # front door. For clearnet exposure change to "8000:8000" and see

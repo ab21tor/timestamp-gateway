@@ -2,6 +2,9 @@
 set -u
 
 REPO="${REPO:-/home/gateway/timestamp-gateway}"
+# shellcheck source=lib/env.sh
+. "$(cd "$(dirname "$0")" && pwd)/lib/env.sh"
+load_env
 ARTIFACTS="${ARTIFACTS:-/home/gateway/timestamp-gateway-live-artifacts}"
 CALENDAR_URL="${CALENDAR_URL:-http://127.0.0.1:14788}"
 OTS="$REPO/.venv/bin/ots"

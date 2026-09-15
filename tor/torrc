@@ -1,4 +1,5 @@
-# SOCKS proxy — used by the gateway container to reach onion LND endpoints.
+# SOCKS proxy — used by the rpc-bridge profile (socat) to reach an onion
+# Bitcoin node; the gateway container itself makes no outbound Tor calls.
 SocksPort 0.0.0.0:9050
 
 # A stream stuck on a dead rendezvous detaches and retries on a fresh

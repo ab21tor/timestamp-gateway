@@ -4,8 +4,10 @@ timestamp-gateway is an HTTP door in front of an OpenTimestamps calendar.
 It accepts a SHA-256 digest, takes a Lightning payment for it when the
 L402 door is on, submits the digest to the operator's own calendar
 (`otsd`, the calendar fork in `opentimestamps-server`), and returns the
-calendar's `.ots` receipt; later it upgrades that receipt to a
-Bitcoin-anchored proof on request and verifies proofs it is given. It
+calendar's `.ots` receipt; later it upgrades that receipt to a proof
+carrying a Bitcoin attestation on request and inspects proofs it is
+given — structurally: it holds no Bitcoin view and never calls a proof
+verified ("`/verify` and `/upgrade`"). It
 stores no client files and keeps no client accounts: the client-facing
 interface is a digest in and a proof out. Its own bookkeeping, the
 obligation log and the anchor-bills ledger (SQLite under
@@ -39,8 +41,8 @@ The same code runs in each of these; the configuration is the `.env`.
   standing payer per confirmed anchor from the calendar's receipts file
   (`/anchor-bills`). With both off nothing charges anywhere, named in one
   startup warning.
-- **The payment backend.** phoenixd (default) or LND (`PAYMENT_BACKEND_TYPE=lnd`);
-  either runs outside the compose stack.
+- **The payment backend.** phoenixd, the only one (the LND backend was
+  removed on 2026-09-15); it runs outside the compose stack.
 - **The front.** The bundled Tor hidden service, and the gateway published
   on `127.0.0.1:8000` only; or clearnet by changing the port mapping. The
   privacy cost of each is in "What is publicly visible".
@@ -76,7 +78,24 @@ the "Tests" table names.
 - A pause, the operator's or the float backstop's, loses nothing: paid
   tokens redeem after it and recorded obligations wait ("Stopping").
 - There is no access log, and the application log carries no digest,
-  preimage or client address ("What the gateway records").
+  preimage or client address; a malformed token or proof is logged as a
+  fixed line naming an error class, never the input ("What the gateway
+  records").
+- `/verify` and `/upgrade` never say `verified`: they read a proof's
+  structure and report `bitcoin_attestation_present` with `verified`
+  null; only a verifier with a Bitcoin view can say more ("`/verify` and
+  `/upgrade`").
+- One `/upgrade` makes at most eight calendar lookups within fifteen
+  seconds, and a calendar that does not answer is a 503, never
+  "pending" ("`/verify` and `/upgrade`").
+- Every POST body is bounded before routing and counted as it is read:
+  any `Transfer-Encoding` is refused with 411, an ambiguous
+  `Content-Length` with 400, and the endpoint never sees more than the
+  declared length ("`/verify` and `/upgrade`").
+- The gateway process holds no Bitcoin credential and no Docker access:
+  under compose its environment is an explicit allowlist, never the
+  whole `.env`; under systemd the RPC URL lives with the otsd user
+  ("Privilege boundary").
 
 ## Requirements
 
@@ -89,8 +108,7 @@ the "Tests" table names.
   docker compose version >/dev/null 2>&1 && C="docker compose" || C="docker-compose"
   ```
 
-- A running phoenixd, or an LND node with its REST API and an invoice
-  macaroon (`PAYMENT_BACKEND_TYPE=lnd`).
+- A running phoenixd.
 - An OpenTimestamps calendar (`otsd`), bundled in the compose stack or
   external.
 - A synced Bitcoin Core node reachable by `otsd`, with a wallet loaded and
@@ -114,9 +132,10 @@ cp .env.example .env
 #   PRICE_PER_PROOF_SATS  the flat price every hash pays, integer >= 1
 #                         (sizing arithmetic: operator guide, "Pricing")
 # A free door (L402_ENABLED=false) needs neither. Then set:
-#   PHOENIXD_HTTP_PASSWORD_LIMITED  the default backend (LND_* only for
-#                                   PAYMENT_BACKEND_TYPE=lnd)
-#   BITCOIN_RPC_SERVICE_URL         for otsd; three shapes in .env.example
+#   PHOENIXD_HTTP_PASSWORD_LIMITED  phoenixd's limited-access password
+#   BITCOIN_RPC_SERVICE_URL         for otsd ONLY (the gateway container
+#                                   never receives it); three shapes in
+#                                   .env.example
 
 # First run only: the calendar's two identity files, which otsd refuses to
 # start without. What they mean: operator guide, "Deploying the calendar
@@ -205,44 +224,32 @@ on the systemd path (gateway under systemd, otsd as a Docker unit,
 phoenixd on the host), 2026-06-16 and 2026-06-17; a VPS on the compose
 path, installed from these documents alone, 2026-07-27.
 
-### LND as the payment backend
+### Privilege boundary
 
-With `PAYMENT_BACKEND_TYPE=lnd` the gateway needs an invoice macaroon,
-which authorises creating and reading invoices and nothing else:
+The internet-facing gateway process never holds the anchor wallet's
+Bitcoin RPC credential and has no Docker access, on either launch path
+(operator guide, "Privilege boundary"):
 
-```bash
-xxd -p -c 256 ~/.lnd/data/chain/bitcoin/mainnet/invoice.macaroon
-```
+- **Compose.** The gateway service's environment is an explicit
+  allowlist in `docker-compose.yml`, interpolated name by name from
+  `.env`; `BITCOIN_RPC_SERVICE_URL` is interpolated into the `otsd`
+  service only. `docker compose config` shows it, and
+  `test_review_compose_gateway_environment_is_an_allowlist` checks both
+  directions: every variable `main.py` reads is in the list, and the RPC
+  credential is in otsd's environment alone. A variable absent from
+  `.env` reaches the container as the empty string, which the gateway
+  reads as unset.
+- **systemd.** Two users: `gateway` runs the gateway (`.env` is its
+  `EnvironmentFile`, so `BITCOIN_RPC_SERVICE_URL` must not be in it on
+  this path) and is not in the `docker` group, and its unit makes the
+  Docker socket unreachable; `otsd` runs the otsd container, is the one
+  docker-group member, and alone can read `/etc/systemd/system/otsd.env`
+  where the RPC URL lives. The wallet alarm uses an RPC user of its own,
+  whitelisted to `getbalances`, from its own file.
 
-The output is `LND_MACAROON_HEX`.
-
-| LND location | `LND_HOST` value | `TOR_PROXY` |
-|---|---|---|
-| Same Docker host | `host.docker.internal` — reaches a loopback-bound LND on Docker Desktop only; on a Linux engine bind LND's REST where the container can reach it, or use the host's LAN IP (same caveat as `PHOENIXD_URL` — operator guide, "Payment backend (phoenixd)") | blank |
-| Remote LAN machine | LAN IP | blank |
-| Onion address | `.onion` address | `tor:9050` |
-| Umbrel | the Umbrel host's LAN IP — `umbrel.local` is mDNS and does not resolve inside containers | blank |
-
-The front-door and payment-node combinations and their trade-offs:
-
-```
-# Tor-only: the gateway as a hidden service, LND reachable at an onion
-LND_HOST=yourlnd.onion
-TOR_PROXY=tor:9050
-OTS_BACKEND_MODE=calendar
-OTS_CALENDAR_URL=http://otsd:14788
-
-# Onion front, clearnet or LAN Lightning node, otsd on the same host
-LND_HOST=192.168.1.x
-TOR_PROXY=              # blank: a direct LND connection
-OTS_BACKEND_MODE=calendar
-OTS_CALENDAR_URL=http://otsd:14788
-```
-
-Tor adds latency, and Tor-only Lightning routing is harder ("Inbound
-liquidity"); a clearnet Lightning node puts its pubkey and IP on the
-Lightning graph permanently ("What is publicly visible"). For a clearnet
-gateway, change the port mapping in `docker-compose.yml` from
+Tor adds latency, and a clearnet Lightning node puts its pubkey and IP
+on the Lightning graph permanently ("What is publicly visible"). For a
+clearnet gateway, change the port mapping in `docker-compose.yml` from
 `127.0.0.1:8000:8000` to `8000:8000` (operator guide, "Clearnet
 exposure").
 
@@ -261,12 +268,9 @@ route to.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `PAYMENT_BACKEND_TYPE` | No | `phoenixd` | `phoenixd` or `lnd` |
+| `PAYMENT_BACKEND_TYPE` | No | `phoenixd` | `phoenixd`, the only backend; `lnd` fails startup naming its removal (2026-09-15) |
 | `PHOENIXD_URL` | No | `http://127.0.0.1:9740` | phoenixd HTTP API endpoint; from the compose stack `http://host.docker.internal:9740`, which reaches a loopback-bound phoenixd on Docker Desktop only; on a Linux engine see the operator guide, "Payment backend (phoenixd)" |
 | `PHOENIXD_HTTP_PASSWORD_LIMITED` | When `phoenixd` | — | phoenixd's `http-password-limited-access` from `phoenix.conf`, never the full `http-password` (scope and why: operator guide, "Payment backend (phoenixd)"). The old name `PHOENIXD_HTTP_PASSWORD` is read as a fallback. |
-| `LND_HOST` | When `lnd` | — | Hostname, IP, or `.onion` address of the LND REST API |
-| `LND_PORT` | When `lnd` | — | LND REST port, typically `8080` |
-| `LND_MACAROON_HEX` | When `lnd` | — | Hex-encoded invoice macaroon |
 | `L402_ENABLED` | No | `true` | The door switch; strict `true`/`false`. `true`: `/timestamp` charges the flat per-proof rate (the 402/L402 flow). `false`: `/timestamp` stamps immediately and returns the proof free of charge: no invoice, no macaroon, no 402, the payment backend is never contacted from that path, and any `Authorization` header is ignored (a token minted before the flip gets its proof regardless). The per-record cost is then charged through anchor billing (`records` × `PER_RECORD_SATS` per confirmed anchor). With both this and `ANCHOR_BILLING_ENABLED` off nothing charges anywhere, named in one startup warning. `/verify` and `/upgrade` are unaffected in both modes. |
 | `PRICE_PER_PROOF_SATS` | When L402 on | — | The flat price in sats every hash pays at submission, the whole quote; the gateway reads no feerates. No default: startup fails without it when the door is on. Integer ≥ 1; `0` is refused (a free door is `L402_ENABLED=false`). Never read with the door off. Sizing arithmetic: operator guide, "Pricing". The retired variables of the earlier feerate model (`GATEWAY_PRICE_SATS`, `PRICE_BLIND_SATS` and the rest) are named in one startup warning and ignored, never a failure. |
 | `STAMPER_FEE_CAP_SATS` | No | `20000` | Mirror of otsd's `--btc-max-fee` flag in sats (the flag takes BTC; 0.0002 BTC = 20,000 sats; keep the two in sync). Used only to derive the float backstop thresholds. |
@@ -281,8 +285,6 @@ route to.
 | `L402_SECRET_HEX` | When L402 on | — | L402 macaroon root signing key (hex, at least 16 bytes; 32 recommended): `python3 -c 'import secrets; print(secrets.token_hex(32))'`. The gateway refuses to start without it when the door is on (development-only escape: `L402_ALLOW_EPHEMERAL_SECRET=true`); never read with the door off. |
 | `OTS_BACKEND_MODE` | Yes | — | `calendar`, or `public` (testing only) |
 | `OTS_CALENDAR_URL` | When `calendar` | — | URL of the operator's otsd (`http://otsd:14788` for the bundled compose profile; `http://127.0.0.1:14788` on the systemd path) |
-| `TOR_PROXY` | No | — | SOCKS5h proxy for LND connections (`lnd` only). Required if `LND_HOST` is `.onion`. |
-| `LND_TLS_VERIFY` | No | `false` | Set `true` only for CA-signed LND TLS certificates (`lnd` only). |
 
 `OTS_BACKEND_MODE` validation: `calendar` requires `OTS_CALENDAR_URL`;
 `public` requires it absent; any other value fails at startup; there is
@@ -421,12 +423,15 @@ both shipped launch paths): there is no per-request log, so no client-IP
 or request-timing record exists anywhere. The application log contains no
 digests, preimages, or client addresses; routine lines truncate payment
 hashes to an 8-hex prefix, and only WARNING-level incident lines (a
-failing re-stamp, a liquidity-fee event) carry a full payment hash. One
-bounded residual: malformed proofs sent to `/verify` and `/upgrade` are
-logged with tracebacks (at INFO), which can echo fragments of the
-malformed input itself; such input is by definition not a valid proof.
-Malformed tokens never get a traceback: unauthenticated input is logged
-as a single WARNING line.
+failing re-stamp, a liquidity-fee event) carry a full payment hash. No
+exception text carrying client input reaches the log: a malformed proof
+sent to `/verify` or `/upgrade` is one fixed INFO line, a malformed token
+one WARNING line naming the exception class and nothing else (until
+2026-09-15 that line carried the exception's text, and so the token's
+bytes — the review's kit put a synthetic record in a token and read it
+back out of the log), and a calendar lookup that fails is one INFO line
+naming the error class. `test_review_malformed_token_content_never_
+reaches_the_log` pins it.
 
 Where a digest does persist: the Lightning invoice memo is the digest,
 which is how payment is verified, so every paid digest is stored, with
@@ -458,7 +463,8 @@ finalized proof: it carries a pending attestation pointing at the
 operator's calendar. Once the calendar's anchoring transaction is
 confirmed (timing: operator guide, "Proof lifecycle"), POST the pending
 proof (base64) with its digest to `/upgrade`, which fetches the Bitcoin
-attestation from the calendar and returns the anchored proof. A client
+attestation from the calendar and returns the proof carrying it (status
+`bitcoin_attestation_present`, `verified` null: structural). A client
 with many pending proofs presents `UPGRADE_CLIENT_TOKEN` as a bearer on
 `/upgrade` and is not throttled by the verify bucket. Plain `ots upgrade
 proof.ots` contacts the calendar URL inside the attestation directly, so
@@ -477,22 +483,57 @@ references a service that needs to stay alive.
 
 ### `/verify` and `/upgrade`
 
+Both are **structural inspection, not verification.** They read a
+proof's encoding, the digest it is about and the attestation nodes it
+carries; neither checks the attested merkle root against a Bitcoin block
+header, because the gateway holds no Bitcoin view by design ("Privilege
+boundary"). A fabricated attestation naming a real block height is
+indistinguishable to them from a genuine one — the 2026-09-15 review
+built one attesting to block 0 and, until then, both endpoints called it
+verified. The verifier is whatever holds a Bitcoin view: `ots verify`
+against your own node, or the calendar fork's `ops/verify_claim.py`
+against an authenticated headers file.
+
 Both take the same JSON body, `digest` (64-char hex) and `ots` (the proof
 bytes, base64; the `tr` below strips the line breaks GNU base64 inserts),
 and return HTTP 200 with a JSON body whose `status` is one of:
 
 | Status | Meaning |
 |---|---|
-| `anchored` | Digest matches and the proof carries a Bitcoin attestation. Independently verifiable against the Bitcoin block. |
-| `pending` | Digest matches; the proof carries a calendar attestation awaiting Bitcoin anchoring. `/upgrade` returns the anchored proof once available. |
+| `bitcoin_attestation_present` | Digest matches and the proof carries a Bitcoin attestation node. Not checked against Bitcoin here: `verified` is `null`. |
+| `pending` | Digest matches; the proof carries a calendar attestation, and the calendar (asked, on `/upgrade`) has not anchored it yet. `/upgrade` returns the attested proof once available. |
 | `mismatch` | Well-formed proof, but it attests a different digest than the one supplied. |
-| `no_attestations` | Well-formed proof, digest matches, but no recognized (bitcoin/pending) attestations: nothing to verify or upgrade. |
+| `no_attestations` | Well-formed proof, digest matches, but no recognized (bitcoin/pending) attestations: nothing to inspect or upgrade. |
 | `invalid` | The `ots` field is not decodable as an OTS proof (bad base64 or malformed bytes), or a proof nested deeper than the OpenTimestamps library will parse, which gets the same verdict from the public `ots` client. |
 
-`verified` is `true` only for `anchored`. Every POST body is capped at
-512 KiB, refused with 413 before it is read, and must declare its length
-(a chunked body is refused with 411); the proof inside is further limited
-to 256 KiB.
+and, from `/upgrade` only, HTTP 503 with `status`
+`calendar_unavailable` when every calendar lookup failed by transport:
+the calendar did not answer, which is not "not anchored yet".
+
+Every answer carries `verification: "structural"`, a `verification_note`
+saying what was and was not checked, `bitcoin_attestation_present`
+(with `bitcoin_anchored` as the same flag under its pre-2026-09-15 name,
+for clients built against it) and `verified`: `null` for
+`bitcoin_attestation_present` — present, not checked — and `false` for
+every other status. `verified` is never `true`.
+
+One `/upgrade` is bounded: at most 8 calendar lookups, at most 15 seconds
+in all, 5 seconds per lookup, each distinct commitment looked up once,
+and the walk stops as soon as a Bitcoin attestation is in hand; the
+answer's `upgrade` field reports `calendar_queries` and
+`budget_exhausted`. (A 3.5 KB proof with a hundred pending sub-stamps
+used to make a hundred sequential lookups at ten seconds each.)
+
+Every POST body is bounded before routing and counted as it is read: the
+cap is 512 KiB, a declared length above it is refused with 413 before a
+byte is read, any `Transfer-Encoding` header is refused with 411 (the
+pinned HTTP parser accepts `Content-Length: 1` beside
+`Transfer-Encoding: chunked` and frames the body by the chunks, which is
+how a 525 KB body once reached a 200), a missing or non-numeric
+`Content-Length` with 411, disagreeing repeated ones with 400, and the
+ASGI receive is wrapped with a byte counter so the endpoint never sees
+more than the declared length whatever the parser framed. The proof
+inside is further limited to 256 KiB.
 
 ```bash
 # Verify a proof against the digest it should attest:
@@ -501,12 +542,13 @@ curl -X POST http://localhost:8000/verify \
   -d "{\"digest\":\"$DIGEST\",\"ots\":\"$(base64 < proof.ots | tr -d '\n')\"}"
 
 # Upgrade a pending proof once the calendar has anchored — the response's
-# `ots` field carries the anchored proof, base64-encoded:
+# `ots` field carries the proof with its Bitcoin attestation, base64:
 curl -X POST http://localhost:8000/upgrade \
   -H "Content-Type: application/json" \
   -d "{\"digest\":\"$DIGEST\",\"ots\":\"$(base64 < proof.ots | tr -d '\n')\"}" \
   | python3 -c 'import sys,json,base64; sys.stdout.buffer.write(base64.b64decode(json.load(sys.stdin)["ots"]))' \
-  > proof-anchored.ots
+  > proof-attested.ots
+ots verify proof-attested.ots   # the verification: against your own node
 ```
 
 ## Recover
@@ -534,7 +576,11 @@ closes it.
 The operator's side, the obligation log under `OBLIGATIONS_DB_PATH`, the
 calendar's state and identity files, the Tor hidden-service keys and the
 receipts file, is what the backup timer archives; `ops/BACKUP-RECOVERY.md`
-is the restore procedure.
+is the restore procedure. The obligation log is captured by a SQLite
+online snapshot that is checked (integrity, the table, the newest row
+read beforehand) before it counts; without a usable one the backup is
+`failed` while the gateway runs, because a raw copy of a live WAL
+database is not a snapshot of any instant.
 
 ### Reorgs
 
@@ -575,6 +621,8 @@ Re-verifying anchored proofs against Bitcoin is the check that remains.
 - Gate the door, stamping or redemption on billing state.
 - See an anchor re-mined at the same height after a calendar restart
   ("Reorgs").
+- Verify a proof against Bitcoin: `/verify` and `/upgrade` are structural
+  ("`/verify` and `/upgrade`"), and the gateway holds no Bitcoin view.
 
 ## Tests
 
@@ -606,6 +654,12 @@ What the suite pins:
 | A malformed receipt line never takes billing down; txid dedupe is case-insensitive | `test_receipts_overflow_line_rejected_not_fatal`, `test_receipts_txid_dedupe_is_case_insensitive` |
 | A calendar anchoring with receipts off degrades `/health` | `test_health_billing_receipts_off_degrades` |
 | The free door never contacts the payment backend | `test_free_mode_never_contacts_payment_backend` |
+| A fabricated Bitcoin attestation is never reported verified; `verified` is null or false | `test_review_fabricated_attestation_is_never_reported_verified`, `test_review_verified_is_false_for_every_non_attested_state` |
+| The body cap holds against the real HTTP parser with dual framing, and bytes are counted | `test_review_body_cap_holds_against_the_real_parser_with_dual_framing`, `test_review_body_cap_counts_bytes_the_parser_delivers` |
+| A malformed token's content never reaches the log | `test_review_malformed_token_content_never_reaches_the_log` |
+| One upgrade is bounded; calendar-unavailable is a 503 | `test_review_upgrade_calendar_work_is_bounded_per_request`, `test_review_calendar_unavailable_is_a_503_not_pending` |
+| The gateway container's environment is an allowlist without the RPC credential | `test_review_compose_gateway_environment_is_an_allowlist` |
+| Ops settings are resolved after `.env`; a failed proof scan is attention and nonzero; a backup without a usable snapshot is failed | `test_review_wallet_alarm_resolves_every_setting_after_env_is_loaded`, `test_review_proof_scan_traversal_failure_is_attention_and_nonzero`, `test_review_backup_without_a_usable_snapshot_is_failed_while_writers_run` |
 
 ## Dependencies
 

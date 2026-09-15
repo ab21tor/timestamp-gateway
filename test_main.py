@@ -1,7 +1,7 @@
 """Test suite for the L402 gateway.
 
 Covers: startup/config validation, digest validation, L402 header parsing, the
-402 challenge, token verify/reject, the paid retry path, LND payment
+402 challenge, token verify/reject, the paid retry path, phoenixd payment
 verification, create_invoice wiring, OTS calendar/public modes with bounded
 retry and no public fallback, the health endpoint, reuse semantics, error
 discipline (generic public details), the obligation log, the /health file
@@ -9,6 +9,7 @@ fields, the float backstop, rate limits, anchor billing, and the free door.
 """
 
 import base64
+import re
 import hashlib
 import io
 import json
@@ -22,12 +23,10 @@ import requests
 
 # Set env vars before importing main so module-level config validation passes.
 # load_dotenv() does not override existing env vars, so these take precedence.
-os.environ["LND_HOST"] = "test.onion"
-os.environ["LND_PORT"] = "8080"
-os.environ["LND_MACAROON_HEX"] = "deadbeef" * 8
-os.environ["TOR_PROXY"] = "127.0.0.1:9050"
 os.environ["PRICE_PER_PROOF_SATS"] = "500"  # the suite-wide deterministic quote
-os.environ["PAYMENT_BACKEND_TYPE"] = "lnd"  # explicit: suite mocks LND REST (the test payer)
+os.environ["PAYMENT_BACKEND_TYPE"] = "phoenixd"  # the only backend; every payment mock is phoenixd's HTTP API
+os.environ["PHOENIXD_URL"] = "http://test-phoenixd:9740"
+os.environ["PHOENIXD_HTTP_PASSWORD_LIMITED"] = "test-limited-password"
 os.environ["OTS_BACKEND_MODE"] = "calendar"
 os.environ["OTS_CALENDAR_URL"] = "http://test-calendar:14788"
 os.environ["L402_SECRET_HEX"] = "ab" * 32          # stable, known signing key
@@ -100,16 +99,18 @@ def auth(token, preimage=PREIMAGE):
     return {"Authorization": f"L402 {token}:{preimage}"}
 
 
-def _get_mock(settled, memo, amt_paid_sat, value=None):
-    """Mock LND invoice-lookup response (verify_payment). ``value`` is the
-    invoice face amount; defaults to amt_paid_sat (paid exactly)."""
+def _get_mock(settled, memo, amt_paid_sat, value=None, expired=False):
+    """Mock phoenixd GET /payments/incoming/{hash} (verify_payment): isPaid,
+    description (the digest memo), receivedSat (credited), requestedSat (the
+    face amount; defaults to receivedSat, paid exactly) and isExpired."""
     m = MagicMock()
     m.raise_for_status.return_value = None
     m.json.return_value = {
-        "settled": settled,
-        "memo": memo,
-        "amt_paid_sat": str(amt_paid_sat),
-        "value": str(value if value is not None else amt_paid_sat),
+        "isPaid": settled,
+        "description": memo,
+        "receivedSat": amt_paid_sat,
+        "requestedSat": value if value is not None else amt_paid_sat,
+        "isExpired": expired,
     }
     return m
 
@@ -119,13 +120,13 @@ def _settled_get():
 
 
 def _post_mock():
-    """Mock LND invoice-creation response: includes r_hash so create_invoice can
-    decode the payment hash (base64 of PAYMENT_HASH so the minted token matches)."""
+    """Mock phoenixd POST /createinvoice: the serialized bolt11 and the
+    payment hash (PAYMENT_HASH, so the minted token matches)."""
     m = MagicMock()
     m.raise_for_status.return_value = None
     m.json.return_value = {
-        "payment_request": FAKE_INVOICE,
-        "r_hash": base64.b64encode(bytes.fromhex(PAYMENT_HASH)).decode(),
+        "serialized": FAKE_INVOICE,
+        "paymentHash": PAYMENT_HASH,
     }
     return m
 
@@ -135,13 +136,6 @@ def _good_calendar_ts():
     ts = Timestamp(bytes.fromhex(DIGEST))
     ts.attestations.add(PendingAttestation("https://test.calendar.example"))
     return ts
-
-
-def _ok_lnd():
-    m = MagicMock()
-    m.raise_for_status.return_value = None
-    m.json.return_value = {"alias": "test-node"}
-    return m
 
 
 def _ok_otsd():
@@ -266,7 +260,7 @@ def _obligation_count():
 
 
 def test_missing_required_env_var_fails_at_startup():
-    with patch.dict(os.environ, {"LND_HOST": ""}):
+    with patch.dict(os.environ, {"OTS_BACKEND_MODE": ""}):
         with pytest.raises(RuntimeError, match="Missing required environment variables"):
             main._parse_config()
 
@@ -410,7 +404,7 @@ def test_digest_normalized_to_lowercase_in_memo():
     with patch("main.requests.post", return_value=_post_mock()) as patched:
         resp = client.post("/timestamp", json={"digest": "A" * 64})
     assert resp.status_code == 402
-    assert patched.call_args.kwargs["json"]["memo"] == "a" * 64
+    assert patched.call_args.kwargs["data"]["description"] == "a" * 64
 
 
 # 3. L402 header parsing
@@ -481,10 +475,9 @@ def test_402_creates_invoice_with_digest_memo_and_configured_price():
     with patch("main.requests.post", return_value=_post_mock()) as p:
         resp = client.post("/timestamp", json={"digest": DIGEST})
     assert resp.status_code == 402
-    sent = p.call_args.kwargs["json"]
-    assert sent["memo"] == DIGEST
-    assert sent["value"] == 500              # configured PRICE_PER_PROOF_SATS
-    assert sent["private"] is True
+    sent = p.call_args.kwargs["data"]
+    assert sent["description"] == DIGEST
+    assert sent["amountSat"] == 500          # configured PRICE_PER_PROOF_SATS
 
 
 def test_402_quotes_flat_per_proof_rate():
@@ -498,7 +491,7 @@ def test_402_quotes_flat_per_proof_rate():
         assert resp.status_code == 402
         body = resp.json()["detail"]
         assert body["price_sats"] == 7
-        assert p.call_args.kwargs["json"]["value"] == 7
+        assert p.call_args.kwargs["data"]["amountSat"] == 7
         assert main.verify_l402_token(body["macaroon"], DIGEST) == (PAYMENT_HASH, 7)
 
 
@@ -709,7 +702,7 @@ def test_valid_token_unsettled_invoice_returns_402():
     assert resp.status_code == 402
 
 
-def test_wrong_preimage_rejected_before_lnd_lookup():
+def test_wrong_preimage_rejected_before_backend_lookup():
     token = valid_token()
     mock_get = MagicMock()
     with patch("main.requests.get", mock_get):
@@ -719,7 +712,7 @@ def test_wrong_preimage_rejected_before_lnd_lookup():
             headers={"Authorization": f"L402 {token}:{WRONG_PREIMAGE}"},
         )
     assert resp.status_code == 401
-    mock_get.assert_not_called()  # preimage check happens before any LND call
+    mock_get.assert_not_called()  # preimage check happens before any phoenixd call
 
 
 def test_same_token_preimage_same_digest_reuse_allowed():
@@ -737,7 +730,7 @@ def test_same_token_preimage_different_digest_rejected():
     assert resp.status_code == 401
 
 
-# 7. LND invoice lookup / payment verification
+# 7. phoenixd invoice lookup / payment verification
 def test_verify_payment_true_when_settled_correct_memo_and_amount():
     with patch("main.requests.get", return_value=_settled_get()):
         assert main.verify_payment(PAYMENT_HASH, DIGEST, 21) is True
@@ -802,7 +795,7 @@ def test_malformed_response_missing_requested_sat_fails_closed():
             assert main.verify_payment(PAYMENT_HASH, DIGEST, 21) is False
 
 
-def test_lnd_overpaid_underminted_invoice_rejected():
+def test_overpaid_underminted_invoice_rejected():
     # Uniform-rule pin: face amount 10 < price 21 rejects even though the
     # payer overpaid to 30. An invoice minted below its bound price is a
     # gateway mint bug to surface, not a payment to honor.
@@ -864,14 +857,14 @@ def test_verify_payment_lookup_failure_raises_generic_502_and_logs(caplog):
             with pytest.raises(HTTPException) as ei:
                 main.verify_payment(PAYMENT_HASH, DIGEST, 21)
     assert ei.value.status_code == 502
-    assert ei.value.detail == "LND error: could not verify payment"
+    assert ei.value.detail == "Payment backend error: could not verify payment"
     assert "boom-internal-detail" not in ei.value.detail
-    assert any("LND invoice lookup failed" in r.message for r in caplog.records)
+    assert any("phoenixd invoice lookup failed" in r.message for r in caplog.records)
 
 
 # 8. create_invoice() wiring
-def test_create_invoice_returns_tuple_and_decodes_rhash_to_hex():
-    ph = "ab" * 32
+def test_create_invoice_returns_tuple_and_lowercases_payment_hash():
+    ph = "AB" * 32
     captured = {}
 
     class FakeResponse:
@@ -879,27 +872,25 @@ def test_create_invoice_returns_tuple_and_decodes_rhash_to_hex():
             pass
 
         def json(self):
-            return {"payment_request": "lnbc...", "r_hash": base64.b64encode(bytes.fromhex(ph)).decode()}
+            return {"serialized": "lnbc...", "paymentHash": ph}
 
-    def fake_post(url, headers=None, json=None, proxies=None, verify=None, timeout=None):
-        captured.update(url=url, headers=headers, json=json, proxies=proxies, verify=verify)
+    def fake_post(url, data=None, auth=None, timeout=None):
+        captured.update(url=url, data=data, auth=auth, timeout=timeout)
         return FakeResponse()
 
     with patch("main.requests.post", fake_post):
         payment_request, payment_hash = main.create_invoice(DIGEST, 21)
 
     assert payment_request == "lnbc..."
-    assert payment_hash == ph and len(payment_hash) == 64
-    assert captured["url"].endswith("/v1/invoices")
-    assert captured["headers"]["Grpc-Metadata-macaroon"] == main.LND_MACAROON_HEX
-    assert captured["verify"] == main.LND_TLS_VERIFY
-    assert captured["proxies"] == {"https": f"socks5h://{main.TOR_PROXY}"}  # TOR_PROXY respected
-    assert captured["json"]["memo"] == DIGEST
-    assert captured["json"]["value"] == 21
-    assert captured["json"]["private"] is True
+    assert payment_hash == ph.lower() and len(payment_hash) == 64
+    assert captured["url"] == f"{main.PHOENIXD_URL}/createinvoice"
+    assert captured["auth"] == ("", main.PHOENIXD_HTTP_PASSWORD_LIMITED)
+    assert captured["data"]["description"] == DIGEST
+    assert captured["data"]["amountSat"] == 21
+    assert captured["data"]["externalId"].startswith(DIGEST[:16] + "-")
 
 
-def test_create_invoice_lnd_failure_raises_generic_502_and_logs(caplog):
+def test_create_invoice_failure_raises_generic_502_and_logs(caplog):
     m = MagicMock()
     m.raise_for_status.side_effect = Exception("creation-internal-detail")
     with patch("main.requests.post", return_value=m):
@@ -907,9 +898,9 @@ def test_create_invoice_lnd_failure_raises_generic_502_and_logs(caplog):
             with pytest.raises(HTTPException) as ei:
                 main.create_invoice(DIGEST, 21)
     assert ei.value.status_code == 502
-    assert ei.value.detail == "LND error: could not create invoice"
+    assert ei.value.detail == "Payment backend error: could not create invoice"
     assert "creation-internal-detail" not in ei.value.detail
-    assert any("LND invoice creation failed" in r.message for r in caplog.records)
+    assert any("phoenixd invoice creation failed" in r.message for r in caplog.records)
 
 
 # 9. OTS backend modes
@@ -1155,14 +1146,14 @@ def test_health_payment_reflects_last_real_mint():
 
 
 # 11. Error discipline (cross-cutting)
-def test_lnd_create_error_detail_is_generic_no_leak():
+def test_create_error_detail_is_generic_no_leak():
     m = MagicMock()
-    m.raise_for_status.side_effect = Exception("secret-lnd-trace")
+    m.raise_for_status.side_effect = Exception("secret-backend-trace")
     with patch("main.requests.post", return_value=m):
         resp = client.post("/timestamp", json={"digest": DIGEST})
     assert resp.status_code == 502
-    assert resp.json()["detail"] == "LND error: could not create invoice"
-    assert "secret-lnd-trace" not in resp.text
+    assert resp.json()["detail"] == "Payment backend error: could not create invoice"
+    assert "secret-backend-trace" not in resp.text
 
 
 def test_malformed_auth_uses_401():
@@ -1221,7 +1212,7 @@ def test_verify_mismatched_digest_returns_mismatch_status():
     assert body["proof_digest"] == OTHER_DIGEST
 
 
-def test_verify_bitcoin_attestation_returns_anchored_status():
+def test_verify_bitcoin_attestation_returns_attestation_present_not_verified():
     ots_b64 = base64.b64encode(
         make_detached_ots_bytes(attestation=main.BitcoinBlockHeaderAttestation(954112))
     ).decode()
@@ -1229,11 +1220,13 @@ def test_verify_bitcoin_attestation_returns_anchored_status():
 
     assert resp.status_code == 200
     body = resp.json()
-    assert body["status"] == "anchored"
+    assert body["status"] == "bitcoin_attestation_present"
     assert body["valid_ots"] is True
     assert body["digest_match"] is True
-    assert body["bitcoin_anchored"] is True
-    assert body["verified"] is True
+    assert body["bitcoin_attestation_present"] is True
+    assert body["bitcoin_anchored"] is True   # the same structural flag, pre-2026-09-15 name
+    assert body["verified"] is None           # not checked against Bitcoin here
+    assert body["verification"] == "structural"
     assert body["attestations"] == [
         {
             "type": "bitcoin",
@@ -1358,7 +1351,7 @@ def test_upgrade_mismatched_digest_no_calendar_contact():
     mock_calendar.assert_not_called()
 
 
-def test_upgrade_already_anchored_no_calendar_contact():
+def test_upgrade_already_attested_no_calendar_contact():
     ots_b64 = base64.b64encode(
         make_detached_ots_bytes(
             attestation=main.BitcoinBlockHeaderAttestation(954112)
@@ -1368,11 +1361,13 @@ def test_upgrade_already_anchored_no_calendar_contact():
         resp = client.post("/upgrade", json={"digest": DIGEST, "ots": ots_b64})
     assert resp.status_code == 200
     body = resp.json()
-    assert body["status"] == "anchored"
+    assert body["status"] == "bitcoin_attestation_present"
     assert body["valid_ots"] is True
     assert body["digest_match"] is True
-    assert body["bitcoin_anchored"] is True
-    assert body["verified"] is True
+    assert body["bitcoin_attestation_present"] is True
+    assert body["bitcoin_anchored"] is True   # the same structural flag, pre-2026-09-15 name
+    assert body["verified"] is None           # not checked against Bitcoin here
+    assert body["verification"] == "structural"
     assert body["ots"] == ots_b64
     mock_calendar.assert_not_called()
 
@@ -1380,7 +1375,7 @@ def test_upgrade_already_anchored_no_calendar_contact():
 def test_upgrade_pending_no_calendar_upgrade_returns_pending():
     ots_b64 = base64.b64encode(make_detached_ots_bytes()).decode()
     instance = MagicMock()
-    instance.get_timestamp.side_effect = Exception("commitment not found")
+    instance.get_timestamp.side_effect = main.CommitmentNotFoundError("commitment not found")
     with patch("main.RemoteCalendar", return_value=instance) as mock_calendar:
         resp = client.post("/upgrade", json={"digest": DIGEST, "ots": ots_b64})
     assert resp.status_code == 200
@@ -1395,7 +1390,7 @@ def test_upgrade_pending_no_calendar_upgrade_returns_pending():
     assert instance.get_timestamp.called
 
 
-def test_upgrade_pending_calendar_returns_bitcoin_anchored():
+def test_upgrade_pending_calendar_returns_attestation_present():
     ots_b64 = base64.b64encode(make_detached_ots_bytes()).decode()
     upgraded_ts = main.Timestamp(bytes.fromhex(DIGEST))
     upgraded_ts.attestations.add(main.BitcoinBlockHeaderAttestation(954112))
@@ -1405,11 +1400,13 @@ def test_upgrade_pending_calendar_returns_bitcoin_anchored():
         resp = client.post("/upgrade", json={"digest": DIGEST, "ots": ots_b64})
     assert resp.status_code == 200
     body = resp.json()
-    assert body["status"] == "anchored"
+    assert body["status"] == "bitcoin_attestation_present"
     assert body["valid_ots"] is True
     assert body["digest_match"] is True
-    assert body["bitcoin_anchored"] is True
-    assert body["verified"] is True
+    assert body["bitcoin_attestation_present"] is True
+    assert body["bitcoin_anchored"] is True   # the same structural flag, pre-2026-09-15 name
+    assert body["verified"] is None           # not checked against Bitcoin here
+    assert body["verification"] == "structural"
     assert body["ots"] is not None
     assert body["ots"] != ots_b64
     assert any(a["type"] == "bitcoin" for a in body["attestations"])
@@ -1424,7 +1421,7 @@ def test_upgrade_override_allowlist_contacts_only_operator_calendar():
         )
     ).decode()
     instance = MagicMock()
-    instance.get_timestamp.side_effect = Exception("commitment not found")
+    instance.get_timestamp.side_effect = main.CommitmentNotFoundError("commitment not found")
     with patch("main.RemoteCalendar", return_value=instance) as mock_calendar:
         resp = client.post("/upgrade", json={"digest": DIGEST, "ots": ots_b64})
     assert resp.status_code == 200
@@ -1444,8 +1441,8 @@ def test_upgrade_override_allowlist_contacts_only_operator_calendar():
 # Payment backend selection
 
 def test_payment_backend_default_is_phoenixd():
-    """With PAYMENT_BACKEND_TYPE unset, the default is phoenixd (the live
-    backend) — and a bare config must parse without any LND vars."""
+    """With PAYMENT_BACKEND_TYPE unset (or empty: the compose allowlist hands
+    an unset variable over as the empty string), the backend is phoenixd."""
     env = {
         "PRICE_PER_PROOF_SATS": "500",
         "OTS_BACKEND_MODE": "calendar",
@@ -1453,20 +1450,35 @@ def test_payment_backend_default_is_phoenixd():
         "L402_SECRET_HEX": "ab" * 16,
     }
     with patch.dict(os.environ, env, clear=True):
-        result = main._parse_config()
-    assert result.payment_backend_type == "phoenixd"
+        assert main._parse_config().payment_backend_type == "phoenixd"
+    with patch.dict(os.environ, dict(env, PAYMENT_BACKEND_TYPE=""), clear=True):
+        assert main._parse_config().payment_backend_type == "phoenixd"
 
 
-def test_payment_backend_env_var_selects_lnd():
-    """The suite runs with PAYMENT_BACKEND_TYPE=lnd set explicitly (LND is the
-    test payer; all payment mocks are LND REST). Explicit selection must win."""
-    assert main.PAYMENT_BACKEND_TYPE == "lnd"
-    assert isinstance(main.PAYMENT_BACKEND, main.LndPaymentBackend)
+def test_payment_backend_is_phoenixd():
+    assert main.PAYMENT_BACKEND_TYPE == "phoenixd"
+    assert isinstance(main.PAYMENT_BACKEND, main.PhoenixdPaymentBackend)
 
 
-def test_make_payment_backend_lnd():
-    backend = main._make_payment_backend("lnd")
-    assert isinstance(backend, main.LndPaymentBackend)
+def test_payment_backend_lnd_is_refused_with_a_teaching_message():
+    """The LND backend was removed on 2026-09-15 (ruling: not carried unless
+    someone actually needs it). An .env still selecting it fails at startup
+    naming the removal and the lines to drop, never silently falling back."""
+    env = {
+        "PAYMENT_BACKEND_TYPE": "lnd",
+        "PRICE_PER_PROOF_SATS": "500",
+        "OTS_BACKEND_MODE": "calendar",
+        "OTS_CALENDAR_URL": "http://127.0.0.1:14788",
+        "L402_SECRET_HEX": "ab" * 16,
+        "LND_HOST": "x", "LND_PORT": "1", "LND_MACAROON_HEX": "aa",
+    }
+    with patch.dict(os.environ, env, clear=True):
+        with pytest.raises(RuntimeError, match=r"LND backend was removed on 2026-09-15"):
+            main._parse_config()
+    with pytest.raises(RuntimeError):
+        main._make_payment_backend("lnd")
+    assert not hasattr(main, "LndPaymentBackend")
+    assert not hasattr(main, "LND_HOST") and not hasattr(main, "TOR_PROXY")
 
 
 def test_make_payment_backend_phoenixd():
@@ -1506,8 +1518,8 @@ def test_same_token_preimage_reuse_returns_cached_proof_not_double_stamp(caplog)
     assert PAYMENT_HASH not in cached[0]
 
 
-def test_phoenixd_backend_does_not_require_lnd_vars():
-    """PAYMENT_BACKEND_TYPE=phoenixd must not require LND_HOST/PORT/MACAROON."""
+def test_phoenixd_backend_config_parses():
+    """PAYMENT_BACKEND_TYPE=phoenixd with its two variables parses."""
     env = {
         "PAYMENT_BACKEND_TYPE": "phoenixd",
         "PRICE_PER_PROOF_SATS": "500",
@@ -2765,7 +2777,7 @@ def test_upgrade_client_token_exempts_bucket(monkeypatch):
     monkeypatch.setattr(main, "UPGRADE_CLIENT_TOKEN", UPGRADE_TOKEN)
     hdr = {"Authorization": f"Bearer {UPGRADE_TOKEN}"}
     instance = MagicMock()
-    instance.get_timestamp.side_effect = Exception("not yet")
+    instance.get_timestamp.side_effect = main.CommitmentNotFoundError("not yet")
     with patch("main.RemoteCalendar", return_value=instance):
         codes = [client.post("/upgrade", json=_upgrade_body(), headers=hdr).status_code
                  for _ in range(5)]
@@ -2778,7 +2790,7 @@ def test_upgrade_client_token_exempts_bucket(monkeypatch):
 def test_upgrade_wrong_or_unset_client_token_is_anonymous(monkeypatch):
     monkeypatch.setattr(main, "VERIFY_RATE_LIMIT_PER_MINUTE", 1)
     instance = MagicMock()
-    instance.get_timestamp.side_effect = Exception("not yet")
+    instance.get_timestamp.side_effect = main.CommitmentNotFoundError("not yet")
     with patch("main.RemoteCalendar", return_value=instance):
         monkeypatch.setattr(main, "UPGRADE_CLIENT_TOKEN", UPGRADE_TOKEN)
         wrong = {"Authorization": "Bearer not-the-token"}
@@ -3235,7 +3247,7 @@ def test_anchor_bills_expired_invoice_remints_new_hash(anchor_billing):
 
 
 def test_anchor_bills_expired_none_treated_as_live(anchor_billing):
-    # A backend with no expiry signal (LND shape) must not re-mint each poll.
+    # A backend answer with no expiry signal (unknown) must not re-mint each poll.
     anchor_billing.write_text(receipt_line())
     backend = _bills_backend()
     with patch("main.PAYMENT_BACKEND", backend):
@@ -3956,3 +3968,581 @@ def test_phoenixd_status_matches_exact_process_name_and_configured_bind(tmp_path
     assert "process: needs_attention" in out
     assert "phoenixd-arm64" in calls.read_text()
 
+
+
+# 19. The 2026-09-15 independent review (gateway findings), as regressions.
+# Each test here fails against de352f1 and passes now. Reproductions of the
+# review's own kit are kept as close to its shape as the fix allows.
+
+from opentimestamps.core.op import OpAppend as _OpAppend  # noqa: E402
+
+
+def _forged_bitcoin_proof():
+    """A valid OTS encoding attesting DIGEST directly to block 0. The genesis
+    header's merkle root is not this digest, so the public library rejects
+    it against the real header — a fabricated attestation."""
+    return make_detached_ots_bytes(attestation=main.BitcoinBlockHeaderAttestation(0))
+
+
+def test_review_fabricated_attestation_is_never_reported_verified():
+    """Before: both endpoints answered status "anchored", verified true.
+    Now the state is structural: bitcoin_attestation_present, verified
+    null (not checked here), and the answer says what was and was not
+    checked."""
+    from bitcoin.core import CBlockHeader
+    from opentimestamps.core.notary import VerificationError
+    proof = _forged_bitcoin_proof()
+    body = {"digest": DIGEST, "ots": base64.b64encode(proof).decode()}
+    genesis = CBlockHeader.deserialize(bytes.fromhex(
+        "01000000" + "00" * 32 + "3ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a"
+        + "29ab5f49ffff001d1dac2b7c"))
+    with pytest.raises(VerificationError):
+        main.BitcoinBlockHeaderAttestation(0).verify_against_blockheader(bytes.fromhex(DIGEST), genesis)
+    for route in ("/verify", "/upgrade"):
+        answer = client.post(route, json=body).json()
+        assert answer["status"] == "bitcoin_attestation_present", route
+        assert answer["verified"] is None, route
+        assert answer["verification"] == "structural", route
+        assert "not checked against a Bitcoin block header" in answer["verification_note"], route
+        assert answer["bitcoin_attestation_present"] is True
+        assert "anchored" not in answer["status"]
+        assert True not in {answer["verified"]}
+
+
+def test_review_verified_is_false_for_every_non_attested_state():
+    pending = base64.b64encode(make_detached_ots_bytes()).decode()
+    other = base64.b64encode(make_detached_ots_bytes(digest=OTHER_DIGEST)).decode()
+    for ots, status in ((pending, "pending"), (other, "mismatch"), ("!!not-base64!!", "invalid")):
+        answer = client.post("/verify", json={"digest": DIGEST, "ots": ots}).json()
+        assert answer["status"] == status
+        assert answer["verified"] is False and answer["verification"] == "structural"
+
+
+def test_review_malformed_token_content_never_reaches_the_log(caplog):
+    """The review's kit: an unauthenticated token whose packet carries a
+    synthetic patient name and record content. Before, the parse error's
+    text — the packet — was logged verbatim at WARNING. Now the log line
+    names the exception class and nothing else."""
+    payload = b"patient=EXAMPLE_PERSON; diagnosis=EXAMPLE_RECORD_CONTENT"
+    packet = b"notakey " + payload + b"\n"
+    token = base64.urlsafe_b64encode(f"{len(packet) + 4:04x}".encode() + packet).decode()
+    with caplog.at_level(logging.DEBUG):
+        response = client.post("/timestamp", json={"digest": DIGEST}, headers=auth(token))
+    assert response.status_code == 401
+    assert "EXAMPLE_PERSON" not in caplog.text
+    assert "EXAMPLE_RECORD_CONTENT" not in caplog.text
+    assert "notakey" not in caplog.text
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "could not be" in warnings[0].getMessage()
+    # Fixed text plus a class name: the message is one of a closed set.
+    assert re.fullmatch(r"L402 macaroon (could not be parsed|caveats could not be read) \([A-Za-z_]+\)",
+                        warnings[0].getMessage())
+
+
+def _proof_with_pending_substamps(count, calendar="http://example.test"):
+    tree = main.Timestamp(bytes.fromhex(DIGEST))
+    for i in range(count):
+        tree.ops.add(_OpAppend(i.to_bytes(2, "big"))).attestations.add(main.PendingAttestation(calendar))
+    detached = main.DetachedTimestampFile(main.OpSHA256(), tree)
+    buf = io.BytesIO()
+    detached.serialize(main.StreamSerializationContext(buf))
+    return buf.getvalue()
+
+
+def test_review_upgrade_calendar_work_is_bounded_per_request():
+    """The review's kit: a 3.5 KB proof with 100 pending sub-stamps made
+    100 sequential calendar calls (timeout 10 each). Now at most
+    UPGRADE_MAX_CALENDAR_QUERIES lookups, each bounded, and the answer
+    says the budget ran out."""
+    proof = _proof_with_pending_substamps(100)
+    calendar = MagicMock()
+    calendar.get_timestamp.side_effect = main.CommitmentNotFoundError("not yet")
+    with patch("main.RemoteCalendar", return_value=calendar):
+        result = client.post("/upgrade", json={"digest": DIGEST, "ots": base64.b64encode(proof).decode()})
+    assert result.status_code == 200
+    body = result.json()
+    assert body["status"] == "pending"
+    assert calendar.get_timestamp.call_count == main.UPGRADE_MAX_CALENDAR_QUERIES == 8
+    assert body["upgrade"] == {"calendar_queries": 8, "budget_exhausted": True}
+    for call in calendar.get_timestamp.call_args_list:
+        assert call.kwargs["timeout"] <= main.UPGRADE_QUERY_TIMEOUT
+
+
+def test_review_upgrade_elapsed_time_is_bounded(monkeypatch):
+    proof = _proof_with_pending_substamps(5)
+    clock = [1000.0]
+
+    def slow_lookup(commitment, timeout=None):
+        clock[0] += 6.0  # each lookup "takes" six seconds
+        raise main.CommitmentNotFoundError("not yet")
+    monkeypatch.setattr(main.time, "monotonic", lambda: clock[0])
+    calendar = MagicMock()
+    calendar.get_timestamp.side_effect = slow_lookup
+    with patch("main.RemoteCalendar", return_value=calendar):
+        body = client.post("/upgrade", json={"digest": DIGEST, "ots": base64.b64encode(proof).decode()}).json()
+    # 15 s budget, 6 s per lookup: the third would start past 12 s and
+    # gets a shortened timeout; nothing starts once 15 s have elapsed.
+    assert calendar.get_timestamp.call_count == 3
+    assert body["upgrade"]["budget_exhausted"] is True
+
+
+def test_review_upgrade_deduplicates_commitments_and_stops_at_first_anchor():
+    # The same commitment under two branches: one lookup. And once the
+    # calendar hands back a Bitcoin attestation, no further lookups.
+    tree = main.Timestamp(bytes.fromhex(DIGEST))
+    for _ in range(3):
+        tree.ops.add(_OpAppend(b"\x01")).attestations.add(main.PendingAttestation("http://example.test"))
+    for i in range(4):
+        tree.ops.add(_OpAppend(bytes([0x10 + i]))).attestations.add(main.PendingAttestation("http://example.test"))
+    detached = main.DetachedTimestampFile(main.OpSHA256(), tree)
+    buf = io.BytesIO()
+    detached.serialize(main.StreamSerializationContext(buf))
+    # OpAppend(b"\x01") added three times is one op in the tree: the walk
+    # sees one sub-stamp for it, then the four distinct ones.
+    seen = []
+
+    def lookup(commitment, timeout=None):
+        seen.append(commitment)
+        if len(seen) == 2:
+            upgraded = main.Timestamp(commitment)
+            upgraded.attestations.add(main.BitcoinBlockHeaderAttestation(954112))
+            return upgraded
+        raise main.CommitmentNotFoundError("not yet")
+    calendar = MagicMock()
+    calendar.get_timestamp.side_effect = lookup
+    with patch("main.RemoteCalendar", return_value=calendar):
+        body = client.post("/upgrade", json={"digest": DIGEST, "ots": base64.b64encode(buf.getvalue()).decode()}).json()
+    assert body["status"] == "bitcoin_attestation_present"
+    assert body["verified"] is None
+    assert len(seen) == 2 and len(set(seen)) == 2
+    assert body["upgrade"]["calendar_queries"] == 2
+
+
+def test_review_calendar_unavailable_is_a_503_not_pending():
+    """Every lookup failing by transport is the calendar not answering:
+    503 calendar_unavailable, never the 200 "pending" that means the
+    calendar answered "not anchored yet"."""
+    proof = make_detached_ots_bytes()
+    calendar = MagicMock()
+    calendar.get_timestamp.side_effect = ConnectionError("not reachable")
+    with patch("main.RemoteCalendar", return_value=calendar):
+        result = client.post("/upgrade", json={"digest": DIGEST, "ots": base64.b64encode(proof).decode()})
+    assert result.status_code == 503
+    body = result.json()
+    assert body["status"] == "calendar_unavailable"
+    assert body["verified"] is False and body["ots"] == base64.b64encode(proof).decode()
+    # One successful "not found" among failures is still a pending answer.
+    calendar.get_timestamp.side_effect = [ConnectionError("x"), main.CommitmentNotFoundError("not yet")]
+    with patch("main.RemoteCalendar", return_value=calendar):
+        result = client.post("/upgrade", json={"digest": DIGEST, "ots": base64.b64encode(
+            _proof_with_pending_substamps(2)).decode()})
+    assert result.status_code == 200 and result.json()["status"] == "pending"
+
+
+def test_review_calendar_failure_log_names_the_class_only(caplog):
+    proof = make_detached_ots_bytes()
+    calendar = MagicMock()
+    calendar.get_timestamp.side_effect = ConnectionError("http://secret.calendar/with?token=EXAMPLE_SECRET")
+    with patch("main.RemoteCalendar", return_value=calendar):
+        with caplog.at_level(logging.DEBUG):
+            client.post("/upgrade", json={"digest": DIGEST, "ots": base64.b64encode(proof).decode()})
+    assert "EXAMPLE_SECRET" not in caplog.text
+    assert "calendar query failed (ConnectionError)" in caplog.text
+
+
+def test_review_phoenixd_expired_maps_isexpired_and_absent_is_unknown():
+    """`expired` is phoenixd's isExpired (present on every incoming-payment
+    answer in v0.8.0 and v0.9.1); a response without the field is
+    unknown, not "not expired"."""
+    backend = main.PhoenixdPaymentBackend()
+    with patch("main.requests.get", return_value=_get_mock(False, DIGEST, 0, value=21, expired=True)):
+        assert backend.lookup_invoice(PAYMENT_HASH).expired is True
+    with patch("main.requests.get", return_value=_get_mock(False, DIGEST, 0, value=21, expired=False)):
+        assert backend.lookup_invoice(PAYMENT_HASH).expired is False
+    m = MagicMock()
+    m.raise_for_status.return_value = None
+    m.json.return_value = {"isPaid": False, "description": DIGEST, "receivedSat": 0, "requestedSat": 21}
+    with patch("main.requests.get", return_value=m):
+        assert backend.lookup_invoice(PAYMENT_HASH).expired is None
+
+
+# The body cap against the real HTTP parser: a uvicorn server on loopback
+# in this process, spoken to over a raw socket, so the request is framed by
+# the pinned h11 exactly as in production.
+import contextlib  # noqa: E402
+import socket  # noqa: E402
+import threading  # noqa: E402
+
+
+@contextlib.contextmanager
+def _live_gateway():
+    import uvicorn
+    config = uvicorn.Config(main.app, host="127.0.0.1", port=0, lifespan="off",
+                            log_level="error", access_log=False)
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.time() + 10
+    while not server.started and time.time() < deadline:
+        time.sleep(0.01)
+    assert server.started
+    port = server.servers[0].sockets[0].getsockname()[1]
+    try:
+        yield port
+    finally:
+        server.should_exit = True
+        thread.join(10)
+
+
+def _raw_http(port, request: bytes):
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
+        try:
+            sock.sendall(request)
+        except OSError:
+            pass  # the server may answer and close before the body is all sent
+        sock.shutdown(socket.SHUT_WR) if False else None
+        chunks = []
+        while True:
+            try:
+                data = sock.recv(65536)
+            except OSError:
+                break
+            if not data:
+                break
+            chunks.append(data)
+            if b"\r\n\r\n" in b"".join(chunks):
+                head, _, rest = b"".join(chunks).partition(b"\r\n\r\n")
+                m = re.search(rb"content-length: ([0-9]+)", head, re.I)
+                if m and len(rest) >= int(m.group(1)):
+                    break
+        return b"".join(chunks)
+
+
+def test_review_body_cap_holds_against_the_real_parser_with_dual_framing():
+    """The review's request: Content-Length: 1 beside Transfer-Encoding:
+    chunked, carrying a 525 KB JSON body in chunks. Before, h11 framed the
+    body by the chunks, the middleware trusted Content-Length, and the
+    gateway answered 200. Now: 411 before routing, and the endpoint never
+    runs."""
+    payload = json.dumps({"digest": DIGEST, "ignored_extra": "x" * (main.MAX_REQUEST_BYTES + 1000)}).encode()
+    request = (b"POST /timestamp HTTP/1.1\r\nHost: example\r\nContent-Type: application/json\r\n"
+               b"Content-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n"
+               + f"{len(payload):x}\r\n".encode() + payload + b"\r\n0\r\n\r\n")
+    with patch("main.L402_ENABLED", False), patch("main.stamp_digest", return_value=b"proof") as stamp:
+        with _live_gateway() as port:
+            answer = _raw_http(port, request)
+            # A plain chunked POST is refused the same way.
+            plain = (b"POST /verify HTTP/1.1\r\nHost: example\r\nContent-Type: application/json\r\n"
+                     b"Transfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n")
+            answer_plain = _raw_http(port, plain)
+            # An honest request still reaches the endpoint.
+            body = json.dumps({"digest": DIGEST}).encode()
+            honest = (b"POST /timestamp HTTP/1.1\r\nHost: example\r\nContent-Type: application/json\r\n"
+                      + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+            answer_honest = _raw_http(port, honest)
+    assert answer.startswith(b"HTTP/1.1 411"), answer[:200]
+    assert answer_plain.startswith(b"HTTP/1.1 411"), answer_plain[:200]
+    assert answer_honest.startswith(b"HTTP/1.1 200"), answer_honest[:200]
+    assert stamp.call_count == 1  # the honest request only
+
+
+def test_review_body_cap_refuses_ambiguous_content_length_and_over_cap_before_routing():
+    with patch("main.L402_ENABLED", False), patch("main.stamp_digest", return_value=b"proof") as stamp:
+        with _live_gateway() as port:
+            body = json.dumps({"digest": DIGEST}).encode()
+            # Two disagreeing Content-Length headers: h11 itself refuses
+            # the request (400) — it never reaches the app.
+            two = (b"POST /timestamp HTTP/1.1\r\nHost: example\r\nContent-Type: application/json\r\n"
+                   + f"Content-Length: {len(body)}\r\nContent-Length: 1\r\n\r\n".encode() + body)
+            answer_two = _raw_http(port, two)
+            big = (b"POST /timestamp HTTP/1.1\r\nHost: example\r\nContent-Type: application/json\r\n"
+                   + f"Content-Length: {main.MAX_REQUEST_BYTES + 1}\r\n\r\n".encode())
+            answer_big = _raw_http(port, big)
+    assert answer_two.startswith(b"HTTP/1.1 400"), answer_two[:200]
+    assert answer_big.startswith(b"HTTP/1.1 413"), answer_big[:200]
+    assert stamp.call_count == 0
+
+
+def test_review_body_cap_counts_bytes_the_parser_delivers():
+    """Defence in depth at the ASGI layer: whatever the parser frames, the
+    app never sees more than the declared length. Driven directly, with a
+    receive that hands over more than Content-Length declared."""
+    payload = json.dumps({"digest": DIGEST, "ignored_extra": "x" * (main.MAX_REQUEST_BYTES + 1000)}).encode()
+    scope = _scope("/timestamp", [("content-type", "application/json"), ("content-length", "1")])
+    with patch("main.L402_ENABLED", False), patch("main.stamp_digest", return_value=b"proof") as stamp:
+        status, out, receives = _run_asgi(scope, body=payload)
+    assert status == 413 and b"too large" in out
+    assert stamp.call_count == 0
+    # The middleware refuses any Transfer-Encoding at the scope level too.
+    scope = _scope("/timestamp", [("content-type", "application/json"),
+                                  ("content-length", "1"), ("transfer-encoding", "chunked")])
+    status, out, receives = _run_asgi(scope, body=payload)
+    assert status == 411 and receives == 0
+    scope = _scope("/timestamp", [("content-type", "application/json"),
+                                  ("content-length", "5"), ("content-length", "7")])
+    status, out, receives = _run_asgi(scope, body=b"12345")
+    assert status == 400 and receives == 0
+
+
+# 20. The 2026-09-15 review: ops scripts, the compose allowlist, the units.
+# Shell scripts are run as subprocesses with stubbed tools on PATH, exactly
+# as the review's kit did; nothing here touches a real wallet or node.
+import shutil  # noqa: E402
+import subprocess  # noqa: E402
+import sqlite3 as _sqlite3  # noqa: E402
+
+_REPO = os.path.dirname(os.path.abspath(__file__))
+
+
+def _stub(directory, name, body):
+    path = os.path.join(directory, name)
+    with open(path, "w") as f:
+        f.write("#!/bin/sh\n" + body + "\n")
+    os.chmod(path, 0o700)
+    return path
+
+
+def _run_script(script, env, cwd=None):
+    return subprocess.run(["/bin/bash", os.path.join(_REPO, "ops", script)],
+                          env=env, text=True, capture_output=True, cwd=cwd, timeout=120)
+
+
+def _ops_env(tmp_path, fixture_env, **extra):
+    fixture = tmp_path / "fixture"
+    fixture.mkdir(exist_ok=True)
+    (fixture / ".env").write_text(fixture_env)
+    bins = tmp_path / "bin"
+    bins.mkdir(exist_ok=True)
+    env = dict(os.environ, REPO=str(fixture), PATH=str(bins) + ":" + os.environ["PATH"])
+    env.pop("WALLET_RPC_ENV_FILE", None)
+    env.update(extra)
+    return fixture, bins, env
+
+
+def test_review_wallet_alarm_resolves_every_setting_after_env_is_loaded(tmp_path):
+    """The review's kit: WALLET_STATUS_PATH set in .env while the
+    environment carried an older path. Before, the older path was written
+    and the configured file stayed absent (which /health reads as
+    healthy). Now .env wins, and WALLET_MIN_SATS from .env is honoured too."""
+    expected = tmp_path / "configured-status"
+    before = tmp_path / "before-source-status"
+    fixture, bins, env = _ops_env(
+        tmp_path,
+        f"WALLET_STATUS_PATH={expected}\nWALLET_MIN_SATS=2000000\nWALLET_RPC_URL=http://unused.test\n",
+        WALLET_STATUS_PATH=str(before), WALLET_MIN_SATS="1")
+    _stub(bins, "curl", """printf '%s' '{"result":{"mine":{"trusted":0.01}},"error":null}'""")
+    r = _run_script("wallet-balance-check.sh", env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert expected.exists() and not before.exists()
+    status = json.loads(expected.read_text())
+    assert status["balance_sats"] == 1_000_000
+    assert status["min_sats"] == 2_000_000 and status["status"] == "low"
+
+
+def test_review_wallet_alarm_credential_is_its_own_file_not_the_gateway_env(tmp_path):
+    """The alarm's RPC user comes from its own file (WALLET_RPC_ENV_FILE);
+    the gateway's .env need not — and on the systemd path must not — hold
+    any Bitcoin credential. Without either, status is unknown, loudly."""
+    status = tmp_path / "wallet-status"
+    fixture, bins, env = _ops_env(tmp_path, f"WALLET_STATUS_PATH={status}\n")
+    _stub(bins, "curl", """printf '%s' '{"result":{"mine":{"trusted":0.5}},"error":null}'""")
+    cred = tmp_path / "wallet-balance-check.env"
+    cred.write_text("WALLET_RPC_URL=http://alarm:secret@unused.test\n")
+    r = _run_script("wallet-balance-check.sh", dict(env, WALLET_RPC_ENV_FILE=str(cred)))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert json.loads(status.read_text())["status"] == "ok"
+    assert "secret" not in r.stdout + r.stderr
+    r = _run_script("wallet-balance-check.sh", dict(env, WALLET_RPC_ENV_FILE=str(tmp_path / "absent")))
+    assert r.returncode == 0
+    assert json.loads(status.read_text()) == {**json.loads(status.read_text()), "status": "unknown",
+                                              "error": "WALLET_RPC_URL not set"}
+
+
+def _proof_scan_fixture(tmp_path, find_body, env_lines=""):
+    status = tmp_path / "proofs-status"
+    fixture, bins, env = _ops_env(tmp_path, f"PROOFS_STATUS_PATH={status}\n" + env_lines)
+    (fixture / "ops").mkdir(exist_ok=True)
+    _stub(fixture / "ops", "upgrade-proof.sh", 'echo "state: bitcoin_backed"; echo "bitcoin_block: 1"')
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir(exist_ok=True)
+    _stub(bins, "find", 'case "$1" in --version) echo "find (GNU findutils) 4.9"; exit 0;; esac\n' + find_body)
+    env.update(ARTIFACTS=str(artifacts))
+    return status, env
+
+
+def test_review_proof_scan_traversal_failure_is_attention_and_nonzero(tmp_path):
+    """The review's kit: find exits 1. Before: exit 0, status ok, total 0,
+    scan_complete. Now: exit 1, status attention naming the scan, state
+    needs_attention — and the status path comes from .env."""
+    status, env = _proof_scan_fixture(tmp_path, "echo permission-denied >&2; exit 1")
+    r = _run_script("upgrade-all-proofs.sh", env)
+    assert r.returncode == 1, r.stdout + r.stderr
+    written = json.loads(status.read_text())
+    assert written["status"] == "attention" and "proof scan failed" in written["error"]
+    assert "state: needs_attention" in r.stdout and "scan_complete" not in r.stdout
+
+
+def test_review_proof_scan_distinguishes_no_files_from_failure(tmp_path):
+    status, env = _proof_scan_fixture(tmp_path, "exit 0")
+    r = _run_script("upgrade-all-proofs.sh", env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    written = json.loads(status.read_text())
+    assert written["status"] == "ok" and written["total"] == 0 and "error" not in written
+    assert "no proofs" in r.stdout and "state: scan_complete" in r.stdout
+    # Two proofs listed: both counted.
+    proofs = tmp_path / "artifacts"
+    for name in ("a", "b"):
+        (proofs / name).mkdir()
+        (proofs / name / "proof.ots").write_bytes(b"x")
+    status, env = _proof_scan_fixture(tmp_path, f'echo "2 {proofs}/a/proof.ots"; echo "1 {proofs}/b/proof.ots"')
+    r = _run_script("upgrade-all-proofs.sh", env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert json.loads(status.read_text())["bitcoin_backed"] == 2
+
+
+def test_review_proof_scan_states_its_gnu_find_dependency(tmp_path):
+    status, env = _proof_scan_fixture(tmp_path, "exit 0")
+    _stub(tmp_path / "bin", "find", "echo 'find: illegal option -- -' >&2; exit 1")  # BSD find
+    r = _run_script("upgrade-all-proofs.sh", env)
+    assert r.returncode == 1
+    assert "GNU find required" in json.loads(status.read_text())["error"]
+
+
+def _backup_fixture(tmp_path, with_row=True):
+    fixture = tmp_path / "repo"
+    fixture.mkdir()
+    os.symlink(os.path.join(_REPO, "ops"), fixture / "ops")
+    state = tmp_path / "state"
+    state.mkdir()
+    conn = _sqlite3.connect(state / "obligations.db")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE obligations(payment_hash TEXT PRIMARY KEY, digest TEXT, created_at INTEGER, status TEXT)")
+    if with_row:
+        conn.execute("INSERT INTO obligations VALUES (?, ?, 1, 'needs_stamp')", ("ab" * 32, "cd" * 32))
+    conn.commit()
+    conn.close()
+    root = tmp_path / "backups"
+    status = tmp_path / "custom-backup-status"
+    (fixture / ".env").write_text(f"BACKUP_ROOT={root}\nBACKUP_STATUS_PATH={status}\nBACKUP_KEEP=3\n")
+    bins = tmp_path / "bin"
+    bins.mkdir()
+    _stub(bins, "docker", "exit 1")   # no daemon here: no container path, no compose gateway
+    for member in ("phoenix", "calendar", "fork"):
+        (tmp_path / member).mkdir()
+    env = dict(os.environ, REPO_DIR=str(fixture), STATE_DIR=str(state), PHOENIX_HOME=str(tmp_path / "phoenix"),
+               OTSD_CALENDAR_DIR=str(tmp_path / "calendar"), OTSD_FORK_PATH=str(tmp_path / "fork"),
+               TOR_KEYS_DIR="", ANCHOR_RECEIPTS_DIR="", ARTIFACTS="", GATEWAY_UNIT="", PHOENIXD_UNIT="", SOCAT_UNIT="",
+               PATH=str(bins) + ":" + os.environ["PATH"])
+    return fixture, state, status, root, bins, env
+
+
+def _archive_metadata(root):
+    archives = sorted(p for p in root.iterdir() if p.name.endswith("-live-state.tar.gz"))
+    assert archives, list(root.iterdir())
+    out = subprocess.run(["tar", "-xzOf", str(archives[-1]), "--include=*/metadata.txt", "--include=*metadata.txt"],
+                         capture_output=True, text=True)
+    return out.stdout
+
+
+def test_review_backup_takes_a_checked_online_snapshot(tmp_path):
+    if not shutil.which("sqlite3"):
+        pytest.skip("sqlite3 CLI not on PATH")
+    fixture, state, status, root, bins, env = _backup_fixture(tmp_path)
+    r = _run_script("backup-live-state.sh", env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    written = json.loads(status.read_text())   # the .env path, honoured
+    assert written["status"] == "local_only", written
+    assert "snapshot check: usable" in r.stdout
+    meta = _archive_metadata(root)
+    assert "obligations_newest_payment_hash: " + "ab" * 32 in meta
+    assert "obligations_snapshot_check: usable" in meta
+    assert "crash-consistent" not in r.stdout + r.stderr
+
+
+def test_review_backup_without_a_usable_snapshot_is_failed_while_writers_run(tmp_path):
+    """The review's point: a raw copy of a live WAL database is not a
+    snapshot of any instant. With no usable online snapshot and the
+    gateway running, the backup is reported failed (the archive is still
+    made); with the gateway stopped it is attention, a stopped-writer copy."""
+    fixture, state, status, root, bins, env = _backup_fixture(tmp_path)
+    _stub(bins, "sqlite3", "echo 'injected: cannot snapshot' >&2; exit 1")
+    _stub(bins, "systemctl", 'case "$1" in is-active) exit 0;; esac; exit 1')   # gateway active
+    r = _run_script("backup-live-state.sh", env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    written = json.loads(status.read_text())
+    assert written["status"] == "failed", written
+    assert "NOT a consistent snapshot" in written["detail"]
+    assert any(p.name.endswith("-live-state.tar.gz") for p in root.iterdir())
+    _stub(bins, "systemctl", 'case "$1" in is-active) exit 3;; esac; exit 1')   # gateway stopped
+    r = _run_script("backup-live-state.sh", env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    written = json.loads(status.read_text())
+    assert written["status"] == "attention" and "stopped-writer copy" in written["detail"]
+
+
+def test_review_snapshot_verifier_reports_an_unusable_copy_as_failed(tmp_path):
+    verify = os.path.join(_REPO, "ops", "verify-obligations-snapshot.sh")
+    good = tmp_path / "good.db"
+    conn = _sqlite3.connect(good)
+    conn.execute("CREATE TABLE obligations(payment_hash TEXT PRIMARY KEY, digest TEXT)")
+    conn.execute("INSERT INTO obligations VALUES (?, 'x')", ("11" * 32,))
+    conn.commit()
+    conn.close()
+    ok = subprocess.run(["/bin/bash", verify, str(good), "--expect-payment-hash", "11" * 32], capture_output=True, text=True)
+    assert ok.returncode == 0 and ok.stdout.startswith("usable:"), ok.stdout + ok.stderr
+    missing = subprocess.run(["/bin/bash", verify, str(good), "--expect-payment-hash", "22" * 32], capture_output=True, text=True)
+    assert missing.returncode == 1 and "unusable: known obligation row" in missing.stdout
+    torn = tmp_path / "torn.db"
+    torn.write_bytes(good.read_bytes()[:1500] + b"\x00" * 600)
+    bad = subprocess.run(["/bin/bash", verify, str(torn)], capture_output=True, text=True)
+    assert bad.returncode == 1 and bad.stdout.startswith("unusable:"), bad.stdout + bad.stderr
+    empty = tmp_path / "empty.db"
+    _sqlite3.connect(empty).close()
+    notable = subprocess.run(["/bin/bash", verify, str(empty)], capture_output=True, text=True)
+    assert notable.returncode == 1 and "obligations table missing" in notable.stdout
+
+
+def test_review_compose_gateway_environment_is_an_allowlist(tmp_path):
+    """The review's kit, inverted: `docker compose config` with a dummy
+    RPC credential in .env. The gateway service's environment must not
+    carry it, otsd's must, and every variable main.py reads must be in
+    the gateway's allowlist (so a config addition cannot silently strand
+    the container)."""
+    probe = subprocess.run(["docker", "compose", "version"], capture_output=True, text=True)
+    if probe.returncode != 0:
+        pytest.skip("docker compose not available")
+    shutil.copy(os.path.join(_REPO, "docker-compose.yml"), tmp_path / "docker-compose.yml")
+    (tmp_path / "otsd").mkdir()
+    (tmp_path / "tor").mkdir()
+    (tmp_path / ".env").write_text(
+        "BITCOIN_RPC_SERVICE_URL=http://example_user:example_wallet_password@127.0.0.1:8332/wallet/test\n"
+        "PRICE_PER_PROOF_SATS=500\n")
+    r = subprocess.run(["docker", "compose", "--project-directory", str(tmp_path), "--profile", "calendar",
+                        "config", "--format", "json"], text=True, capture_output=True, timeout=120)
+    assert r.returncode == 0, r.stderr
+    services = json.loads(r.stdout)["services"]
+    gateway, otsd = services["gateway"]["environment"], services["otsd"]["environment"]
+    assert "env_file" not in services["gateway"]
+    assert "BITCOIN_RPC_SERVICE_URL" not in gateway and "BITCOIN_RPC_ONION" not in gateway
+    assert "example_wallet_password" not in json.dumps(gateway)
+    assert "example_wallet_password" in otsd["BITCOIN_RPC_SERVICE_URL"]
+    assert gateway["PRICE_PER_PROOF_SATS"] == "500"
+    assert gateway["PAUSE_FILE"] == ""   # absent from .env: empty, which main reads as unset
+    source = open(os.path.join(_REPO, "main.py")).read()
+    read_by_main = set(re.findall(r'_env\(\s*"([A-Z0-9_]+)"', source)) | set(re.findall(r'os\.getenv\("([A-Z0-9_]+)"', source))
+    retired = {"GATEWAY_PRICE_SATS", "MIN_GATEWAY_PRICE_SATS", "PRICE_BLIND_SATS", "PRICE_BUMP_RESERVE",
+               "PRICE_MARGIN", "PRICE_TX_VSIZE_ESTIMATE", "PRICE_CONF_TARGET", "PRICE_RPC_URL", "PRICE_MARKUP"}
+    missing = read_by_main - retired - set(gateway)
+    assert not missing, f"read by main.py but not in the compose allowlist: {sorted(missing)}"
+    assert not (set(gateway) - read_by_main), f"in the allowlist but never read: {sorted(set(gateway) - read_by_main)}"
+
+
+def test_review_systemd_templates_separate_the_gateway_identity_from_docker_and_the_credential():
+    gateway_unit = open(os.path.join(_REPO, "deploy", "timestamp-gateway.service.example")).read()
+    otsd_unit = open(os.path.join(_REPO, "deploy", "otsd.service.example")).read()
+    alarm_unit = open(os.path.join(_REPO, "ops", "systemd", "wallet-balance-check.service")).read()
+    assert "InaccessiblePaths=-/var/run/docker.sock" in gateway_unit
+    assert "User=gateway" in gateway_unit and "docker group" in gateway_unit
+    assert "User=otsd" in otsd_unit and "User=gateway" not in otsd_unit
+    assert "EnvironmentFile=-/etc/systemd/system/wallet-balance-check.env" in alarm_unit
+    assert "lnd" not in gateway_unit.lower()

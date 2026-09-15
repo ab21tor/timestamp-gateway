@@ -6,10 +6,20 @@
 # Paths below assume the repo at /home/gateway/timestamp-gateway with a
 # .venv created per the operator guide ("Running without Docker").
 
+# Privilege boundary (operator guide, "Privilege boundary"): the gateway
+# identity holds no Bitcoin credential and no Docker access.
+#   - .env is this unit's EnvironmentFile, so BITCOIN_RPC_SERVICE_URL must
+#     NOT be in it on this path: it lives in /etc/systemd/system/otsd.env,
+#     owned by the otsd service user (deploy/otsd.service.example), which
+#     the gateway user cannot read. The wallet alarm's read-only RPC user
+#     lives in its own file (ops/systemd/wallet-balance-check.service).
+#   - The gateway user is not in the docker group (`gpasswd -d gateway
+#     docker` if it ever was) and the unit below makes the Docker socket
+#     unreachable from inside the service regardless.
+
 [Unit]
 Description=timestamp-gateway Lightning-gated OpenTimestamps gateway
-# phoenixd (the default payment backend) needs no unit dependency.
-# Operators running the lnd test-payer may add lnd.service here.
+# phoenixd (the only payment backend) needs no unit dependency.
 After=network.target
 
 [Service]
@@ -32,11 +42,15 @@ EnvironmentFile=/home/gateway/timestamp-gateway/.env
 # rebuilt or moved; -m resolves through the interpreter that exists now.
 ExecStart=/home/gateway/timestamp-gateway/.venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8000 --no-access-log
 
-# Sandboxing: the gateway writes only its state directory.
+# Sandboxing: the gateway writes only its state directory, and the Docker
+# socket does not exist from its point of view (the `-` tolerates a box
+# without Docker).
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ReadWritePaths=/var/lib/timestamp-gateway
+InaccessiblePaths=-/var/run/docker.sock
+InaccessiblePaths=-/run/docker.sock
 Restart=always
 RestartSec=10
 

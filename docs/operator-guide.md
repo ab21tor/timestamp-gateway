@@ -26,7 +26,7 @@ The gateway cannot produce Bitcoin-anchored proofs on its own. It requires a run
   ```bash
   docker compose version >/dev/null 2>&1 && C="docker compose" || C="docker-compose"
   ```
-- A running phoenixd instance (the live payment backend — see "Payment backend (phoenixd)" below for how to get one) — or an LND node with REST API and invoice macaroon if using the LND test-payer / alternative backend
+- A running phoenixd instance (the payment backend — see "Payment backend (phoenixd)" below for how to get one)
 - Inbound Lightning liquidity on the payment backend
 - An OTS calendar backend (otsd) — bundled via `--profile calendar` or external
 - An **existing, already-synced** Bitcoin Core node reachable by otsd, with a wallet loaded and funded. This is the heaviest prerequisite, and this guide does not teach it: standing up a node from nothing is a multi-day project — on the order of 750 GB of initial-block-download ingress, days of sync time, and a funded wallet. If you do not already run a node, start at https://bitcoincore.org.
@@ -39,10 +39,10 @@ A VPS, a static IP, and clearnet ports are all optional; Tor-only mode needs non
 
 1. Clone this repository, clone the calendar fork next to it (clone command: "Deploying the calendar (otsd)" below), and copy `.env.example` to `.env`.
 2. Generate the L402 signing key and set `L402_SECRET_HEX` in `.env`: `python3 -c 'import secrets; print(secrets.token_hex(32))'`. The gateway refuses to start without it — likewise `PRICE_PER_PROOF_SATS`, the flat price every hash pays, an integer ≥ 1 (sizing arithmetic: "Pricing" below). Set both before first start. Both apply to the default paid door (`L402_ENABLED=true`); a free door (`L402_ENABLED=false` — "Pricing", "The door switch") reads neither.
-3. Set `PAYMENT_BACKEND_TYPE=phoenixd` (the default) and fill in `PHOENIXD_URL` (`http://host.docker.internal:9740` for a phoenixd on this host — Docker Desktop only; on a Linux engine phoenixd must be bound where the container can reach it, see "Payment backend (phoenixd)") and `PHOENIXD_HTTP_PASSWORD_LIMITED`. Only fill in `LND_*` if using the LND test-payer / alternative backend.
-4. (lnd test-payer backend only) Set `TOR_PROXY=tor:9050` if `LND_HOST` is a `.onion` address; leave blank otherwise.
-5. Set `OTS_BACKEND_MODE=calendar` and `OTS_CALENDAR_URL=http://otsd:14788`.
-6. Set `BITCOIN_RPC_SERVICE_URL` for otsd (full URL including credentials, in `.env` only — see `.env.example` for the LAN, onion-bridge, and systemd shapes).
+3. Fill in `PHOENIXD_URL` (`http://host.docker.internal:9740` for a phoenixd on this host — Docker Desktop only; on a Linux engine phoenixd must be bound where the container can reach it, see "Payment backend (phoenixd)") and `PHOENIXD_HTTP_PASSWORD_LIMITED`. phoenixd is the only payment backend (the LND backend was removed on 2026-09-15; a `PAYMENT_BACKEND_TYPE=lnd` line fails startup with the reason).
+4. Set `OTS_BACKEND_MODE=calendar` and `OTS_CALENDAR_URL=http://otsd:14788`.
+5. Set `BITCOIN_RPC_SERVICE_URL` for otsd (full URL including credentials; on the compose path in `.env`, which interpolates it into the otsd service only — the gateway container's environment is an allowlist that never includes it; on the systemd path in `/etc/systemd/system/otsd.env`, never in `.env` — see "Privilege boundary").
+6. Set `WALLET_RPC_URL` for the wallet alarm: an RPC user of its own, whitelisted to `getbalances` ("Wallet liquidity alarm").
 7. First run only: initialise the calendar identity (see "Deploying the calendar" below).
 8. Start the full stack: `docker compose --profile calendar up -d --build` (first run; plain `up -d` thereafter — see "Deploying the calendar (otsd)").
 9. Check logs: `docker compose logs -f`.
@@ -128,7 +128,28 @@ Two conventions in these examples to know about before copying one:
 - **Port:** mainnet Bitcoin Core answers RPC on **8332**. The `18332` in the examples is this repo's local-bridge convention — the socat/onion bridges listen on 18332 and forward to the node's 8332 — kept consistent across the shapes so the bridge and no-bridge URLs differ only in host. Talking to a mainnet node directly with no bridge, use 8332.
 - **Wallet name:** the `/wallet/<name>` path segment must name the wallet actually loaded in Bitcoin Core — the examples use `otsd-hot`, so either `bitcoin-cli createwallet otsd-hot` (then load and fund it) or change the segment to your wallet's name. A URL naming a wallet that is not loaded fails every call.
 
-On the systemd path otsd reads this URL from `/etc/systemd/system/otsd.env` instead of the repo `.env` — see `deploy/otsd.service.example`.
+On the systemd path otsd reads this URL from `/etc/systemd/system/otsd.env` instead of the repo `.env` — see `deploy/otsd.service.example` — and it must NOT also be in `.env`, which is the gateway service's `EnvironmentFile` ("Privilege boundary"). On the compose path it is in `.env` for interpolation into the otsd service only.
+
+### Privilege boundary
+
+The internet-facing gateway process holds no Bitcoin credential and no Docker access (2026-09-15 review: `env_file: .env` had handed the gateway container the anchor wallet's full RPC URL, password included, and the systemd layout put the gateway user in the docker group).
+
+**Compose.** The gateway service's environment in `docker-compose.yml` is an explicit allowlist, one line per variable the gateway reads, interpolated from `.env`. `BITCOIN_RPC_SERVICE_URL` and `BITCOIN_RPC_ONION` are interpolated into the `otsd` and `rpc-bridge` services only. Prove it on your own box:
+
+```bash
+docker compose --profile calendar config --format json \
+  | python3 -c 'import json,sys; s=json.load(sys.stdin)["services"]; print("gateway:", "BITCOIN_RPC_SERVICE_URL" in s["gateway"]["environment"], "otsd:", "BITCOIN_RPC_SERVICE_URL" in s["otsd"]["environment"])'
+# gateway: False otsd: True
+```
+
+A variable absent from `.env` reaches the container as the empty string, which the gateway reads as unset (its defaults apply). The gateway's test suite checks the list both ways (`test_review_compose_gateway_environment_is_an_allowlist`), so a variable added to `main.py` without a line here fails the suite.
+
+**systemd.** Two system users:
+
+- `gateway` runs `timestamp-gateway.service`. Its `EnvironmentFile` is the repo `.env`, so that file carries the gateway's own settings and never `BITCOIN_RPC_SERVICE_URL`. It is not in the `docker` group (`sudo gpasswd -d gateway docker` if it ever was), and the unit adds `InaccessiblePaths=-/var/run/docker.sock` so the socket does not exist from inside the service.
+- `otsd` runs `otsd.service` (the `docker run` of the calendar container), is the one member of the `docker` group, and owns `/etc/systemd/system/otsd.env` (mode 600) where the RPC URL lives. `deploy/otsd.service.example` has the `useradd`/`usermod`/`chown` lines.
+
+The wallet alarm (`wallet-balance-check.service`, run as `gateway`) uses a third credential: an RPC user of its own that Bitcoin Core restricts to `getbalances` — `rpcauth=<user>:<salt$hash>` plus `rpcwhitelist=<user>:getbalances` in `bitcoin.conf` — as `WALLET_RPC_URL` in `/etc/systemd/system/wallet-balance-check.env` (owned by `gateway`, mode 600). The gateway user can read that file, and what it reads can only read a balance. Residual: local root sees everything (`docker inspect`, the env files), which is why backup archives stay encrypted.
 
 For a directly reachable node, ensure the otsd host is allowed by `rpcbind`/`rpcallowip` in bitcoin.conf.
 
@@ -237,8 +258,8 @@ Do not expose otsd on a public port. It has no authentication. Access should be 
 
 1. **Immediate:** The gateway submits the digest to otsd and receives a receipt with a `PendingAttestation` pointing to the calendar URL. This is the `.ots` file returned to the client. It is not yet Bitcoin-anchored.
 2. **Within hours:** otsd submits a Bitcoin transaction anchoring the Merkle root of the pending digests — at most one transaction per anchoring interval ("Bitcoin transaction cost") — then waits for `--btc-min-confirmations` (default 6) before writing the Bitcoin attestation. Typically a few hours end to end: best case about an hour, worst case the full anchoring interval plus confirmation time. (An expectation derived from the defaults — no timing record is committed.)
-3. **Upgrade:** The client POSTs the pending proof (base64) with its digest to the gateway's `/upgrade` endpoint, which fetches the Bitcoin anchoring from the operator's calendar and returns the anchored proof (see the README's `/verify` and `/upgrade` status vocabulary). Plain `ots upgrade proof.ots` reaches the calendar URL inside the pending attestation directly, so it works only if the operator serves that URL publicly — with the calendar private, as this guide recommends, the gateway endpoint is the client path.
-4. **Verify:** The client runs `ots verify proof.ots` to verify the anchored proof against the Bitcoin blockchain — independently exactly when the verifying machine has its own Bitcoin node or a block-header source the client chose to trust; `ots verify` is only as independent as its view of Bitcoin.
+3. **Upgrade:** The client POSTs the pending proof (base64) with its digest to the gateway's `/upgrade` endpoint, which fetches the Bitcoin attestation from the operator's calendar (at most eight lookups within fifteen seconds per call) and returns the proof with status `bitcoin_attestation_present` (see the README's `/verify` and `/upgrade` status vocabulary; a calendar that does not answer is a 503 `calendar_unavailable`, not "pending"). Plain `ots upgrade proof.ots` reaches the calendar URL inside the pending attestation directly, so it works only if the operator serves that URL publicly — with the calendar private, as this guide recommends, the gateway endpoint is the client path.
+4. **Verify:** The client runs `ots verify proof.ots` to verify the proof against the Bitcoin blockchain — independently exactly when the verifying machine has its own Bitcoin node or a block-header source the client chose to trust; `ots verify` is only as independent as its view of Bitcoin. The gateway's `/verify` is not this step: it is structural inspection (the gateway holds no Bitcoin view) and answers `verified: null` for a proof with a Bitcoin attestation, never `true`.
 
 The `.ots` file returned immediately by the gateway is a valid receipt. It is not incomplete or broken; it has not been finalized yet because Bitcoin blocks take time.
 
@@ -473,8 +494,6 @@ The fork writes, the gateway only reads. Two deployment shapes, two answers:
   gateway:
     volumes:
       - anchor_receipts:/anchor-receipts:ro
-    environment:
-      - ANCHOR_RECEIPTS_PATH=/anchor-receipts/anchor-receipts.jsonl
   otsd:
     volumes:
       - anchor_receipts:/anchor-receipts
@@ -484,7 +503,9 @@ volumes:
   anchor_receipts:
 ```
 
-(`ANCHOR_RECEIPTS_PATH` lives in the compose file rather than `.env` because it names a container path fixed by the mount above.)
+and in `.env`: `ANCHOR_RECEIPTS_PATH=/anchor-receipts/anchor-receipts.jsonl`.
+
+(`ANCHOR_RECEIPTS_PATH` is in the gateway's environment allowlist like every other variable, so set it in `.env` to the container path the mount fixes.)
 
 **systemd + docker (the reference deployment):** no new mount. The otsd container already bind-mounts `/var/lib/otsd/calendar` at `/calendar` (`deploy/otsd.service.example`); point the receipts inside it, and the host-run gateway reads the host path directly:
 
@@ -492,58 +513,6 @@ volumes:
 2. Set `ANCHOR_RECEIPTS_PATH=/var/lib/otsd/calendar/anchor-receipts.jsonl` (with the other three variables) in the gateway's `.env` and restart the gateway.
 
 On this path the receipts file does share a directory with the hmac key. Harmless here — the gateway is a host process opening one named file — but it is exactly why compose gets a dedicated volume instead of the calendar one: a volume mount exposes the whole directory, key included.
-
----
-
-## Getting the invoice macaroon (LND test payer / alternative backend only)
-
-This section applies only when `PAYMENT_BACKEND_TYPE=lnd` (test payer / alternative). The live default backend is Phoenixd, which needs no macaroon — only `PHOENIXD_URL` and `PHOENIXD_HTTP_PASSWORD_LIMITED`.
-
-The invoice macaroon authorises creating and reading invoices. It cannot spend funds, open channels, or take any other action.
-
-### LND CLI (minimal macaroon)
-
-```bash
-lncli bakemacaroon \
-  invoices:read \
-  invoices:write \
-  address:read \
-  offchain:read \
-  --save_to invoice.macaroon
-xxd -p -c 256 invoice.macaroon
-```
-
-### Pre-baked macaroon (most home node setups)
-
-LND ships with `invoice.macaroon` pre-created at:
-
-```
-~/.lnd/data/chain/bitcoin/mainnet/invoice.macaroon
-```
-
-Convert it:
-
-```bash
-xxd -p -c 256 ~/.lnd/data/chain/bitcoin/mainnet/invoice.macaroon
-```
-
-### Umbrel
-
-```
-~/umbrel/app-data/lightning/data/lnd/data/chain/bitcoin/mainnet/invoice.macaroon
-```
-
-LND REST host: `umbrel.local` resolves via mDNS from LAN machines only — inside the gateway container it does not resolve; use the Umbrel host's LAN IP instead. Port `8080`.
-
-### RaspiBlitz
-
-```bash
-cat /mnt/hdd/lnd/data/chain/bitcoin/mainnet/invoice.macaroon | xxd -p -c 256
-```
-
-### Start9
-
-Retrieve from the LND app's Properties page or via SSH. Path varies by EmbassyOS version.
 
 ---
 
@@ -578,30 +547,9 @@ To receive Lightning payments, the payment backend must have inbound capacity �
 
 phoenixd manages its own liquidity: it purchases inbound capacity from ACINQ automatically, either when an on-chain swap-in deposit confirms or when a received Lightning payment needs a channel, the fee deducted from that deposit or payment (see `ops/OPERATOR-NOTES.md`). Pre-provision it with the on-chain deposit before going live — the walkthrough is "First payment: pre-fund before going live". Do not leave the channel purchase to the first real payment: in live testing (2026-07) three pre-fund payment attempts from a Phoenix mobile sender were refused upstream, ACINQ returning `UpdateFailHtlc` within ~1 second without ever contacting the receiving phoenixd — and even when that rail works, the first payment nets less.
 
-Both funding rails — the on-chain deposit and a received Lightning payment — purchase inbound liquidity from ACINQ, phoenixd's only peer. That is a deliberate single-provider dependency of the phoenixd backend; third-party channel-open services do not apply. Operators who require peer choice need the alternative backend (LND, below), where inbound capacity is arranged manually.
+Both funding rails — the on-chain deposit and a received Lightning payment — purchase inbound liquidity from ACINQ, phoenixd's only peer. That is a deliberate single-provider dependency, and phoenixd is the only backend this gateway runs (the LND backend was removed on 2026-09-15 — its adapter reported no invoice expiry, so an anchor bill whose first invoice expired was served forever without renewal, and no deployment used it); third-party channel-open services do not apply. An operator who needs peer choice needs a different wallet daemon than this repository supports.
 
-### LND (test payer / alternative backend only)
-
-Inbound capacity must be arranged manually:
-
-**Boltz submarine swap** (no new channel needed):
-
-```bash
-lncli addinvoice --memo boltz-swap --amt 30000
-# Submit invoice at boltz.exchange
-```
-
-Boltz pays the invoice over Lightning (creating inbound capacity on that channel) and gives you on-chain BTC in return, minus a fee.
-
-**Receive a channel from a well-connected node:**
-
-Services like Bitrefill Thor or Amboss Magma open a channel to your node for a fee. Gives you immediate inbound capacity.
-
-**Lightning Terminal (Loop In):**
-
-Submarine swap via Terminal to move sats from your local channel balance to the remote side, creating inbound capacity.
-
-### Tor-only routing difficulty (self-hosted LND-style nodes)
+### Tor-only routing difficulty
 
 Tor-only Lightning nodes see fewer routing paths. The trade-off, its permanence on the clearnet side, and the options (accept lower reliability, hybrid node, VPS payment node) are in the README — "Inbound liquidity" and "Privacy trade-offs".
 
@@ -673,17 +621,25 @@ Two different "anchoring isn't happening" signals, and how to tell them apart:
 
 The otsd-hot wallet funds anchoring transactions. If it drains, anchoring silently stops — so its balance is checked unattended and surfaced through `/health`.
 
-**How it works:** `ops/wallet-balance-check.sh` (run by a systemd timer every 30 minutes) reads the wallet balance over Bitcoin JSON-RPC (`getbalances`, via `BITCOIN_RPC_SERVICE_URL` from `.env`), compares it against `WALLET_MIN_SATS` (default 50000), and atomically writes a one-line JSON status file (`WALLET_STATUS_PATH`, default `/var/lib/timestamp-gateway/wallet-status`). `/health` reads only that file — the wallet field never comes from the gateway talking to Bitcoin RPC, and the gateway holds no wallet credential for it. (The gateway makes no Bitcoin RPC calls at all: the balance-check timer holds the only read credential, and the gateway reads only the file it leaves behind.) The float backstop reads `balance_sats` from this same file — thresholds and the auto-pause semantics are under "Pricing". The two alarms read one file but trip at different levels: with defaults, the float alarm fires first (5 × `STAMPER_FEE_CAP_SATS` = 100,000), then the wallet field goes `low` (`WALLET_MIN_SATS` = 50,000), then the full stop (1 × cap = 20,000) — keep `WALLET_MIN_SATS` between the two float thresholds or one of the alarms becomes dead weight.
+**How it works:** `ops/wallet-balance-check.sh` (run by a systemd timer every 30 minutes) reads the wallet balance over Bitcoin JSON-RPC (`getbalances`, via `WALLET_RPC_URL`: an RPC user of its own, whitelisted to `getbalances`, from `/etc/systemd/system/wallet-balance-check.env` — see "Privilege boundary"; unset, it falls back to `BITCOIN_RPC_SERVICE_URL`, the compose island's one-file shape), compares it against `WALLET_MIN_SATS` (default 50000), and atomically writes a one-line JSON status file (`WALLET_STATUS_PATH`, default `/var/lib/timestamp-gateway/wallet-status`). Every setting is resolved after `.env` is loaded, through `ops/lib/env.sh`, which every ops script uses (until 2026-09-15 the script captured `WALLET_STATUS_PATH` before sourcing `.env`, so a path set there was ignored and `/health` kept reading a file nothing wrote to — reported `absent`, which does not degrade). `/health` reads only that file — the wallet field never comes from the gateway talking to Bitcoin RPC, and the gateway holds no wallet credential for it. (The gateway makes no Bitcoin RPC calls at all: the balance-check timer holds the only read credential, and the gateway reads only the file it leaves behind.) The float backstop reads `balance_sats` from this same file — thresholds and the auto-pause semantics are under "Pricing". The two alarms read one file but trip at different levels: with defaults, the float alarm fires first (5 × `STAMPER_FEE_CAP_SATS` = 100,000), then the wallet field goes `low` (`WALLET_MIN_SATS` = 50,000), then the full stop (1 × cap = 20,000) — keep `WALLET_MIN_SATS` between the two float thresholds or one of the alarms becomes dead weight.
 
 **Install the timer:**
 
-First, make sure `BITCOIN_RPC_SERVICE_URL` is set in `.env` — the check fails with `BITCOIN_RPC_SERVICE_URL not set` (status `unknown`) without it:
+First, give the alarm its own read-only RPC user. In `bitcoin.conf`:
 
 ```
-BITCOIN_RPC_SERVICE_URL=http://<rpc-user>:<rpc-password>@<host:port>/wallet/<wallet-name>
+rpcauth=alarm:<salt$hash>          # from Bitcoin Core's share/rpcauth/rpcauth.py
+rpcwhitelist=alarm:getbalances
+rpcwhitelistdefault=0
 ```
 
-The whole URL goes on one line, no quotes.
+then write its URL, one line, no quotes, to `/etc/systemd/system/wallet-balance-check.env`, owned by the unit's user, mode 600 — the check fails with `WALLET_RPC_URL not set` (status `unknown`) without it:
+
+```
+WALLET_RPC_URL=http://alarm:<alarm-password>@<host:port>/wallet/<wallet-name>
+```
+
+Never put the otsd wallet's `BITCOIN_RPC_SERVICE_URL` in the gateway's `.env` on this path ("Privilege boundary").
 
 Then install and start the timer:
 
@@ -723,7 +679,7 @@ sudo systemctl enable --now health-monitor.timer
 
 ### Other /health fields
 
-`/health` also reports `proofs` — written by `ops/upgrade-all-proofs.sh` (run by `timestamp-gateway-upgrade-proofs.timer`), the sweep that upgrades pending proofs against the local calendar and flags attestation mismatches — and `backup`, written by `ops/backup-live-state.sh` (run by `backup-live-state.timer`; see `ops/BACKUP-RECOVERY.md`). Both follow the wallet pattern: `absent` (not installed) is reported without degrading health; failure and stale states degrade to 503.
+`/health` also reports `proofs` — written by `ops/upgrade-all-proofs.sh` (run by `timestamp-gateway-upgrade-proofs.timer`), the sweep that upgrades pending proofs against the local calendar and flags attestation mismatches; it requires GNU `find` (`-printf`), and a traversal that fails (an unreadable subtree, a missing tool) is status `attention`, state `needs_attention`, exit 1 — distinct from a clean scan of an artifacts directory that holds no proofs (total 0, `ok`) — and `backup`, written by `ops/backup-live-state.sh` (run by `backup-live-state.timer`; see `ops/BACKUP-RECOVERY.md`), which is `failed` when no usable obligation-log snapshot could be taken while the gateway was running. Both follow the wallet pattern: `absent` (not installed) is reported without degrading health; failure and stale states degrade to 503. Every ops script resolves its settings after loading `.env` (`ops/lib/env.sh`), so a status path or artifacts directory set there is honoured.
 
 ---
 
@@ -804,10 +760,11 @@ sudo cat /var/lib/tor/timestamp_gateway/hostname
 - [ ] Bitcoin RPC credentials are configured and otsd can reach Bitcoin Core.
 - [ ] A wallet is loaded in Bitcoin Core and has enough BTC to pay anchoring fees.
 - [ ] Phoenixd has inbound Lightning liquidity (first-payment channel-open fee caveat — see OPERATOR-NOTES).
-- [ ] Invoice macaroon is not committed to any public repository (lnd test-payer / alternative backend only).
+- [ ] On the systemd path: `BITCOIN_RPC_SERVICE_URL` is in `otsd.env` (owned by the `otsd` user) and NOT in `.env`; the `gateway` user is not in the `docker` group; `WALLET_RPC_URL` is a `getbalances`-whitelisted RPC user in its own file. On the compose path: `docker compose config` shows the RPC URL under otsd only ("Privilege boundary").
+- [ ] The first backup run's status is `ok` or `local_only` and its log shows `snapshot check: usable` (`ops/BACKUP-RECOVERY.md`).
 - [ ] `.env` is in `.gitignore` and has never been committed.
 - [ ] Tor hidden service private key is backed up.
 - [ ] `docker compose logs -f otsd` shows otsd starting without errors.
 - [ ] A test payment has been completed end-to-end: invoice issued → paid → `.ots` returned.
-- [ ] A test proof upgrades (gateway `/upgrade`, or the ops sweep) and `ots verify` passes once anchored (timing: "Proof lifecycle").
+- [ ] A test proof upgrades (gateway `/upgrade` answers `bitcoin_attestation_present`, or the ops sweep) and `ots verify` passes once anchored (timing: "Proof lifecycle") — `/upgrade`'s answer is structural, `ots verify` is the verification.
 - [ ] I understand that Lightning graph exposure (clearnet Lightning node IP) is permanent once published.

@@ -50,7 +50,8 @@ umask 077
 
 REPO_DIR="${REPO_DIR:-/home/gateway/timestamp-gateway}"
 STATE_DIR="${STATE_DIR:-/var/lib/timestamp-gateway}"
-STATUS_FILE="$STATE_DIR/backup-status"
+# Provisional, for a failure before .env is loaded; resolved again below.
+STATUS_FILE="${BACKUP_STATUS_PATH:-$STATE_DIR/backup-status}"
 STATUS="ok"
 DETAIL=""
 
@@ -78,30 +79,36 @@ write_status() {
 
 degrade() {
   # degrade <error-string> — record, warn, continue; never silently skip a step.
-  STATUS="attention"
+  [ "$STATUS" = "failed" ] || STATUS="attention"
   DETAIL="${DETAIL:+$DETAIL; }$1"
   logger -p user.warning -t backup-live-state "$1" || true
   echo "attention: $1"
 }
 
-# Source the gitignored .env for the BACKUP_* knobs and OTSD_FORK_PATH (same
-# pattern as ops/wallet-balance-check.sh; .env wins over the defaults below).
+fail_member() {
+  # fail_member <error-string> — a critical member could not be captured
+  # usably: the run continues (the rest of the set is still archived) but
+  # its status is "failed", which /health degrades on and the monitor pushes.
+  STATUS="failed"
+  DETAIL="${DETAIL:+$DETAIL; }$1"
+  logger -p user.err -t backup-live-state "$1" || true
+  echo "failed: $1"
+}
+
+# Load the gitignored .env for the BACKUP_* knobs and OTSD_FORK_PATH through
+# the shared loader (ops/lib/env.sh; .env wins over the defaults below).
+# Every setting, BACKUP_STATUS_PATH included, is resolved after it.
 if [ ! -f "$REPO_DIR/.env" ]; then
   mkdir -p "$STATE_DIR"
   write_status "failed" "none" "env file not found at $REPO_DIR/.env"
   echo "state: failed"
   exit 1
 fi
-set -a
-# shellcheck disable=SC1091
-# || true: a .env can carry unfilled placeholder lines (e.g. an
-# <angle-bracket> host) that error as shell; under set -e that would abort
-# the whole backup. The error still prints, and sourcing continues past it
-# to the remaining assignments.
-. "$REPO_DIR/.env" || true
-set +a
+# shellcheck source=lib/env.sh
+. "$(cd "$(dirname "$0")" && pwd)/lib/env.sh"
+REPO="$REPO_DIR" load_env
 STATE_DIR="${STATE_DIR:-/var/lib/timestamp-gateway}"
-STATUS_FILE="$STATE_DIR/backup-status"
+STATUS_FILE="${BACKUP_STATUS_PATH:-$STATE_DIR/backup-status}"
 BACKUP_ROOT="${BACKUP_ROOT:-/home/gateway/timestamp-gateway-live-backups}"
 OTSD_FORK_PATH="${OTSD_FORK_PATH:-/home/gateway/opentimestamps-server}"
 PHOENIX_HOME="${PHOENIX_HOME:-/home/gateway/phoenixd/home/.phoenix}"
@@ -164,8 +171,8 @@ echo "=== writing metadata ==="
   echo "host: $(hostname)"
   echo "user: $(whoami)"
   echo "repo: $REPO_DIR"
-  echo "commit: $(git -C "$REPO_DIR" rev-parse HEAD)"
-  echo "branch: $(git -C "$REPO_DIR" branch --show-current)"
+  echo "commit: $(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+  echo "branch: $(git -C "$REPO_DIR" branch --show-current 2>/dev/null || echo unknown)"
 } > "$OUTDIR/metadata.txt"
 
 (cd "$REPO_DIR" && ./ops/status.sh) > "$OUTDIR/status.txt" 2>&1 || true
@@ -178,11 +185,21 @@ systemctl --no-pager cat timestamp-gateway.service > "$OUTDIR/timestamp-gateway.
 systemctl --no-pager cat phoenixd.service > "$OUTDIR/phoenixd.service.txt" 2>&1 || true
 
 echo "=== snapshotting obligation log ==="
-# A .backup through sqlite3 is consistent even mid-write; the raw WAL trio
-# archived below is the fallback if this snapshot is absent. Where the host
-# has no sqlite3 (the compose island), the same online-backup API runs
-# through the gateway container's python — read-locked, writing only to the
-# container's ephemeral /tmp, never to production state.
+# The obligation log is captured by SQLite's online backup (a .backup
+# through sqlite3, or the same API through the gateway container's python
+# where the host has no sqlite3 — read-locked, staged in the container's
+# ephemeral /tmp, never writing production state), and the snapshot is then
+# checked: integrity_check, the obligations table, and the newest obligation
+# row read from the live database beforehand (the known-record check,
+# ops/verify-obligations-snapshot.sh). Only a snapshot that passes is
+# usable. Without one, the raw obligations.db/-wal/-shm files that the
+# archive also carries are a consistent copy ONLY if no writer was running:
+# the 2026-09-15 review copied the database, let a WAL checkpoint run, then
+# copied the WAL, and the restored copy had lost the committed obligations
+# table. So: no usable snapshot and the gateway running = the backup is
+# "failed" (the rest of the set is still archived); no usable snapshot and
+# the gateway stopped = "attention", the raw copy stands as a stopped-writer
+# copy. Nothing here is ever called crash-consistent.
 snapshot_via_container() {
   docker compose --project-directory "$REPO_DIR" exec -T gateway python -c "
 import sqlite3
@@ -197,23 +214,74 @@ dst.close(); src.close()
          rm -f /tmp/obligations.db.snapshot
 }
 
+writers_stopped() {
+  # True when no gateway process can be writing the obligation log: the
+  # systemd unit is not active and no compose gateway container is running.
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet timestamp-gateway 2>/dev/null; then
+    return 1
+  fi
+  if docker compose --project-directory "$REPO_DIR" ps --status running --services 2>/dev/null | grep -qx gateway; then
+    return 1
+  fi
+  return 0
+}
+
+SNAPSHOT="$OUTDIR/obligations.db.snapshot"
+SNAPSHOT_STATE="none"
+EXPECT_HASH=""
 if [ ! -f "$STATE_DIR/obligations.db" ]; then
   degrade "obligations.db not found at $STATE_DIR - snapshot skipped"
-elif command -v sqlite3 >/dev/null 2>&1; then
-  sqlite3 "$STATE_DIR/obligations.db" ".backup '$OUTDIR/obligations.db.snapshot'" \
-    || degrade "sqlite3 snapshot failed"
-elif docker compose --project-directory "$REPO_DIR" ps gateway >/dev/null 2>&1; then
-  snapshot_via_container \
-    || degrade "container snapshot failed (raw WAL trio in archive is crash-consistent; see ops/BACKUP-RECOVERY.md)"
 else
-  degrade "sqlite3 not installed and no gateway container - obligations.db snapshot skipped (raw WAL trio in archive is crash-consistent; see ops/BACKUP-RECOVERY.md)"
+  # The newest obligation row, read before the snapshot: what the snapshot
+  # (and, after a restore, the restored database) must contain.
+  EXPECT_HASH="$(python3 - "$STATE_DIR/obligations.db" 2>/dev/null <<'PYQ' || true
+import sqlite3, sys
+conn = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
+row = conn.execute("SELECT payment_hash FROM obligations ORDER BY rowid DESC LIMIT 1").fetchone()
+print(row[0] if row else "")
+PYQ
+)"
+  echo "obligations_newest_payment_hash: ${EXPECT_HASH:-none}" >> "$OUTDIR/metadata.txt"
+  TAKEN=false
+  if command -v sqlite3 >/dev/null 2>&1; then
+    if sqlite3 "$STATE_DIR/obligations.db" ".backup '$SNAPSHOT'"; then
+      TAKEN=true
+    else
+      echo "sqlite3 snapshot failed"
+    fi
+  elif docker compose --project-directory "$REPO_DIR" ps gateway >/dev/null 2>&1; then
+    if snapshot_via_container; then
+      TAKEN=true
+    else
+      echo "container snapshot failed"
+    fi
+  else
+    echo "sqlite3 not installed and no gateway container: no online snapshot possible"
+  fi
+  if [ "$TAKEN" = true ]; then
+    if [ -n "$EXPECT_HASH" ]; then
+      VERDICT="$("$REPO_DIR/ops/verify-obligations-snapshot.sh" "$SNAPSHOT" --expect-payment-hash "$EXPECT_HASH")" && SNAPSHOT_STATE="ok" || SNAPSHOT_STATE="unusable"
+    else
+      VERDICT="$("$REPO_DIR/ops/verify-obligations-snapshot.sh" "$SNAPSHOT")" && SNAPSHOT_STATE="ok" || SNAPSHOT_STATE="unusable"
+    fi
+    echo "snapshot check: $VERDICT"
+    echo "obligations_snapshot_check: $VERDICT" >> "$OUTDIR/metadata.txt"
+    [ "$SNAPSHOT_STATE" = "ok" ] || rm -f "$SNAPSHOT"
+  fi
+  if [ "$SNAPSHOT_STATE" != "ok" ]; then
+    if writers_stopped; then
+      degrade "obligation log: no usable online snapshot; the gateway is stopped, so the raw obligations.db copy in the archive is a stopped-writer copy (verify it after restore: ops/verify-obligations-snapshot.sh)"
+    else
+      fail_member "obligation log: no usable online snapshot and the gateway is running; the raw obligations.db copy in the archive is NOT a consistent snapshot (see ops/BACKUP-RECOVERY.md)"
+    fi
+  fi
 fi
 
 echo "=== creating sensitive archive ==="
 # The state dir holds the durable obligation log (obligations.db plus its
-# WAL -wal/-shm sidecars) and the operator PAUSED switch; archiving the
-# whole directory captures the database and both sidecars together, so a
-# settled-but-unstamped obligation survives a rebuild. The
+# WAL -wal/-shm sidecars) and the operator PAUSED switch. The checked
+# snapshot above is the copy to restore; the raw files travel too, and are
+# a consistent copy only when they were taken with no writer running. The
 # opentimestamps-server checkout (uncommitted work by design), the tor
 # hidden-service keys (the onion identity — and the calendar's uri name
 # where the onion is the uri), the anchor receipts (billing evidence), and
