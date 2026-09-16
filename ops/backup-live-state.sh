@@ -15,6 +15,13 @@
 #   BACKUP_KEEP           newest archives kept in BACKUP_ROOT (default 7)
 #   PHOENIX_HOME          phoenixd state dir (seed.dat, wallet db)
 #   OTSD_CALENDAR_DIR     otsd calendar state, host path
+#   OBLIGATIONS_DB_PATH   the obligation log the gateway is configured to
+#                         use (its .env setting); default
+#                         $STATE_DIR/obligations.db on the host. Every
+#                         snapshot, check, archive member and metadata line
+#                         names this file (2026-09-15/16 review F07: the
+#                         default beside it was archived as if it were the
+#                         live one).
 #   TOR_KEYS_DIR          tor hidden-service state (onion identity — and,
 #                         where the onion is the calendar uri, the calendar's
 #                         name); default is the compose tor_keys volume. Set
@@ -123,6 +130,13 @@ OTSD_CALENDAR_DIR="${OTSD_CALENDAR_DIR:-/var/lib/otsd/calendar}"
 # design (ARTIFACTS= declares it N/A there).
 : "${ARTIFACTS=/home/gateway/timestamp-gateway-live-artifacts}"
 UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
+# The obligation log, resolved once: the configured path on the host, and
+# the path the gateway sees inside its container (the same setting, or the
+# gateway's own default there). A configured path that is not a file on
+# this host is an unresolved mapping and fails the obligation member below
+# rather than falling back to a default that is not the live log.
+OBLIGATIONS_DB="${OBLIGATIONS_DB_PATH:-$STATE_DIR/obligations.db}"
+OBLIGATIONS_DB_IN_CONTAINER="${OBLIGATIONS_DB_PATH:-/var/lib/timestamp-gateway/obligations.db}"
 # Same unset-only idiom for the individual unit members: empty = N/A on this
 # shape (skipped silently), unset = $UNIT_DIR/<name>.
 : "${GATEWAY_UNIT=$UNIT_DIR/timestamp-gateway.service}"
@@ -173,6 +187,7 @@ echo "=== writing metadata ==="
   echo "repo: $REPO_DIR"
   echo "commit: $(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
   echo "branch: $(git -C "$REPO_DIR" branch --show-current 2>/dev/null || echo unknown)"
+  echo "obligations_db_path: $OBLIGATIONS_DB"
 } > "$OUTDIR/metadata.txt"
 
 (cd "$REPO_DIR" && ./ops/status.sh) > "$OUTDIR/status.txt" 2>&1 || true
@@ -201,9 +216,9 @@ echo "=== snapshotting obligation log ==="
 # the gateway stopped = "attention", the raw copy stands as a stopped-writer
 # copy. Nothing here is ever called crash-consistent.
 snapshot_via_container() {
-  docker compose --project-directory "$REPO_DIR" exec -T gateway python -c "
-import sqlite3
-src = sqlite3.connect('file:/var/lib/timestamp-gateway/obligations.db?mode=ro', uri=True)
+  docker compose --project-directory "$REPO_DIR" exec -T -e "SNAPSHOT_SRC=$OBLIGATIONS_DB_IN_CONTAINER" gateway python -c "
+import os, sqlite3
+src = sqlite3.connect('file:%s?mode=ro' % os.environ['SNAPSHOT_SRC'], uri=True)
 dst = sqlite3.connect('/tmp/obligations.db.snapshot')
 src.backup(dst)
 dst.close(); src.close()
@@ -229,12 +244,20 @@ writers_stopped() {
 SNAPSHOT="$OUTDIR/obligations.db.snapshot"
 SNAPSHOT_STATE="none"
 EXPECT_HASH=""
-if [ ! -f "$STATE_DIR/obligations.db" ]; then
-  degrade "obligations.db not found at $STATE_DIR - snapshot skipped"
+if [ ! -f "$OBLIGATIONS_DB" ]; then
+  if [ -n "${OBLIGATIONS_DB_PATH:-}" ]; then
+    case "$OBLIGATIONS_DB_PATH" in
+      /*) WHY="is not a file on this host" ;;
+      *) WHY="is not an absolute host path" ;;
+    esac
+    fail_member "obligation log: OBLIGATIONS_DB_PATH=$OBLIGATIONS_DB_PATH $WHY; name the host path of the live log (on a compose layout STATE_DIR is the volume's host path and the container keeps its default), never a default beside it"
+  else
+    degrade "obligations.db not found at $OBLIGATIONS_DB - snapshot skipped"
+  fi
 else
   # The newest obligation row, read before the snapshot: what the snapshot
   # (and, after a restore, the restored database) must contain.
-  EXPECT_HASH="$(python3 - "$STATE_DIR/obligations.db" 2>/dev/null <<'PYQ' || true
+  EXPECT_HASH="$(python3 - "$OBLIGATIONS_DB" 2>/dev/null <<'PYQ' || true
 import sqlite3, sys
 conn = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
 row = conn.execute("SELECT payment_hash FROM obligations ORDER BY rowid DESC LIMIT 1").fetchone()
@@ -244,7 +267,7 @@ PYQ
   echo "obligations_newest_payment_hash: ${EXPECT_HASH:-none}" >> "$OUTDIR/metadata.txt"
   TAKEN=false
   if command -v sqlite3 >/dev/null 2>&1; then
-    if sqlite3 "$STATE_DIR/obligations.db" ".backup '$SNAPSHOT'"; then
+    if sqlite3 "$OBLIGATIONS_DB" ".backup '$SNAPSHOT'"; then
       TAKEN=true
     else
       echo "sqlite3 snapshot failed"
@@ -302,6 +325,16 @@ MEMBERS=(
   "$ARTIFACTS"
   "$OUTDIR"
 )
+# The configured obligation log and its WAL sidecars travel by name when
+# they live outside STATE_DIR (inside it they are already members).
+case "$OBLIGATIONS_DB" in
+  "$STATE_DIR"/*) ;;
+  *)
+    for RAW in "$OBLIGATIONS_DB" "$OBLIGATIONS_DB-wal" "$OBLIGATIONS_DB-shm"; do
+      [ -e "$RAW" ] && MEMBERS+=("$RAW")
+    done
+    ;;
+esac
 PRESENT=()
 for MEMBER in "${MEMBERS[@]}"; do
   if [ -z "$MEMBER" ]; then

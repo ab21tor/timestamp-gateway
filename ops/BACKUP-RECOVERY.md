@@ -36,7 +36,12 @@ This is critical. It holds the durable obligation log — the record of settled 
 
 Critical files (the DB runs in SQLite WAL mode, so back up all three sidecars together):
 
-- `obligations.db`
+- `obligations.db` (at `OBLIGATIONS_DB_PATH` when `.env` sets it, else
+  `STATE_DIR/obligations.db`; the backup snapshots, checks and archives
+  that file and records its path as `obligations_db_path` in
+  `metadata.txt`. A configured path that is not a file on the host fails
+  the obligation member rather than falling back to a default beside it:
+  2026-09-15/16 review F07)
 - `obligations.db-wal`
 - `obligations.db-shm`
 

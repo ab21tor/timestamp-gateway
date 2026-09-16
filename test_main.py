@@ -4433,6 +4433,10 @@ def _backup_fixture(tmp_path, with_row=True):
                OTSD_CALENDAR_DIR=str(tmp_path / "calendar"), OTSD_FORK_PATH=str(tmp_path / "fork"),
                TOR_KEYS_DIR="", ANCHOR_RECEIPTS_DIR="", ARTIFACTS="", GATEWAY_UNIT="", PHOENIXD_UNIT="", SOCAT_UNIT="",
                PATH=str(bins) + ":" + os.environ["PATH"])
+    # This module exports OBLIGATIONS_DB_PATH=":memory:" for the app; the
+    # backup honours that setting (2026-09-15/16 review F07) and these
+    # tests are about the default path, so it must not leak into the run.
+    env.pop("OBLIGATIONS_DB_PATH", None)
     return fixture, state, status, root, bins, env
 
 
