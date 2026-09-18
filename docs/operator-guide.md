@@ -38,9 +38,9 @@ A VPS, a static IP, and clearnet ports are all optional; Tor-only mode needs non
 ## First-run checklist
 
 1. Clone this repository, clone the calendar fork next to it (clone command: "Deploying the calendar (otsd)" below), and copy `.env.example` to `.env`.
-2. Generate the L402 signing key and set `L402_SECRET_HEX` in `.env`: `python3 -c 'import secrets; print(secrets.token_hex(32))'`. The gateway refuses to start without it — likewise `PRICE_PER_PROOF_SATS`, the flat price every hash pays, an integer ≥ 1 (sizing arithmetic: "Pricing" below). Set both before first start. Both apply to the default paid door (`L402_ENABLED=true`); a free door (`L402_ENABLED=false` — "Pricing", "The door switch") reads neither.
+2. Generate the L402 signing key and set `L402_SECRET_HEX` in `.env`: `python3 -c 'import secrets; print(secrets.token_hex(32))'`. The gateway refuses to start without it — likewise `PRICE_PER_PROOF_SATS`, the flat price every hash pays, an integer ≥ 1 (sizing arithmetic: "Pricing" below). Set both before first start.
 3. Fill in `PHOENIXD_URL` (`http://host.docker.internal:9740` for a phoenixd on this host — Docker Desktop only; on a Linux engine phoenixd must be bound where the container can reach it, see "Payment backend (phoenixd)") and `PHOENIXD_HTTP_PASSWORD_LIMITED`. phoenixd is the only payment backend (the LND backend was removed on 2026-09-15; a `PAYMENT_BACKEND_TYPE=lnd` line fails startup with the reason).
-4. Set `OTS_BACKEND_MODE=calendar` and `OTS_CALENDAR_URL=http://otsd:14788`.
+4. Set `OTS_CALENDAR_URL=http://otsd:14788`: the operator's calendar, the only place a digest is ever submitted to.
 5. Set `BITCOIN_RPC_SERVICE_URL` for otsd (full URL including credentials; on the compose path in `.env`, which interpolates it into the otsd service only — the gateway container's environment is an allowlist that never includes it; on the systemd path in `/etc/systemd/system/otsd.env`, never in `.env` — see "Privilege boundary").
 6. Set `WALLET_RPC_URL` for the wallet alarm: an RPC user of its own, whitelisted to `getbalances` ("Wallet liquidity alarm").
 7. First run only: initialise the calendar identity (see "Deploying the calendar" below).
@@ -60,30 +60,18 @@ A VPS, a static IP, and clearnet ports are all optional; Tor-only mode needs non
 
 ---
 
-## OTS backend modes
-
-### calendar (real mode — use this in production)
+## The calendar
 
 ```
-OTS_BACKEND_MODE=calendar
 OTS_CALENDAR_URL=http://otsd:14788      # bundled compose profile
 # OTS_CALENDAR_URL=http://127.0.0.1:14788  # systemd path (host-networked otsd)
 ```
 
-The gateway forwards paid digests to the operator's own otsd instance. otsd aggregates submissions and anchors the Merkle root in Bitcoin when commitments are pending, batched on the anchoring interval (see "Bitcoin transaction cost"). This is the only production mode.
+The gateway forwards paid digests to the operator's own otsd instance and to nothing else. otsd aggregates submissions and anchors the Merkle root in Bitcoin when commitments are pending, batched on the anchoring interval (see "Bitcoin transaction cost"). `OTS_CALENDAR_URL` is required; startup fails without it, naming the variable.
 
-**There is no silent fallback.** Calendar failure means 502, never a retry against public aggregators — the failure behavior and the strict mode validation are pinned in the README ("OTS backend modes").
+**There is no silent fallback.** Calendar failure means 502, never a retry against public aggregators — the failure behavior is pinned in the README ("What the gateway guarantees").
 
-### public (compatibility/testing only — not for production)
-
-```
-OTS_BACKEND_MODE=public
-# OTS_CALENDAR_URL must NOT be set
-```
-
-The gateway forwards paid digests to the four public OpenTimestamps aggregators (`a.pool.opentimestamps.org`, etc.). This mode is provided so you can test the payment flow without running otsd. It is not the real target.
-
-**Do not use `public` mode in production.** In public mode, the gateway is a paid relay to other operators' infrastructure — not an independent calendar node.
+The relay to the public OpenTimestamps aggregators (`OTS_BACKEND_MODE=public`) was retired on 2026-09-18: a paid relay to other operators' infrastructure contradicts the operator-calendar configuration, which is the one this repository supports. An `.env` that still sets `OTS_BACKEND_MODE=public` fails at startup with a diagnostic naming the retirement and the way on (remove the line and set `OTS_CALENDAR_URL`, or stay on the revision before the retirement); an `OTS_BACKEND_MODE=calendar` line is warned about once and ignored. The tests use local fakes, never the public calendars.
 
 ---
 
@@ -144,12 +132,13 @@ docker compose --profile calendar config --format json \
 
 A variable absent from `.env` reaches the container as the empty string, which the gateway reads as unset (its defaults apply). The gateway's test suite checks the list both ways (`test_review_compose_gateway_environment_is_an_allowlist`), so a variable added to `main.py` without a line here fails the suite.
 
-**systemd.** Two system users:
+**systemd.** Three system users:
 
 - `gateway` runs `timestamp-gateway.service`. Its `EnvironmentFile` is the repo `.env`, so that file carries the gateway's own settings and never `BITCOIN_RPC_SERVICE_URL`. It is not in the `docker` group (`sudo gpasswd -d gateway docker` if it ever was), and the unit adds `InaccessiblePaths=-/var/run/docker.sock` so the socket does not exist from inside the service.
 - `otsd` runs `otsd.service` (the `docker run` of the calendar container), is the one member of the `docker` group, and owns `/etc/systemd/system/otsd.env` (mode 600) where the RPC URL lives. `deploy/otsd.service.example` has the `useradd`/`usermod`/`chown` lines.
+- `phoenixd` runs `phoenixd.service` and owns the wallet's home, `/var/lib/phoenixd` (mode 700; `.phoenix` inside it holds the seed and both API passwords). The gateway user cannot read it, so code execution in the web process reaches neither the seed nor the full spending password, whatever password the gateway was given. Until 2026-09-18 both units ran as `gateway` and a limited password protected nothing on disk (2026-09-15 review F06). `deploy/phoenixd.service.example` has the `useradd` lines and the move for a box deployed before.
 
-The wallet alarm (`wallet-balance-check.service`, run as `gateway`) uses a third credential: an RPC user of its own that Bitcoin Core restricts to `getbalances` — `rpcauth=<user>:<salt$hash>` plus `rpcwhitelist=<user>:getbalances` in `bitcoin.conf` — as `WALLET_RPC_URL` in `/etc/systemd/system/wallet-balance-check.env` (owned by `gateway`, mode 600). The gateway user can read that file, and what it reads can only read a balance. Residual: local root sees everything (`docker inspect`, the env files), which is why backup archives stay encrypted.
+The wallet alarm (`wallet-balance-check.service`, run as `gateway`) uses a further credential: an RPC user of its own that Bitcoin Core restricts to `getbalances` — `rpcauth=<user>:<salt$hash>` plus `rpcwhitelist=<user>:getbalances` in `bitcoin.conf` — as `WALLET_RPC_URL` in `/etc/systemd/system/wallet-balance-check.env` (owned by `gateway`, mode 600). The gateway user can read that file, and what it reads can only read a balance. Residual: local root sees everything (`docker inspect`, the env files), which is why backup archives stay encrypted.
 
 For a directly reachable node, ensure the otsd host is allowed by `rpcbind`/`rpcallowip` in bitcoin.conf.
 
@@ -308,8 +297,8 @@ Rows are never deleted by the gateway itself, so the table grows with every paid
 
 phoenixd is the live payment backend: a self-custodial Lightning node daemon by ACINQ. The gateway needs exactly two values from it — `PHOENIXD_URL` (its HTTP API) and `PHOENIXD_HTTP_PASSWORD_LIMITED`.
 
-- **Install:** download a release from https://github.com/ACINQ/phoenixd (or build from source) and run `phoenixd`. Upstream docs: https://phoenix.acinq.co/server. On first run it creates its data directory (`~/.phoenix`) including the wallet seed — back the seed up; it is the money.
-- **API password:** first run also generates two passwords in `~/.phoenix/phoenix.conf`. Use `http-password-limited-access` as `PHOENIXD_HTTP_PASSWORD_LIMITED` — it covers the gateway's entire phoenixd surface (`createinvoice`, `getinfo`, `payments/incoming`) and cannot reach `/payinvoice` or `/sendtoaddress` (verified against phoenixd 0.8.0). Never use the full `http-password` here: that hands an internet-facing process the authority to drain the wallet.
+- **Install:** download a release from https://github.com/ACINQ/phoenixd (or build from source) and run `phoenixd`. Upstream docs: https://phoenix.acinq.co/server. On first run it creates its data directory (`.phoenix` in its user's home: `/var/lib/phoenixd/.phoenix` under the shipped unit, run once by hand as the `phoenixd` user first) including the wallet seed — back the seed up; it is the money.
+- **API password:** first run also generates two passwords in `phoenix.conf` in that directory. Use `http-password-limited-access` as `PHOENIXD_HTTP_PASSWORD_LIMITED` — it covers the gateway's entire phoenixd surface (`createinvoice`, `getinfo`, `payments/incoming`) and cannot reach `/payinvoice` or `/sendtoaddress` (verified against phoenixd 0.8.0). Never use the full `http-password` here: that hands an internet-facing process the authority to drain the wallet.
 - **URL:** the HTTP API listens on `127.0.0.1:9740` by default. For a host-run gateway (systemd path) `PHOENIXD_URL=http://127.0.0.1:9740` works as-is. For a container-run gateway (compose path) reachability is NOT automatic: `host.docker.internal` reaches a loopback-bound phoenixd only on Docker Desktop (macOS/Windows, via its VM proxy). On a Linux engine — VPS, Pi, Umbrel, Start9 — it maps to a bridge IP where a loopback-bound phoenixd is not listening, and the connection is refused. phoenixd must be bound where the container can reach it: `--http-bind-ip` on the docker0 bridge address, or a reverse proxy in front of it. phoenixd stays outside the compose stack — it is the wallet holding your funds.
 - **The recipe (Linux engine + compose):** the pair to configure is phoenixd started with `--http-bind-ip 172.17.0.1` (the docker0 bridge address) and `PHOENIXD_URL=http://host.docker.internal:9740` in `.env` — compose maps `host.docker.internal` to that same bridge via `host-gateway`, so the two settings meet. `deploy/phoenixd.service.example` is a minimal systemd unit with exactly this bind; run `phoenixd` once interactively first (first run creates `~/.phoenix`, including the wallet seed) before enabling the unit. Never bind `0.0.0.0` on a public VPS — the API answers to anyone who finds the port.
 - **Neighbours on the bridge (threat model):** `172.17.0.1` is reachable from every container on every Docker network of the host, not only this stack's. phoenixd on that address is password-gated; a same-host bitcoind that binds it (the "Same-host bitcoind under compose" recipe) is gated by `rpcauth` and its whitelist. So the boundary is "any container on this box", and the credentials at stake are the gateway's limited phoenixd password and the otsd container's whitelisted RPC login for the anchor wallet — spendable by design, bounded by that wallet's balance and the stamper's fee cap. Acceptable for a single-tenant box; on a host that runs other people's containers, move phoenixd and bitcoind onto a dedicated network or the host firewall must fence the bridge.
@@ -385,33 +374,13 @@ This can be a deliberate choice rather than a surprise — operators may set `--
 
 ## Pricing
 
-Pricing is a two-part model. **Both parts are live.**
-
-**Part one — the flat per-proof rate (live).** With the L402 door on (`L402_ENABLED=true`, the default), every hash pays `PRICE_PER_PROOF_SATS` at submission. That is the whole quote: no feerate, no estimator, no floor logic — the gateway makes no Bitcoin RPC calls. The variable is required with no default while the door is on (startup fails without it, the same pattern as `L402_SECRET_HEX`) and must be an integer ≥ 1. `0` is refused: a token minted at 0 could never redeem (the price caveat rejects it); a free door is the switch below. A token minted at N validates at N for as long as its settled invoice backs it: settlement, not the clock, gates redemption (the expiry in the challenge is advisory), so repricing never strands an in-flight invoice.
-
-**Part two — anchor billing (live).** Each anchor's records, times `PER_RECORD_SATS`, is billed to a standing payer wallet: the calendar fork writes a receipt per confirmed anchor into an append-only file, including the number of digest submissions inside that anchor's tree, and the gateway turns those receipts into Lightning bills served on `GET /anchor-bills`. Off by default; a gateway with `ANCHOR_BILLING_ENABLED=false` behaves exactly as before it existed. With billing on, anchor costs move from the operator's side of the ledger to the standing payer's — the flat rate becomes a pure service premium. Everything about it: "Anchor billing" below.
-
-### The door switch — free mode
-
-`L402_ENABLED=false` (strict `true`/`false`, default `true`) is the free door. With the door off, `POST /timestamp` stamps the digest immediately and returns the proof free of charge — no invoice, no macaroon, no 402; the payment backend is never contacted from that path, and any `Authorization` header is ignored (a token minted before a flip gets its proof regardless: settlement outranks expiry holds trivially). The per-record cost is charged at anchor time through the existing anchor-bill machinery — records × `PER_RECORD_SATS` per confirmed anchor — so a free door with billing on is the deployment where the standing payer carries everything.
-
-What changes with the door off, precisely:
-
-- **No obligation row is written for a free stamp.** The obligation log exists so a PAID customer is never dropped; nothing is paid here. A failed stamp returns the same 502 and the client retries.
-- **`PRICE_PER_PROOF_SATS` and `L402_SECRET_HEX` are never read** — set-but-unused values are ignored silently; an `.env` legitimately holds both modes' vars.
-- **No rate limit remains on `/timestamp`.** The invoice-mint bucket does not apply (nothing mints; the calendar's per-second aggregation absorbs volume). Whatever can reach a free door can load the calendar and the anchor bill.
-- **`/verify` and `/upgrade` are unaffected** in both modes, including their shared rate bucket.
-- **`/health` reports the mode** in an `l402` field: `on`/`off`, reported, never degrading — the same contract as billing `off`.
-- **Startup names the mode once.** Door off with billing on logs one INFO line (free door; anchor billing carries the charges). Door off with billing off logs one warning instead: nothing charges anywhere — a valid choice (a subsidising operator), named once.
+Every hash pays `PRICE_PER_PROOF_SATS` at submission, through the L402 door. That is the whole quote: no feerate, no estimator, no floor logic — the gateway makes no Bitcoin RPC calls. The variable is required with no default (startup fails without it, the same pattern as `L402_SECRET_HEX`) and must be an integer ≥ 1. `0` is refused: a token minted at 0 could never redeem (the price caveat rejects it). A token minted at N validates at N for as long as its settled invoice backs it: settlement, not the clock, gates redemption (the expiry in the challenge is advisory), so repricing never strands an in-flight invoice.
 
 ### Sizing the flat rate
 
 Measured constants (2026-07): a calm anchor cost 153–308 sats (153 amortized, 308 with one fee bump); the worst case per anchor cycle is bounded by the stamper's fee cap — `--btc-max-fee 0.0002` = 20,000 sats; and one anchor carries the whole batch, every proof aggregated since the last anchor sharing that one cost (measured: five proofs on one 153-sat anchor, 30.6 sats/proof).
 
-Two deployments, two answers:
-
-- **No standing payer — anchoring comes out of the flat rate.** Size in the hundreds of sats. At the measured constants, a 500-sat rate carries a calm 308-sat anchor from the first sale of each batch; a sustained run of cap-priced anchors (20,000 sats each) needs the batch to hold 20,000 ÷ rate sales (40 at 500 sats) or the difference comes out of the float — which is what the float and the cap are for. Fee-spike risk belongs to the float and the cap, not the price.
-- **Standing payer carries anchor costs (anchor billing on).** The flat rate is a pure service premium: single digits to tens of sats. Whether the anchors are recovered is a breakeven condition, not a property of the mechanism: **anchors per day × anchor cost must sit at or below records per day × `PER_RECORD_SATS`** (the rate has no default; the examples here use the guide's running 50). At the default cadence (2–4 anchors/day — "Anchor billing" below), 600 records/day earns 30,000 sats/day against at most 4 × 308 = 1,232 sats of calm anchor cost: roughly 24× breakeven. But 20 records/day earns 1,000 sats/day and loses money on a perfectly calm four-anchor day (1,232 sats) — and one fee-cap anchor (20,000 sats) needs 400 records on its own. Size the rate against your worst expected fee day and your real record volume, not the calm measurements.
+Anchoring comes out of the flat rate, so size it in the hundreds of sats. At the measured constants, a 500-sat rate carries a calm 308-sat anchor from the first sale of each batch; a sustained run of cap-priced anchors (20,000 sats each) needs the batch to hold 20,000 ÷ rate sales (40 at 500 sats) or the difference comes out of the float — which is what the float and the cap are for. Fee-spike risk belongs to the float and the cap, not the price.
 
 ### The float backstop
 
@@ -423,96 +392,15 @@ The anchor wallet (`otsd-hot`) funds anchoring. The gateway watches it through t
 
 ### Retired pricing variables
 
-`GATEWAY_PRICE_SATS`, `MIN_GATEWAY_PRICE_SATS`, `PRICE_BLIND_SATS`, `PRICE_BUMP_RESERVE`, `PRICE_MARGIN`, `PRICE_TX_VSIZE_ESTIMATE`, `PRICE_CONF_TARGET`, and `PRICE_RPC_URL` are no longer read. Any of them present in the environment logs one startup warning naming it, then is ignored — never a startup failure. `PRICE_MARKUP` is retired the same way with its own warning (its successor is the anchor-bill rate, not the quote): anchor bills are now records × `PER_RECORD_SATS` ("Anchor billing" below).
+`GATEWAY_PRICE_SATS`, `MIN_GATEWAY_PRICE_SATS`, `PRICE_BLIND_SATS`, `PRICE_BUMP_RESERVE`, `PRICE_MARGIN`, `PRICE_TX_VSIZE_ESTIMATE`, `PRICE_CONF_TARGET`, and `PRICE_RPC_URL` (the feerate model) are no longer read. Any of them present in the environment logs one startup warning naming it, then is ignored — never a startup failure. Retired the same way on 2026-09-18, with a warning of their own: `PRICE_MARKUP`, `ANCHOR_BILLING_ENABLED`, `PER_RECORD_SATS`, `ANCHOR_RECEIPTS_PATH`, `ANCHOR_BILLS_TOKEN` (anchor billing, below) and the names `L402_ENABLED` and `OTS_BACKEND_MODE`. Two values of those last two are refused at startup instead, because they changed what the gateway was: `L402_ENABLED=false` (the free door: this gateway always charges, and a deployed free door is never silently turned into a paid one) and `OTS_BACKEND_MODE=public` (the public-calendar relay: "The calendar"). Each refusal names the retirement and the way on — remove the line and set the required variables, or stay on the revision before the retirement.
 
 ---
 
-## Anchor billing
+## Retired: anchor billing (2026-09-18)
 
-Part two of the pricing model ("Pricing" above), off by default. The calendar fork writes one receipt line per confirmed anchor into an append-only JSONL file — at the path its `OTSD_ANCHOR_RECEIPTS` environment variable names, written after the calendar save under a pending marker so a crash can never bill the same records twice ("Crashes and receipts" below). Each receipt carries `records`: the number of digest submissions inside that anchor's tree (an integer; `0` means the fork could not prove a count — it errs low by design). With billing on, the gateway ingests those receipts into an `anchor_bills` table (`INSERT OR IGNORE` keyed on the lowercased txid dedupes repeated lines) and bills a standing payer `records × PER_RECORD_SATS` sats per anchor. The amount is computed exactly once, at ingestion, and is immutable: changing the rate later never reprices an existing bill, as with the quote. Bills already in the table keep their stored amounts, whatever formula made them (markup-era bills read back with `records` null).
+Anchor billing — bills of `records × PER_RECORD_SATS` per confirmed anchor, minted from the calendar fork's receipts file and served on `GET /anchor-bills` to a standing payer — was retired on 2026-09-18 under the two-configurations rule: the supported configurations are the single-host appliance (no payments) and this door (paid at submission), and nothing else. The gateway no longer reads the receipts file, creates no `anchor_bills` table, serves no `/anchor-bills`, and `/health` has no `billing` field. `ANCHOR_BILLING_ENABLED`, `PER_RECORD_SATS`, `ANCHOR_RECEIPTS_PATH` and `ANCHOR_BILLS_TOKEN` are retired names ("Retired pricing variables"). The compose wiring that carried the receipts to the gateway (the `anchor_receipts` volume and the `OTSD_ANCHOR_RECEIPTS` line in the otsd service) is gone from `docker-compose.yml`; the receipts file itself, `OTSD_ANCHOR_RECEIPTS` and the `records` count are the calendar fork's and remain its (fork README, "Anchor receipts"). The standing payer, `pay-anchor-bills.sh` in `auto-anchor`, is retired with it.
 
-**Sizing the payer's ceilings.** One anchor's bill is everything submitted in one inter-anchor window: at the default cadence (`--btc-min-tx-interval` 21600 × jitter 1–2, so 6–12 hours) that is records-per-window × `PER_RECORD_SATS`, and the payer's `MAX_SATS_PER_BILL` (default 60,000), its `DAILY_BUDGET_SATS` (default 200,000), and the client's outbound channel capacity must all be sized to that product — the bill arrives as one bolt11, so the channel must carry it in a single payment. The defaults are demo-scale, and enterprise volume exceeds them quietly: 30 records/minute puts 21,600 records in a 12-hour window — one bill of 1,080,000 sats at rate 50, 18× the default per-bill ceiling, with the day's ~2.16M sats at 10× the default budget. What that looks like: the payer logs `skipped reason: exceeds_per_bill_ceiling` on every run and never pays; after 24 hours the gateway's `billing` flips `overdue` and `/health` degrades to 503 — which pages only where the health-monitor timer is installed, so on the compose path alone nothing pages anyone; sales continue throughout (billing gates nothing). Raise the ceilings and the channel with the volume, or shorten the window (`--btc-min-tx-interval`) so each bill stays inside them.
-
-**Crashes and receipts.** The fork writes the receipt after the calendar save, guarded by a marker (`<receipts file>.pending`: the receipt plus one commitment of the anchor's tree) written before the save and removed after the receipt. A stamper crash before the save leaves commitments the calendar does not hold; on restart the fork finds the marker, sees the calendar never saved that anchor, discards the receipt with a warning naming the txid, and re-anchors the commitments under a new txid with their own receipt — one bill. A crash after the save but before the receipt leaves a marker whose commitments the calendar holds; on restart the receipt is recovered from it — one bill, a few minutes late. A crash after both leaves a marker for a receipt already on file, which is removed. So `GET /anchor-bills` never shows two bills for one batch of submissions; what a crash can cost the operator is at most one receipt, and only when the marker itself could not be written (warned at the time). Until 2026-09-08 the receipt was written before the save and a crash between the two produced a second bill for the same records; that edge, and the refund case it called for, is gone.
-
-How a client reconciles anyway: keep a count of records submitted per anchor window (the `api-endpoint` ledger does this per fingerprint — its `proof_free` and `proof_bought` events between two anchor confirmations are that window's records). A bill whose `records` exceeds that count is over-billed, whatever caused it; `pay-anchor-bills.sh` can refuse such a bill on its own (`RECORDS_LOG`, in its README) and the `records` arithmetic is what exposes it to the operator.
-
-**Deploy order: the fork must carry the `records` receipt field before this gateway version bills anything — receipts without real counts do not bill.** A receipt with `records: 0` produces no bill and a warning naming the txid (the fork could not prove a count, so nothing is charged). A receipt missing `records` entirely, or carrying a non-integer, is malformed: skipped with the malformed-line warning. So is anything else the fork cannot write: a txid that is not 64 hex characters (txids are stored lowercase, so a re-cased copy of a line never bills an anchor twice), a negative fee, an empty tree, a negative height, a `confirmed_at` more than a day ahead of the gateway's clock, or a `records` × rate that would not fit the ledger's 64-bit integer. Every such line is skipped with a warning and counted in `billing_rejected`; none can stop the lines after it or take billing down. An old five-field receipts file from an un-upgraded fork therefore never bills — loudly, on every ingest pass.
-
-Billing gates nothing. Sales, stamping, and redemption never consult billing state — an unpaid bill degrades `/health` (below), and that is the whole mechanism. The standing payer is a customer with a ledger, not a dependency the gateway waits on.
-
-### Configuration
-
-`ANCHOR_BILLING_ENABLED` is a strict `true`/`false` (anything else fails startup) and defaults to `false`, which means the feature is entirely absent: the three variables below are never read, `GET /anchor-bills` returns the same 404 as an unregistered route, and `/health` reports `billing: off` without ever degrading. With `true`, all three are required with no defaults — startup fails, naming every missing one in a single error:
-
-- **`PER_RECORD_SATS`** — the price in sats per record inside each anchor: an integer ≥ 1, the same rule as `PRICE_PER_PROOF_SATS`. `0` is refused — to bill nothing, set `ANCHOR_BILLING_ENABLED=false`. Replaces the retired `PRICE_MARKUP`.
-- **`ANCHOR_RECEIPTS_PATH`** — the receipts file as the gateway sees it (wiring below). An absent file is healthy — billing on, no anchors yet. Present but unreadable is `billing: error`.
-- **`ANCHOR_BILLS_TOKEN`** — the opaque bearer token guarding `GET /anchor-bills`: operational history (anchor timing, fees, payment state) is not public. Generate it like `L402_SECRET_HEX` (`python3 -c 'import secrets; print(secrets.token_hex(32))'`).
-
-### The endpoint
-
-`GET /anchor-bills` with `Authorization: Bearer <ANCHOR_BILLS_TOKEN>`. 404 when billing is off, 401 on a missing or wrong token (constant-time compare), and rate-limited from the `/verify` bucket (`VERIFY_RATE_LIMIT_PER_MINUTE`) — the limiter runs before the token compare, so it also throttles guessing.
-
-Everything happens on the poll; ingestion never mints. A bill without a live invoice — none yet, or the previous one expired — gets a fresh **plain bolt11** (memo `anchor-bill <txid>`) on the poll that finds it: anchor bills are not L402, and none of the macaroon machinery is involved. A settled invoice marks the bill `paid`, and paid is terminal — it never re-mints, and the bill stays in the response for a reconciliation week (7 days) with `paid_at` in place of the bolt11. The response is every unpaid bill plus that week of paid ones, oldest anchor first:
-
-```json
-{
-  "bills": [
-    {
-      "txid": "3b1f0c…dd6e",
-      "fee_sats": 308,
-      "commitments": 5,
-      "confirmed_height": 955211,
-      "confirmed_at": 1753574400,
-      "records": 4,
-      "amount_sats": 200,
-      "status": "unpaid",
-      "payment_hash": "9f86d0…a08",
-      "bolt11": "lnbc2000n1…",
-      "invoice_created_at": 1753660800
-    }
-  ],
-  "summary": { "unpaid_count": 1, "unpaid_sats": 200 }
-}
-```
-
-(`amount_sats` 200 = 4 records × `PER_RECORD_SATS=50`; `records` can sit below `commitments` — the fork's count errs low, with one bounded exception: a digest re-submitted across a fork restart boundary, or past the fork's one-hour in-memory dedupe horizon, counts a second record.) Each bill's `records` is the payer's audit handle: check `amount_sats` = `records` × the contracted rate before paying. The bill's record arithmetic is public, so the client's own ledger exposes any duplicate: records billed reconcile against records the client actually submitted, and an excess is a real duplicate and grounds for a refund. A bill ingested under the retired markup formula reads back with `records` null — its stored amount stands. The payer's whole loop is: poll, pay every `bolt11`, poll again and watch the bills flip to `paid`.
-
-### The 24-hour bookkeeping alarm
-
-`/health` carries a `billing` field: `off` | `ok` | `rejected` | `receipts_off` | `overdue` | `error`. `rejected` — receipt lines are being rejected as malformed — `receipts_off` — the calendar's status line says it is anchoring without writing receipts (`anchor_receipts: "off"`; every anchor from then on is unbilled, which is what a calendar recreated without `OTSD_ANCHOR_RECEIPTS` looks like) — `overdue` — an unpaid bill more than 24 hours (hardcoded) past its anchor's own `confirmed_at` — and `error` — receipts file present but unreadable — all degrade to 503 like a wallet failure (`error` and `overdue` outrank `receipts_off`, which outranks `rejected`); `off` never degrades. The `receipts_off` reading needs a fork that reports `anchor_receipts` (or, before c1db4dd, printed the `Anchor receipts:` page line); an older fork reads as unknown, which never degrades on its own. With billing on, `/health` also carries two counters: `billing_bills` (total rows in the bills table) and `billing_rejected` (receipt lines rejected as malformed, recounted from the file on every check — fixing the file clears it). "No receipts yet" is therefore visibly healthy — `billing: ok`, `billing_bills: 0`, `billing_rejected: 0` — distinguishable from a receipts stream being rejected wholesale. A well-formed `records: 0` receipt is **not** rejected: it is unbilled by design (err-low), warned in the log, and never degrades — a permanent line in the append-only file must not alarm forever. The health check ingests receipts itself, so overdue is seen even if the payer never polls (it never mints — minting stays poll-only).
-
-The clock is the anchor's `confirmed_at`, not ingestion time. Enabling billing over a receipts file with old anchors therefore alarms **immediately** — intended: those anchors are unbilled operational history. Either collect the bills or start from a fresh receipts path. It is bookkeeping, not enforcement: sales are never gated by billing state — the gateway reports the debt; collecting it is the operator's job.
-
-### Wiring the receipts file
-
-The fork writes, the gateway only reads. Two deployment shapes, two answers:
-
-**Compose (bundled otsd):** a dedicated shared volume, mounted read-write into otsd and read-only into the gateway — deliberately NOT the calendar volume: `/calendar` holds the hmac key, and the gateway container must not mount the directory that contains it. The wiring ships commented out in `docker-compose.yml` (a pull switches nothing on); uncomment the wiring lines and set the other three billing variables in `.env`:
-
-```yaml
-  gateway:
-    volumes:
-      - anchor_receipts:/anchor-receipts:ro
-  otsd:
-    volumes:
-      - anchor_receipts:/anchor-receipts
-    environment:
-      - OTSD_ANCHOR_RECEIPTS=/anchor-receipts/anchor-receipts.jsonl
-volumes:
-  anchor_receipts:
-```
-
-and in `.env`: `ANCHOR_RECEIPTS_PATH=/anchor-receipts/anchor-receipts.jsonl`.
-
-(`ANCHOR_RECEIPTS_PATH` is in the gateway's environment allowlist like every other variable, so set it in `.env` to the container path the mount fixes.)
-
-**systemd + docker (the reference deployment):** no new mount. The otsd container already bind-mounts `/var/lib/otsd/calendar` at `/calendar` (`deploy/otsd.service.example`); point the receipts inside it, and the host-run gateway reads the host path directly:
-
-1. Add `OTSD_ANCHOR_RECEIPTS=/calendar/anchor-receipts.jsonl` to `/etc/systemd/system/otsd.env` — the same service-user-owned, mode-600 file that carries the RPC URL — and `systemctl restart otsd`.
-2. Set `ANCHOR_RECEIPTS_PATH=/var/lib/otsd/calendar/anchor-receipts.jsonl` (with the other three variables) in the gateway's `.env` and restart the gateway.
-
-On this path the receipts file does share a directory with the hmac key. Harmless here — the gateway is a host process opening one named file — but it is exactly why compose gets a dedicated volume instead of the calendar one: a volume mount exposes the whole directory, key included.
+A deployment that used billing does this once before taking this revision, by wallet lookup and minting nothing: run the standing payer once more in `DRY_RUN=true`, so that every recorded attempt is reconciled against the wallet (paid, failed, or still unresolved); then, for every unpaid bill with a stored invoice, ask phoenixd `GET /payments/incoming/<payment_hash>` with the limited password — settled marks the bill paid; not settled with the invoice expired, or no invoice ever stored, is written off, recorded with its txid and amount; anything the wallet cannot answer is kept as unresolved and asked again by hand. No replacement invoice is minted at any point, so `/anchor-bills` is not polled during this (the poll mints). The `anchor_bills` table in an existing `obligations.db`, the calendar's receipts file and the payer's state file are historical records: nothing in the code drops or rewrites them.
 
 ---
 
@@ -590,7 +478,7 @@ When the gateway sits behind a reverse proxy, also set `GATEWAY_BEHIND_PROXY=tru
 
 The same sharing happens behind the bundled Tor hidden service, and there is no header to fix it: the `tor` container is the peer for every onion visitor, so all of them draw from one mint bucket and one verify bucket (the Pi's shape since 2026-08-28). One busy or hostile onion client can exhaust the free endpoints for the others; the paid mint path is a separate budget. A busy client with many pending proofs presents `UPGRADE_CLIENT_TOKEN` and is exempt from the verify bucket. Keying the limiter per Tor circuit (HAProxy-style `ProxyProtocol` from a custom Tor build) is deferred; a clearnet reverse proxy with `GATEWAY_BEHIND_PROXY=true` is the shape that keys per client today.
 
-The one exemption from the verify bucket is deliberate: a client presenting `UPGRADE_CLIENT_TOKEN` as a bearer on `/upgrade` is never throttled there, because the free door can hand it thousands of pending proofs an hour and every one of them must finish (the client is trusting the calendar until it does). Set the same value in the api-endpoint's `GATEWAY_UPGRADE_TOKEN`. The token exempts `/upgrade` only; `/verify`, minting and `/anchor-bills` keep their budgets, and a wrong token is treated as no token.
+The one exemption from the verify bucket is deliberate: a client presenting `UPGRADE_CLIENT_TOKEN` as a bearer on `/upgrade` is never throttled there, because a client with many pending proofs must be able to finish every one of them (the client is trusting the calendar until it does). Set the same value in the api-endpoint's `GATEWAY_UPGRADE_TOKEN`. The token exempts `/upgrade` only; `/verify` and minting keep their budgets, and a wrong token is treated as no token.
 
 ---
 
@@ -679,7 +567,7 @@ sudo systemctl enable --now health-monitor.timer
 
 ### Other /health fields
 
-`/health` also reports `proofs` — written by `ops/upgrade-all-proofs.sh` (run by `timestamp-gateway-upgrade-proofs.timer`), the sweep that upgrades pending proofs against the local calendar and flags attestation mismatches; it requires GNU `find` (`-printf`), and a traversal that fails (an unreadable subtree, a missing tool) is status `attention`, state `needs_attention`, exit 1 — distinct from a clean scan of an artifacts directory that holds no proofs (total 0, `ok`) — and `backup`, written by `ops/backup-live-state.sh` (run by `backup-live-state.timer`; see `ops/BACKUP-RECOVERY.md`), which is `failed` when no usable obligation-log snapshot could be taken while the gateway was running. Both follow the wallet pattern: `absent` (not installed) is reported without degrading health; failure and stale states degrade to 503. Every ops script resolves its settings after loading `.env` (`ops/lib/env.sh`), so a status path or artifacts directory set there is honoured.
+`/health` also reports `proofs` — written by `ops/upgrade-all-proofs.sh` (run by `timestamp-gateway-upgrade-proofs.timer`), the sweep that upgrades pending proofs against the local calendar and flags attestation mismatches; it requires GNU `find` (`-printf`), and a traversal that fails (an unreadable subtree, a missing tool) is status `attention`, state `needs_attention`, exit 1 — distinct from a clean scan of an artifacts directory that holds no proofs (total 0, `ok`) — and `backup`, written by `ops/backup-live-state.sh` (run by `backup-live-state.timer`; see `ops/BACKUP-RECOVERY.md`), which is `failed` when no usable obligation-log snapshot could be taken while the gateway was running, or when the calendar directory was copied while `otsd` ran with no boundary set (`CALENDAR_BACKUP_BOUNDARY`: the writer stopped by the run or by the operator, or an operator's filesystem snapshot; `ops/BACKUP-RECOVERY.md`). Both follow the wallet pattern: `absent` (not installed) is reported without degrading health; failure and stale states degrade to 503. Every ops script resolves its settings after loading `.env` (`ops/lib/env.sh`), so a status path or artifacts directory set there is honoured.
 
 ---
 
@@ -754,8 +642,7 @@ sudo cat /var/lib/tor/timestamp_gateway/hostname
 
 ## Operator checklist
 
-- [ ] `OTS_BACKEND_MODE=calendar` is set (not `public`).
-- [ ] `OTS_CALENDAR_URL` points to a running otsd instance.
+- [ ] `OTS_CALENDAR_URL` points to a running otsd instance, and no retired `OTS_BACKEND_MODE` or `L402_ENABLED` line is left in `.env`.
 - [ ] `OBLIGATIONS_DB_PATH` is writable by the service user (bare-metal: `mkdir -p` + `chown` it; Docker: the `gateway_data` volume handles this).
 - [ ] Bitcoin RPC credentials are configured and otsd can reach Bitcoin Core.
 - [ ] A wallet is loaded in Bitcoin Core and has enough BTC to pay anchoring fees.

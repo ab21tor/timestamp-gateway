@@ -49,7 +49,7 @@ else
 import json, sys
 try:
     d = json.load(sys.stdin)
-    print(" ".join("%s=%s" % (k, d.get(k)) for k in ("status", "paused", "payment", "otsd", "wallet", "float", "proofs", "backup", "billing")))
+    print(" ".join("%s=%s" % (k, d.get(k)) for k in ("status", "paused", "payment", "otsd", "wallet", "float", "proofs", "backup")))
 except Exception:
     print("unparseable")
 ')"

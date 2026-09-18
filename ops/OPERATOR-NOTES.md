@@ -45,8 +45,10 @@ The gateway uses Phoenixd through `.env`.
 
 Do not print or paste the Phoenixd password.
 
-Phoenixd state lives in the directory `PHOENIX_HOME` names (a `.phoenix`
-directory — e.g. `~/.phoenix` beside the phoenixd binary's user).
+Phoenixd state lives in the directory `PHOENIX_HOME` names:
+`/var/lib/phoenixd/.phoenix`, the phoenixd user's home
+(`deploy/phoenixd.service.example`), mode 700, which the gateway user
+cannot read.
 
 Important files:
 

@@ -26,7 +26,7 @@ from pymacaroons.exceptions import MacaroonException
 from opentimestamps.core.op import OpSHA256
 from opentimestamps.core.timestamp import DetachedTimestampFile, Timestamp
 from opentimestamps.core.serialize import StreamSerializationContext, StreamDeserializationContext
-from opentimestamps.calendar import RemoteCalendar, DEFAULT_AGGREGATORS, CommitmentNotFoundError
+from opentimestamps.calendar import RemoteCalendar, CommitmentNotFoundError
 from opentimestamps.core.notary import PendingAttestation, BitcoinBlockHeaderAttestation
 
 
@@ -40,13 +40,11 @@ L402_CAPABILITY = "timestamp"
 class GatewayConfig:
     """Validated gateway configuration. One field per module global, named as
     the lowercase of the global it populates. Built only by _parse_config()."""
-    price_per_proof_sats: int | None
+    price_per_proof_sats: int
     stamper_fee_cap_sats: int
     pause_file: str
-    ots_backend_mode: str
-    ots_calendar_url: str | None
-    l402_enabled: bool
-    l402_secret: bytes | None
+    ots_calendar_url: str
+    l402_secret: bytes
     l402_token_expiry_seconds: int
     ots_submit_max_attempts: int
     ots_submit_backoff_seconds: float
@@ -64,10 +62,6 @@ class GatewayConfig:
     rate_limit_per_minute: int
     verify_rate_limit_per_minute: int
     gateway_behind_proxy: bool
-    anchor_billing_enabled: bool
-    per_record_sats: int | None
-    anchor_receipts_path: str | None
-    anchor_bills_token: str | None
     upgrade_client_token: str | None
     health_probe_cache_seconds: int
 
@@ -88,13 +82,35 @@ def _env(name: str, default: str | None = None) -> str | None:
 
 def _parse_config() -> GatewayConfig:
     """Parse and validate all required env vars. Raises RuntimeError on misconfiguration."""
-    required = {
-        "OTS_BACKEND_MODE": _env("OTS_BACKEND_MODE"),
-    }
-
-    missing = [name for name, val in required.items() if not val]
-    if missing:
-        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+    # Two settings whose old values changed what the gateway was are refused
+    # at startup with the way on, never silently reinterpreted (workflow
+    # five, gate rulings 2 and 5, 2026-09-18). Any other value of either
+    # name is a retired name, warned about below and ignored.
+    door = _env("L402_ENABLED")
+    if door is not None and door.strip().lower() == "false":
+        raise RuntimeError(
+            "L402_ENABLED=false: the free door was retired on 2026-09-18; this "
+            "gateway charges every hash the flat PRICE_PER_PROOF_SATS through "
+            "the L402 flow. A deployed free door is never silently turned into "
+            "a paid one, so this is a refusal: remove L402_ENABLED from .env "
+            "and set PRICE_PER_PROOF_SATS and L402_SECRET_HEX to run the paid "
+            "door, or stay on the revision before the retirement."
+        )
+    backend_mode = _env("OTS_BACKEND_MODE")
+    if backend_mode is not None and backend_mode.strip().lower() == "public":
+        raise RuntimeError(
+            "OTS_BACKEND_MODE=public: the public-calendar relay was retired on "
+            "2026-09-18; a gateway submits only to the operator's own calendar. "
+            "Remove OTS_BACKEND_MODE from .env and set OTS_CALENDAR_URL to the "
+            "operator's otsd, or stay on the revision before the retirement."
+        )
+    calendar_url = _env("OTS_CALENDAR_URL") or None
+    if not calendar_url:
+        raise RuntimeError(
+            "OTS_CALENDAR_URL is required: the URL of the operator's calendar "
+            "(otsd), http://otsd:14788 under compose or http://127.0.0.1:14788 "
+            "on the systemd path."
+        )
 
     # Retired pricing model (one warning, never a failure)
     # The quote is the flat PRICE_PER_PROOF_SATS; the gateway reads no
@@ -124,103 +140,82 @@ def _parse_config() -> GatewayConfig:
             ", ".join(retired_present),
         )
 
-    # PRICE_MARKUP retired separately: its successor is the anchor-bill rate,
-    # not the quote, so the feerate-era message above would misname it. Same
-    # mechanics — fires only when itself explicitly set, never a failure.
-    if _env("PRICE_MARKUP") is not None:
+    # Retired on 2026-09-18 (workflow five): anchor billing, the free door
+    # and the public relay. Their names are warned about once and ignored;
+    # the two values that changed what the gateway was are refused above.
+    retired_features_present = [
+        name
+        for name in (
+            "PRICE_MARKUP",
+            "ANCHOR_BILLING_ENABLED",
+            "PER_RECORD_SATS",
+            "ANCHOR_RECEIPTS_PATH",
+            "ANCHOR_BILLS_TOKEN",
+            "L402_ENABLED",
+            "OTS_BACKEND_MODE",
+        )
+        if _env(name) is not None
+    ]
+    if retired_features_present:
         logging.warning(
-            "PRICE_MARKUP present and ignored: anchor bills are now "
-            "records × PER_RECORD_SATS. Remove it from .env."
+            "Retired variables present and ignored: %s. Anchor billing, the "
+            "free door (L402_ENABLED) and the public relay (OTS_BACKEND_MODE) "
+            "were retired on 2026-09-18; the door is paid and the calendar is "
+            "OTS_CALENDAR_URL. Remove them from .env.",
+            ", ".join(retired_features_present),
         )
 
-    # L402 door switch. true (default): /timestamp charges the flat per-proof
-    # rate. false: records are stamped free and the per-record cost lands on
-    # the anchor bill (records × PER_RECORD_SATS per confirmed anchor, when
-    # billing is on). Strict true/false: a typo silently read as a mode would
-    # change what the door charges.
-    l402_enabled_raw = _env("L402_ENABLED", "true").lower()
-    if l402_enabled_raw not in ("true", "false"):
+    # Flat per-proof price. Required with no default: the price is an
+    # operator decision. Zero is refused: a token minted at 0 could never
+    # redeem (the price caveat regexes reject "0").
+    price_per_proof_raw = _env("PRICE_PER_PROOF_SATS")
+    if price_per_proof_raw is None or price_per_proof_raw == "":
         raise RuntimeError(
-            f"L402_ENABLED must be 'true' or 'false', got {l402_enabled_raw!r}"
+            "PRICE_PER_PROOF_SATS is required — the flat price in sats every "
+            "hash pays at submission. Size it with the operator guide's "
+            '"Pricing" arithmetic.'
         )
-    l402_enabled = l402_enabled_raw == "true"
-
-    # Flat per-proof price. Required with no default when the door is on: the
-    # price is an operator decision. With the door off it is never read — an
-    # .env legitimately holds both modes' vars. Zero is refused: a token
-    # minted at 0 could never redeem (the price caveat regexes reject "0");
-    # the free door is L402_ENABLED=false.
-    price_per_proof: int | None = None
-    if l402_enabled:
-        price_per_proof_raw = _env("PRICE_PER_PROOF_SATS")
-        if price_per_proof_raw is None or price_per_proof_raw == "":
-            raise RuntimeError(
-                "PRICE_PER_PROOF_SATS is required — the flat price in sats every "
-                "hash pays at submission. Size it with the operator guide's "
-                '"Pricing" arithmetic. To run a free door instead, set '
-                "L402_ENABLED=false."
-            )
-        try:
-            price_per_proof = int(price_per_proof_raw)
-        except ValueError:
-            raise RuntimeError("PRICE_PER_PROOF_SATS must be an integer")
-        if price_per_proof < 1:
-            raise RuntimeError(
-                f"PRICE_PER_PROOF_SATS must be >= 1, got {price_per_proof}. "
-                "For a free door set L402_ENABLED=false."
-            )
+    try:
+        price_per_proof = int(price_per_proof_raw)
+    except ValueError:
+        raise RuntimeError("PRICE_PER_PROOF_SATS must be an integer")
+    if price_per_proof < 1:
+        raise RuntimeError(
+            f"PRICE_PER_PROOF_SATS must be >= 1, got {price_per_proof}: a "
+            "token minted at 0 could never redeem."
+        )
 
     pause_file = _env("PAUSE_FILE", "/var/lib/timestamp-gateway/PAUSED")
-
-    mode = _env("OTS_BACKEND_MODE").lower()
-    if mode not in ("calendar", "public"):
-        raise RuntimeError(
-            f"OTS_BACKEND_MODE must be 'calendar' or 'public', got {mode!r}"
-        )
-
-    calendar_url = _env("OTS_CALENDAR_URL") or None
-    if mode == "calendar" and not calendar_url:
-        raise RuntimeError(
-            "OTS_CALENDAR_URL is required when OTS_BACKEND_MODE=calendar"
-        )
-    if mode == "public" and calendar_url:
-        raise RuntimeError(
-            "OTS_CALENDAR_URL must not be set when OTS_BACKEND_MODE=public; "
-            "set OTS_BACKEND_MODE=calendar to use a specific calendar backend"
-        )
 
     # L402 token signing key
     # Root key used to sign and verify L402 macaroons. It is required in
     # production: a stable key means a paid-but-not-yet-redeemed token still
     # verifies after a gateway restart. A random per-process key is allowed only
     # as an explicit development opt-out, because it would invalidate such tokens
-    # on every restart. Never read with the door off — no token is minted or
-    # verified there.
-    l402_secret: bytes | None = None
-    if l402_enabled:
-        secret_hex = _env("L402_SECRET_HEX") or None
-        allow_ephemeral = _env("L402_ALLOW_EPHEMERAL_SECRET", "false").lower() == "true"
-        if secret_hex:
-            try:
-                l402_secret = bytes.fromhex(secret_hex)
-            except ValueError:
-                raise RuntimeError("L402_SECRET_HEX must be a hex string")
-            if len(l402_secret) < 16:
-                raise RuntimeError("L402_SECRET_HEX must decode to at least 16 bytes")
-        elif allow_ephemeral:
-            l402_secret = secrets.token_bytes(32)
-            logging.warning(
-                "L402_SECRET_HEX is not set and L402_ALLOW_EPHEMERAL_SECRET=true; using a "
-                "random per-process key. Paid-but-unredeemed tokens will not verify after a "
-                "restart. Development only."
-            )
-        else:
-            raise RuntimeError(
-                "L402_SECRET_HEX is required. Generate one with "
-                "`python -c \"import secrets; print(secrets.token_hex(32))\"`. "
-                "For development only, set L402_ALLOW_EPHEMERAL_SECRET=true to use a "
-                "random per-process key instead."
-            )
+    # on every restart.
+    secret_hex = _env("L402_SECRET_HEX") or None
+    allow_ephemeral = _env("L402_ALLOW_EPHEMERAL_SECRET", "false").lower() == "true"
+    if secret_hex:
+        try:
+            l402_secret = bytes.fromhex(secret_hex)
+        except ValueError:
+            raise RuntimeError("L402_SECRET_HEX must be a hex string")
+        if len(l402_secret) < 16:
+            raise RuntimeError("L402_SECRET_HEX must decode to at least 16 bytes")
+    elif allow_ephemeral:
+        l402_secret = secrets.token_bytes(32)
+        logging.warning(
+            "L402_SECRET_HEX is not set and L402_ALLOW_EPHEMERAL_SECRET=true; using a "
+            "random per-process key. Paid-but-unredeemed tokens will not verify after a "
+            "restart. Development only."
+        )
+    else:
+        raise RuntimeError(
+            "L402_SECRET_HEX is required. Generate one with "
+            "`python -c \"import secrets; print(secrets.token_hex(32))\"`. "
+            "For development only, set L402_ALLOW_EPHEMERAL_SECRET=true to use a "
+            "random per-process key instead."
+        )
 
     try:
         l402_expiry = int(_env("L402_TOKEN_EXPIRY_SECONDS", "3600"))
@@ -367,10 +362,10 @@ def _parse_config() -> GatewayConfig:
         )
 
     # Upgrade client token (optional). A client presenting it as a bearer on
-    # /upgrade is not drawn from the per-peer verify bucket: the free door
-    # can hand out thousands of pending proofs an hour, and the client that
-    # owns them must be able to finish them. It exempts /upgrade only — a
-    # wrong token is simply anonymous, and unset makes the header inert.
+    # /upgrade is not drawn from the per-peer verify bucket: a client with
+    # many pending proofs must be able to finish every one of them. It
+    # exempts /upgrade only — a wrong token is simply anonymous, and unset
+    # makes the header inert.
     upgrade_client_token = _env("UPGRADE_CLIENT_TOKEN") or None
 
     # /health's calendar probe is cached for this many seconds behind a
@@ -396,83 +391,11 @@ def _parse_config() -> GatewayConfig:
         )
     gateway_behind_proxy = behind_proxy_raw == "true"
 
-    # Anchor billing (part two of the pricing model)
-    # Off by default: disabled means the three billing vars are never read and
-    # every behavior stays byte-identical. Strict true/false: a typo silently
-    # treated as false would turn billing off without a word.
-    anchor_billing_raw = _env("ANCHOR_BILLING_ENABLED", "false").lower()
-    if anchor_billing_raw not in ("true", "false"):
-        raise RuntimeError(
-            f"ANCHOR_BILLING_ENABLED must be 'true' or 'false', got {anchor_billing_raw!r}"
-        )
-    anchor_billing_enabled = anchor_billing_raw == "true"
-
-    per_record_sats: int | None = None
-    anchor_receipts_path: str | None = None
-    anchor_bills_token: str | None = None
-    if anchor_billing_enabled:
-        # All three are operator decisions with no sane default. Every missing
-        # one is named in a single error so the operator fixes them in one pass.
-        missing_billing = []
-        if not _env("PER_RECORD_SATS"):
-            missing_billing.append(
-                "PER_RECORD_SATS — the price in sats per record inside each "
-                "anchor (a bill is records × this rate)"
-            )
-        if not _env("ANCHOR_RECEIPTS_PATH"):
-            missing_billing.append(
-                "ANCHOR_RECEIPTS_PATH — the anchor-receipts JSONL file the "
-                "calendar fork writes (the path its OTSD_ANCHOR_RECEIPTS names)"
-            )
-        if not _env("ANCHOR_BILLS_TOKEN"):
-            missing_billing.append(
-                "ANCHOR_BILLS_TOKEN — the bearer token guarding GET "
-                "/anchor-bills; operational history is not public"
-            )
-        if missing_billing:
-            raise RuntimeError(
-                "ANCHOR_BILLING_ENABLED=true requires: " + "; ".join(missing_billing)
-            )
-        # Same rule as PRICE_PER_PROOF_SATS: integer >= 1; zero is refused.
-        try:
-            per_record_sats = int(_env("PER_RECORD_SATS"))
-        except ValueError:
-            raise RuntimeError("PER_RECORD_SATS must be an integer")
-        if per_record_sats < 1:
-            raise RuntimeError(
-                f"PER_RECORD_SATS must be >= 1, got {per_record_sats}. "
-                "To bill nothing set ANCHOR_BILLING_ENABLED=false."
-            )
-        anchor_receipts_path = _env("ANCHOR_RECEIPTS_PATH")
-        anchor_bills_token = _env("ANCHOR_BILLS_TOKEN")
-
-    # Mode announcement (free door)
-    # One line at startup naming what charges. Free door with billing on is
-    # INFO: the anchor bill carries the per-record cost. Free door with
-    # billing off means nothing charges anywhere — a valid choice (a
-    # subsidising operator), named once at WARNING, never silent; the warning
-    # replaces the INFO line so each mode is announced exactly once.
-    if not l402_enabled:
-        if anchor_billing_enabled:
-            logging.info(
-                "L402_ENABLED=false: free door — records are stamped free of "
-                "charge; anchor billing carries the charges (records × "
-                "PER_RECORD_SATS per confirmed anchor)."
-            )
-        else:
-            logging.warning(
-                "L402_ENABLED=false and ANCHOR_BILLING_ENABLED=false: nothing "
-                "charges anywhere — the door is free and no anchor bills are "
-                "minted."
-            )
-
     return GatewayConfig(
         price_per_proof_sats=price_per_proof,
         stamper_fee_cap_sats=stamper_fee_cap,
         pause_file=pause_file,
-        ots_backend_mode=mode,
         ots_calendar_url=calendar_url,
-        l402_enabled=l402_enabled,
         l402_secret=l402_secret,
         l402_token_expiry_seconds=l402_expiry,
         ots_submit_max_attempts=ots_max_attempts,
@@ -491,10 +414,6 @@ def _parse_config() -> GatewayConfig:
         rate_limit_per_minute=rate_limit_per_minute,
         verify_rate_limit_per_minute=verify_rate_limit_per_minute,
         gateway_behind_proxy=gateway_behind_proxy,
-        anchor_billing_enabled=anchor_billing_enabled,
-        per_record_sats=per_record_sats,
-        anchor_receipts_path=anchor_receipts_path,
-        anchor_bills_token=anchor_bills_token,
         upgrade_client_token=upgrade_client_token,
         health_probe_cache_seconds=health_probe_cache_seconds,
     )
@@ -509,9 +428,7 @@ _CONFIG = _parse_config()
 PRICE_PER_PROOF_SATS = _CONFIG.price_per_proof_sats
 STAMPER_FEE_CAP_SATS = _CONFIG.stamper_fee_cap_sats
 PAUSE_FILE = _CONFIG.pause_file
-OTS_BACKEND_MODE = _CONFIG.ots_backend_mode
 OTS_CALENDAR_URL = _CONFIG.ots_calendar_url
-L402_ENABLED = _CONFIG.l402_enabled
 L402_SECRET = _CONFIG.l402_secret
 L402_TOKEN_EXPIRY_SECONDS = _CONFIG.l402_token_expiry_seconds
 OTS_SUBMIT_MAX_ATTEMPTS = _CONFIG.ots_submit_max_attempts
@@ -530,10 +447,6 @@ BACKUP_STATUS_MAX_AGE_SECONDS = _CONFIG.backup_status_max_age_seconds
 RATE_LIMIT_PER_MINUTE = _CONFIG.rate_limit_per_minute
 VERIFY_RATE_LIMIT_PER_MINUTE = _CONFIG.verify_rate_limit_per_minute
 GATEWAY_BEHIND_PROXY = _CONFIG.gateway_behind_proxy
-ANCHOR_BILLING_ENABLED = _CONFIG.anchor_billing_enabled
-PER_RECORD_SATS = _CONFIG.per_record_sats
-ANCHOR_RECEIPTS_PATH = _CONFIG.anchor_receipts_path
-ANCHOR_BILLS_TOKEN = _CONFIG.anchor_bills_token
 UPGRADE_CLIENT_TOKEN = _CONFIG.upgrade_client_token
 HEALTH_PROBE_CACHE_SECONDS = _CONFIG.health_probe_cache_seconds
 
@@ -685,40 +598,6 @@ def init_obligation_db() -> None:
                 "CREATE INDEX IF NOT EXISTS obligations_needs_stamp "
                 "ON obligations(payment_hash) WHERE status='needs_stamp'"
             )
-            # Gated on the flag, not created unconditionally: with billing
-            # disabled the gateway must stay byte-identical, including the
-            # bytes of a disabled operator's obligations.db.
-            if ANCHOR_BILLING_ENABLED:
-                conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS anchor_bills (
-                        txid               TEXT PRIMARY KEY,
-                        fee_sats           INTEGER NOT NULL,
-                        commitments        INTEGER NOT NULL,
-                        confirmed_height   INTEGER NOT NULL,
-                        confirmed_at       INTEGER NOT NULL,
-                        records            INTEGER,
-                        amount_sats        INTEGER NOT NULL,
-                        payment_hash       TEXT,
-                        bolt11             TEXT,
-                        invoice_created_at INTEGER,
-                        status             TEXT NOT NULL DEFAULT 'unpaid'
-                                           CHECK (status IN ('unpaid', 'paid')),
-                        paid_at            INTEGER
-                    )
-                    """
-                )
-                # Additive upgrade for a markup-era table: records is NULL on
-                # rows billed under the old formula — their stored amounts
-                # stay untouched (nullable column, no rewrite).
-                cols = [
-                    row[1]
-                    for row in conn.execute("PRAGMA table_info(anchor_bills)")
-                ]
-                if "records" not in cols:
-                    conn.execute(
-                        "ALTER TABLE anchor_bills ADD COLUMN records INTEGER"
-                    )
             conn.commit()
         finally:
             conn.close()
@@ -1298,18 +1177,42 @@ def _upgrade_pending_against_operator(timestamp) -> dict:
             tally["budget_exhausted"] = True
             break
         tally["queries"] += 1
-        try:
-            upgraded = calendar.get_timestamp(
-                sub_stamp.msg, timeout=min(UPGRADE_QUERY_TIMEOUT, UPGRADE_MAX_SECONDS - elapsed))
-        except CommitmentNotFoundError:
-            tally["not_found"] += 1
-            continue
-        except Exception as exc:
+        remaining = UPGRADE_MAX_SECONDS - elapsed
+        outcome: dict = {}
+
+        def lookup(msg=sub_stamp.msg, limit=min(UPGRADE_QUERY_TIMEOUT, remaining)):
+            try:
+                outcome["value"] = calendar.get_timestamp(msg, timeout=limit)
+            except BaseException as exc:  # reported below by class only
+                outcome["error"] = exc
+
+        # The library's timeout is a socket inactivity timeout: a calendar
+        # that trickles bytes in gaps shorter than it keeps one read alive
+        # past the request's budget (2026-09-15 review F18: 13 bytes in
+        # 1.42 s gaps ran 17 s against a 15 s budget). So the lookup runs in
+        # a worker joined for what remains of the budget; a worker still
+        # reading when the budget runs out is abandoned (it ends at its own
+        # socket timeout, at most UPGRADE_QUERY_TIMEOUT of inactivity later)
+        # and counted as a failed lookup, and the budget is reported
+        # exhausted.
+        worker = threading.Thread(target=lookup, name="upgrade-lookup", daemon=True)
+        worker.start()
+        worker.join(remaining)
+        if worker.is_alive():
+            tally["failed"] += 1
+            tally["budget_exhausted"] = True
+            logging.info("Upgrade: calendar query ran past the request budget; abandoned")
+            break
+        if "error" in outcome:
+            if isinstance(outcome["error"], CommitmentNotFoundError):
+                tally["not_found"] += 1
+                continue
             # Fixed text plus the class: never the exception's own message,
             # which can carry the URL or the response body.
             tally["failed"] += 1
-            logging.info("Upgrade: calendar query failed (%s)", type(exc).__name__)
+            logging.info("Upgrade: calendar query failed (%s)", type(outcome["error"]).__name__)
             continue
+        upgraded = outcome["value"]
         try:
             sub_stamp.merge(upgraded)
             tally["found"] += 1
@@ -1338,10 +1241,7 @@ def _upgrade_ots_bytes(digest: str, ots_bytes: bytes) -> dict:
         # upgrade: no calendar contact.
         return _proof_answer(digest, status, proof_digest, attestations,
                              upgrade=True, ots_b64=original_b64)
-    tally = {"queries": 0, "found": 0, "not_found": 0, "failed": 0,
-             "budget_exhausted": False, "anchored": False}
-    if OTS_CALENDAR_URL:
-        tally = _upgrade_pending_against_operator(detached.timestamp)
+    tally = _upgrade_pending_against_operator(detached.timestamp)
     info = {"calendar_queries": tally["queries"], "budget_exhausted": tally["budget_exhausted"]}
     attestations = _extract_attestations(detached.timestamp)
     if tally["anchored"]:
@@ -1500,14 +1400,6 @@ class Invoice:
 class InvoiceStatus:
     """The current state of a previously created invoice, as reported by the node.
 
-    ``expired`` comes from phoenixd's ``isExpired`` on
-    ``GET /payments/incoming/{paymentHash}``: checked against the phoenixd
-    sources at v0.8.0 (the deployed release) and v0.9.1 — both compute it
-    as now > createdAt + the bolt11 expiry (JsonSerializers.kt,
-    ``IncomingPayment``), and both always emit the field. ``None`` is kept
-    for a response without it (an older or foreign phoenixd) and means
-    "unknown", which anchor billing treats as live rather than re-minting.
-
     Two amounts, not one: phoenixd reports the credited amount net of any
     ACINQ liquidity fee, so a fully paid invoice would look underpaid if the
     face amount and the credited amount were conflated.
@@ -1520,12 +1412,11 @@ class InvoiceStatus:
     # any ACINQ liquidity fee).
     amount_received_sat: int
     memo: str | None
-    expired: bool | None
 
 
-# The last real invoice mint the gateway attempted, recorded inside both
-# backends' create_invoice (the L402 challenge and anchor-bill minting both
-# land there). /health derives its payment field from this record, not from
+# The last real invoice mint the gateway attempted, recorded inside
+# create_invoice (the L402 challenge is the one mint). /health derives its
+# payment field from this record, not from
 # a reachability probe: getinfo can answer ok while createinvoice is wedged,
 # and minting is the capability the field vouches for. Passive — no prober,
 # no timers — so a freshly started gateway reports "unknown" until the first
@@ -1616,7 +1507,6 @@ class PhoenixdPaymentBackend:
             amount_requested_sat=int(data.get("requestedSat") or 0),
             amount_received_sat=int(data.get("receivedSat") or 0),
             memo=data.get("description"),
-            expired=data.get("isExpired") if "isExpired" in data else None,
         )
 
 
@@ -1639,54 +1529,36 @@ def create_invoice(memo: str, amount_sats: int) -> tuple[str, str]:
 
 
 def stamp_digest(hex_digest: str) -> bytes:
-    """Submit a SHA256 digest to the configured OTS backend and return the serialized .ots bytes.
-
-    OTS_BACKEND_MODE=calendar  — submit to the operator-controlled OTS calendar at
-                                  OTS_CALENDAR_URL, retrying up to OTS_SUBMIT_MAX_ATTEMPTS
-                                  times with a backoff so a paid request does not fail just
-                                  because otsd is still starting. No fallback to public
-                                  calendars. Persistent failure -> RuntimeError.
-    OTS_BACKEND_MODE=public    — submit to DEFAULT_AGGREGATORS (compatibility/testing only).
-                                  Succeeds if at least one aggregator responds.
-    """
+    """Submit a SHA256 digest to the operator's calendar at OTS_CALENDAR_URL and
+    return the serialized .ots bytes, retrying up to OTS_SUBMIT_MAX_ATTEMPTS
+    times with a backoff so a paid request does not fail just because otsd is
+    still starting. No fallback to any other calendar: persistent failure is
+    a RuntimeError (the public-calendar relay was retired on 2026-09-18)."""
     digest_bytes = bytes.fromhex(hex_digest)
     file_timestamp = DetachedTimestampFile(OpSHA256(), Timestamp(digest_bytes))
 
-    if OTS_BACKEND_MODE == "calendar":
-        last_error = None
-        for attempt in range(1, OTS_SUBMIT_MAX_ATTEMPTS + 1):
-            try:
-                calendar_timestamp = RemoteCalendar(OTS_CALENDAR_URL).submit(
-                    digest_bytes, timeout=10
-                )
-                file_timestamp.timestamp.merge(calendar_timestamp)
-                break
-            except Exception as e:
-                last_error = e
-                logging.warning(
-                    "OTS calendar submit attempt %d/%d to %s failed: %s",
-                    attempt, OTS_SUBMIT_MAX_ATTEMPTS, OTS_CALENDAR_URL, e,
-                )
-                if attempt < OTS_SUBMIT_MAX_ATTEMPTS:
-                    time.sleep(OTS_SUBMIT_BACKOFF_SECONDS)
-        else:
-            logging.error(
-                "OTS calendar backend %s failed after %d attempts: %s",
-                OTS_CALENDAR_URL, OTS_SUBMIT_MAX_ATTEMPTS, last_error,
+    last_error = None
+    for attempt in range(1, OTS_SUBMIT_MAX_ATTEMPTS + 1):
+        try:
+            calendar_timestamp = RemoteCalendar(OTS_CALENDAR_URL).submit(
+                digest_bytes, timeout=10
             )
-            raise RuntimeError("OTS calendar backend failed")
+            file_timestamp.timestamp.merge(calendar_timestamp)
+            break
+        except Exception as e:
+            last_error = e
+            logging.warning(
+                "OTS calendar submit attempt %d/%d to %s failed: %s",
+                attempt, OTS_SUBMIT_MAX_ATTEMPTS, OTS_CALENDAR_URL, e,
+            )
+            if attempt < OTS_SUBMIT_MAX_ATTEMPTS:
+                time.sleep(OTS_SUBMIT_BACKOFF_SECONDS)
     else:
-        # public — compatibility/testing mode only; do not use as the real backend
-        succeeded = 0
-        for url in DEFAULT_AGGREGATORS:
-            try:
-                calendar_timestamp = RemoteCalendar(url).submit(digest_bytes, timeout=10)
-                file_timestamp.timestamp.merge(calendar_timestamp)
-                succeeded += 1
-            except Exception:
-                logging.warning("OTS public calendar %s failed", url, exc_info=True)
-        if succeeded == 0:
-            raise RuntimeError("All OTS public calendars failed; no timestamp was created")
+        logging.error(
+            "OTS calendar backend %s failed after %d attempts: %s",
+            OTS_CALENDAR_URL, OTS_SUBMIT_MAX_ATTEMPTS, last_error,
+        )
+        raise RuntimeError("OTS calendar backend failed")
 
     buf = io.BytesIO()
     file_timestamp.serialize(StreamSerializationContext(buf))
@@ -1724,258 +1596,16 @@ def verify_payment(payment_hash: str, digest: str, price_sats: int) -> bool:
     )
 
 
-# Anchor billing (part two of the pricing model)
-# The calendar fork writes a receipt line per confirmed anchor into an
-# append-only JSONL file (its OTSD_ANCHOR_RECEIPTS), including "records" —
-# the number of digest submissions inside that anchor's tree (0 = the fork
-# could not prove a count; it errs low by design). With billing enabled, the
-# gateway ingests those receipts into the anchor_bills table and bills the
-# standing payer records × PER_RECORD_SATS per anchor. Invoices are minted on
-# poll of GET /anchor-bills, never at ingestion; settlement is checked on the
-# same poll through the existing payment backend. Billing state gates
-# nothing: sales, stamping, and redemption never consult this table.
-
-# A bill is overdue for /health once unpaid for 24h past its anchor's own
-# confirmed_at — a hardcoded bookkeeping alarm, not an enforcement clock.
-# Enabling billing over a receipts file with old anchors alarms immediately:
-# those anchors ARE unbilled operational history, so that is intended.
-_ANCHOR_BILL_OVERDUE_SECONDS = 24 * 3600
-# Paid bills stay in the /anchor-bills response for a reconciliation week.
-_ANCHOR_BILL_RECENTLY_PAID_SECONDS = 7 * 24 * 3600
-
-_ANCHOR_RECEIPT_FIELDS = (
-    ("txid", str),
-    ("fee_sats", int),
-    ("commitments", int),
-    ("confirmed_height", int),
-    ("confirmed_at", int),
-    ("records", int),
-)
-# A receipt's confirmed_at is the fork's wall clock on the same box; a line
-# further ahead of our clock than this is not a clock, it is a bad line.
-_ANCHOR_RECEIPT_FUTURE_SLACK = 24 * 3600
-# SQLite INTEGER is signed 64-bit: a line whose records × rate would not fit
-# is malformed, rejected before it can raise inside the ingest pass.
-_LEDGER_INT_MAX = 2**63 - 1
-
-
-def _ingest_anchor_receipts() -> int:
-    """Ingest the fork's anchor receipts into anchor_bills. Returns the
-    number of lines rejected as malformed this pass — recounted from the
-    file every time, so the counter clears when the file is fixed.
-
-    INSERT OR IGNORE keyed on txid dedupes the fork's crash-preferred
-    duplicate lines, and amount_sats is computed exactly once: the bill's
-    mint-time amount, immutable across later rate changes, like the quote.
-    records=0 (the fork could not prove a count) is never billed — no row,
-    a warning naming the txid — and is not counted as rejected: the line is
-    well-formed and permanent in the append-only file. A line missing
-    records (an un-upgraded fork) is malformed and skipped with a warning,
-    so an old five-field receipts file never bills. The rest of what the
-    fork cannot write is malformed too: a txid that is not 64 hex chars
-    (stored lowercase, so a re-cased copy of a line can never bill an
-    anchor twice), a negative fee, an empty tree, a confirmed_at ahead of
-    our clock, or a records × rate that would not fit the ledger's integer.
-    An absent file is healthy (billing on, no anchors yet). Raises only for
-    an unreadable-but-present file or a failing DB — the caller classifies
-    that as billing "error"."""
-    try:
-        with open(ANCHOR_RECEIPTS_PATH, "r") as fd:
-            lines = fd.readlines()
-    except FileNotFoundError:
-        return 0
-
-    rejected = 0
-    conn = _obligation_connect()
-    try:
-        for lineno, line in enumerate(lines, 1):
-            if not line.strip():
-                continue
-            try:
-                receipt = json.loads(line)
-                if not isinstance(receipt, dict):
-                    raise ValueError("not a JSON object")
-                for field, ftype in _ANCHOR_RECEIPT_FIELDS:
-                    if not isinstance(receipt[field], ftype) or isinstance(
-                        receipt[field], bool
-                    ):
-                        raise ValueError(f"bad {field}")
-                # The fork cannot produce a negative count: malformed.
-                if receipt["records"] < 0:
-                    raise ValueError("bad records")
-                if not re.fullmatch(r"[0-9a-fA-F]{64}", receipt["txid"]):
-                    raise ValueError("bad txid")
-                receipt["txid"] = receipt["txid"].lower()
-                if receipt["fee_sats"] < 0:
-                    raise ValueError("bad fee_sats")
-                if receipt["commitments"] < 1:
-                    raise ValueError("bad commitments")
-                if receipt["confirmed_height"] < 0:
-                    raise ValueError("bad confirmed_height")
-                if not 0 <= receipt["confirmed_at"] <= int(time.time()) + _ANCHOR_RECEIPT_FUTURE_SLACK:
-                    raise ValueError("bad confirmed_at")
-                if receipt["records"] * PER_RECORD_SATS > _LEDGER_INT_MAX:
-                    raise ValueError("records x rate exceeds the ledger's integer range")
-            except (ValueError, KeyError) as exp:
-                rejected += 1
-                logging.warning(
-                    "Anchor receipt line %d skipped (malformed): %r", lineno, exp
-                )
-                continue
-            if receipt["records"] == 0:
-                logging.warning(
-                    "Anchor receipt %s not billed: the fork could not prove "
-                    "a record count (records=0)",
-                    receipt["txid"],
-                )
-                continue
-            try:
-                conn.execute(
-                    "INSERT OR IGNORE INTO anchor_bills "
-                    "(txid, fee_sats, commitments, confirmed_height, confirmed_at, "
-                    "records, amount_sats, status) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'unpaid')",
-                    (
-                        receipt["txid"],
-                        receipt["fee_sats"],
-                        receipt["commitments"],
-                        receipt["confirmed_height"],
-                        receipt["confirmed_at"],
-                        receipt["records"],
-                        receipt["records"] * PER_RECORD_SATS,
-                    ),
-                )
-            except OverflowError as exp:
-                # Belt and braces behind the range check above: one line can
-                # never take the rest of the file down with it.
-                rejected += 1
-                logging.warning(
-                    "Anchor receipt line %d skipped (malformed): %r", lineno, exp
-                )
-        conn.commit()
-    finally:
-        conn.close()
-    return rejected
-
-
-def _store_anchor_bill_invoice(
-    txid: str, payment_hash: str, bolt11: str, created_at: int,
-    expected_hash: str | None,
-) -> bool:
-    """Attach a freshly minted invoice to a bill — only if the row still
-    holds what this poll read (expected_hash; None = no invoice yet, the
-    IS NULL arm). Two concurrent polls can both decide to mint for one
-    bill; the conditional WHERE makes exactly one store win. Returns False
-    to the loser, which must re-read and serve the winner's invoice: a
-    blind overwrite would orphan an invoice the payer may already hold —
-    paid, it would settle invisibly (no poll ever checks a replaced hash),
-    the bill would re-serve as unpaid, and one anchor would be paid twice.
-    The losing mint is never stored and never served; it dies unpaid at
-    its own Lightning expiry."""
-    conn = _obligation_connect()
-    try:
-        cur = conn.execute(
-            "UPDATE anchor_bills SET payment_hash=?, bolt11=?, "
-            "invoice_created_at=? "
-            "WHERE txid=? AND (payment_hash IS NULL OR payment_hash=?)",
-            (payment_hash, bolt11, created_at, txid, expected_hash),
-        )
-        conn.commit()
-        return cur.rowcount == 1
-    finally:
-        conn.close()
-
-
-def _read_anchor_bill_invoice(txid: str) -> tuple[str | None, str | None, int | None]:
-    """The bill's stored (payment_hash, bolt11, invoice_created_at) — what a
-    poll that lost the mint race serves instead of its own orphaned mint."""
-    conn = _obligation_connect()
-    try:
-        row = conn.execute(
-            "SELECT payment_hash, bolt11, invoice_created_at "
-            "FROM anchor_bills WHERE txid=?",
-            (txid,),
-        ).fetchone()
-        return (row[0], row[1], row[2]) if row else (None, None, None)
-    finally:
-        conn.close()
-
-
-def _mark_anchor_bill_paid(txid: str, paid_at: int) -> None:
-    conn = _obligation_connect()
-    try:
-        conn.execute(
-            "UPDATE anchor_bills SET status='paid', paid_at=? WHERE txid=?",
-            (paid_at, txid),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def _billing_status(receipts_state: bool | None = None) -> tuple[str, int, int]:
-    """Classify anchor billing for /health. Returns (status, bills, rejected)
-    where bills is the total rows in anchor_bills, rejected the receipt
-    lines rejected as malformed this pass, and status one of:
-      off          — ANCHOR_BILLING_ENABLED=false; reported, never degrades
-      ok           — receipts ingestable, nothing rejected, no unpaid bill
-                     older than 24h. With bills 0 this is "no receipts
-                     yet", distinct from rejection.
-      rejected     — receipt lines are being rejected as malformed
-                     (rejected > 0); degrades. The three below outrank it.
-      receipts_off — the calendar says it is anchoring without writing
-                     receipts (its homepage line "Anchor receipts: off"):
-                     every anchor from here is unbilled. receipts_state
-                     carries that reading — True on, False off, None when
-                     the calendar did not say (unreachable, or a fork
-                     without the line), which never degrades on its own.
-      overdue      — an unpaid bill has sat >24h past its anchor's
-                     confirmed_at (bookkeeping alarm; sales are never gated
-                     by billing state)
-      error        — the receipts file is present but unreadable, or the
-                     bills table cannot be read, with billing on
-    Ingests receipts itself so overdue is seen even if the payer never
-    polls, but never mints invoices — minting is poll-only.
-    Never raises — /health must never crash."""
-    if not ANCHOR_BILLING_ENABLED:
-        return "off", 0, 0
-    try:
-        rejected = _ingest_anchor_receipts()
-        conn = _obligation_connect()
-        try:
-            bills = conn.execute(
-                "SELECT COUNT(*) FROM anchor_bills"
-            ).fetchone()[0]
-            overdue = conn.execute(
-                "SELECT COUNT(*) FROM anchor_bills "
-                "WHERE status='unpaid' AND confirmed_at < ?",
-                (int(time.time()) - _ANCHOR_BILL_OVERDUE_SECONDS,),
-            ).fetchone()[0]
-        finally:
-            conn.close()
-    except Exception:
-        logging.warning("Health check: anchor billing unreadable", exc_info=True)
-        return "error", 0, 0
-    if overdue:
-        return "overdue", bills, rejected
-    if receipts_state is False:
-        return "receipts_off", bills, rejected
-    if rejected:
-        return "rejected", bills, rejected
-    return "ok", bills, rejected
-
 
 @app.get("/")
 def root():
     return {"status": "running"}
 
 
-def _probe_otsd() -> tuple[str, bool | None, list[str]]:
-    """One read of the calendar's status line: (otsd_status, receipts_state,
-    attention). otsd_status is "ok", "needs_attention", "error", or "n/a"
-    (no calendar URL); receipts_state True/False when the status says
-    anchor receipts are on/off and billing is on, else None; attention is
-    the calendar's deep-reorg findings (fork stamper.check_anchors), empty
+def _probe_otsd() -> tuple[str, list[str]]:
+    """One read of the calendar's status line: (otsd_status, attention).
+    otsd_status is "ok", "needs_attention" or "error"; attention is the
+    calendar's deep-reorg findings (fork stamper.check_anchors), empty
     when none or unstated.
 
     The contract (fork rpc.py get_status, since c1db4dd, 2026-09-14): GET /
@@ -1983,20 +1613,17 @@ def _probe_otsd() -> tuple[str, bool | None, list[str]]:
     it, null when its Bitcoin RPC path is down — the one external proof
     that otsd can see Bitcoin, so null (or any body that is not the JSON
     status) reads as error, exactly as the retired page's missing
-    "Best-block" marker did. anchor_receipts is "on"/"off". needs_attention
-    lists receipted anchors that left the chain: the saved proofs name a
-    block that no longer holds them, nothing is re-anchored automatically,
-    the operator decides — so it degrades. Residual, unchanged: this proves
-    RPC reachability, not that the stamper thread is unwedged; the health
-    monitor's stall alarm covers that class.
+    "Best-block" marker did. needs_attention lists receipted anchors that
+    left the chain: the saved proofs name a block that no longer holds
+    them, nothing is re-anchored automatically, the operator decides — so
+    it degrades. Residual, unchanged: this proves RPC reachability, not
+    that the stamper thread is unwedged; the health monitor's stall alarm
+    covers that class.
 
     Transitional: a fork older than c1db4dd still serves the retired page.
-    Its two markers are read as before and the log names it, so the hosted
-    box can take this gateway before the fork (never the other way round).
-    Remove the fallback once no calendar serves the page."""
-    if not OTS_CALENDAR_URL:
-        return "n/a", None, []
-    receipts_state = None
+    Its "Best-block" marker is read as before and the log names it, so the
+    hosted box can take this gateway before the fork (never the other way
+    round). Remove the fallback once no calendar serves the page."""
     attention: list[str] = []
     otsd_status = "ok"
     try:
@@ -2034,25 +1661,14 @@ def _probe_otsd() -> tuple[str, bool | None, list[str]]:
                 )
                 if otsd_status == "ok":
                     otsd_status = "needs_attention"
-            if ANCHOR_BILLING_ENABLED:
-                receipts = status.get("anchor_receipts")
-                if receipts == "on":
-                    receipts_state = True
-                elif receipts == "off":
-                    receipts_state = False
         elif b"Best-block" in content:
-            # The retired page (fork before c1db4dd): read its markers, say so.
+            # The retired page (fork before c1db4dd): read its marker, say so.
             logging.warning(
                 "Health check: otsd at %s answers the retired status page; "
                 "its fork predates c1db4dd — upgrade it (the gateway reads the "
                 "JSON status line)",
                 OTS_CALENDAR_URL,
             )
-            if ANCHOR_BILLING_ENABLED:
-                if b"Anchor receipts: on" in content:
-                    receipts_state = True
-                elif b"Anchor receipts: off" in content:
-                    receipts_state = False
         else:
             logging.warning(
                 "Health check: otsd HTTP up at %s but the body is not the JSON "
@@ -2060,16 +1676,10 @@ def _probe_otsd() -> tuple[str, bool | None, list[str]]:
                 OTS_CALENDAR_URL, len(content),
             )
             otsd_status = "error"
-        if receipts_state is False:
-            logging.warning(
-                "Health check: billing is on but otsd at %s reports "
-                "anchor receipts off; anchors are going unbilled",
-                OTS_CALENDAR_URL,
-            )
     except Exception:
         logging.warning("Health check: otsd unreachable at %s", OTS_CALENDAR_URL)
         otsd_status = "error"
-    return otsd_status, receipts_state, attention
+    return otsd_status, attention
 
 
 # The probe's cache: one status read per HEALTH_PROBE_CACHE_SECONDS,
@@ -2081,7 +1691,7 @@ _health_probe_lock = threading.Lock()
 _health_probe_cache: dict = {"at": None, "result": None}
 
 
-def _otsd_probe_cached() -> tuple[str, bool | None, list[str]]:
+def _otsd_probe_cached() -> tuple[str, list[str]]:
     """The calendar probe, at most one read in flight and at most one per
     HEALTH_PROBE_CACHE_SECONDS. A result inside the TTL is served as is. An
     expired result is served stale while one caller refreshes it, so a
@@ -2142,26 +1752,17 @@ def health(request: Request):
     else:
         payment_status = "unknown"
 
-    # With billing on, the calendar's status also says whether it is
-    # writing receipts (anchor_receipts "on"/"off"); a calendar restarted
-    # with receipts off is anchoring for free, and billing must say so.
     # otsd_attention is the calendar's deep-reorg findings, surfaced below
     # only when there are any.
-    otsd_status, receipts_state, otsd_attention = _otsd_probe_cached()
+    otsd_status, otsd_attention = _otsd_probe_cached()
 
-    # File-mediated fields (wallet, proofs, backup) and billing: each
-    # classifier's docstring lists its vocabulary. "absent", "local_only",
-    # and billing "off" report without degrading; every other non-ok value
-    # degrades like a backend failure — the expression below is the rule.
+    # File-mediated fields (wallet, proofs, backup): each classifier's
+    # docstring lists its vocabulary. "absent" and "local_only" report
+    # without degrading; every other non-ok value degrades like a backend
+    # failure — the expression below is the rule.
     wallet_status = _wallet_status()
     proofs_status = _proofs_status()
     backup_status = _backup_status()
-    billing_status, billing_bills, billing_rejected = _billing_status(receipts_state)
-
-    # L402 door: "on"/"off" — a mode, reported, never degrading; the same
-    # contract as billing "off". "off" means /timestamp stamps free of charge
-    # and the per-record cost lands on the anchor bill.
-    l402_status = "on" if L402_ENABLED else "off"
 
     if paused:
         overall = "paused"
@@ -2171,12 +1772,11 @@ def health(request: Request):
         overall = (
             "ok"
             if payment_status in ("ok", "unknown")
-            and otsd_status in ("ok", "n/a")
+            and otsd_status == "ok"
             and wallet_status in ("ok", "absent")
             and proofs_status in ("ok", "absent")
             and backup_status in ("ok", "local_only", "absent")
             and float_state in ("ok", "inactive")
-            and billing_status in ("off", "ok")
             else "degraded"
         )
 
@@ -2191,14 +1791,7 @@ def health(request: Request):
         "float": float_state,
         "proofs": proofs_status,
         "backup": backup_status,
-        "billing": billing_status,
-        "l402": l402_status,
     }
-    # Billing "off" means the feature is entirely absent (same contract as
-    # the 404 on /anchor-bills), so the counters exist only with billing on.
-    if ANCHOR_BILLING_ENABLED:
-        content["billing_bills"] = billing_bills
-        content["billing_rejected"] = billing_rejected
     # The calendar's findings, verbatim: which receipted anchors left the
     # chain, so the operator can act on them without opening the calendar.
     if otsd_attention:
@@ -2207,125 +1800,6 @@ def health(request: Request):
     return JSONResponse(
         status_code=200 if overall == "ok" else 503,
         content=content,
-    )
-
-
-@app.get("/anchor-bills")
-def anchor_bills(request: Request):
-    """The standing payer's bills ledger. Poll-driven: minting and settlement
-    checks happen here, never at ingestion — a bill lacking a live invoice
-    (none yet, or expired) gets a fresh bolt11 on each poll that needs one,
-    and a paid bill never re-mints. Plain bolt11s: anchor bills are NOT L402;
-    the macaroon machinery and verify_payment are not involved."""
-    # Absent unless billing is enabled: same 404 as an unregistered route.
-    if not ANCHOR_BILLING_ENABLED:
-        raise HTTPException(status_code=404, detail="Not Found")
-
-    # Same budget as the other non-sales endpoints (/verify, /upgrade): polls
-    # cost gateway CPU and phoenixd round-trips. Limiting before the token
-    # compare also throttles guessing.
-    retry_after = _verify_rate_limit_retry_after(_client_ip(request))
-    if retry_after is not None:
-        raise HTTPException(
-            status_code=429,
-            headers={"Retry-After": str(retry_after)},
-            detail={"status": "rate_limited", "retry_after_seconds": retry_after},
-        )
-
-    # Operational history is not public: bearer token, constant-time compare.
-    auth = request.headers.get("Authorization", "")
-    provided = auth[len("Bearer "):] if auth.startswith("Bearer ") else ""
-    if not provided or not secrets.compare_digest(
-        provided.encode(), ANCHOR_BILLS_TOKEN.encode()
-    ):
-        raise HTTPException(status_code=401, detail="Invalid or missing bearer token")
-
-    _ingest_anchor_receipts()
-
-    now = int(time.time())
-    # Read everything first and close — never hold a connection across the
-    # phoenixd round-trips below (the sweeper's short-transaction pattern).
-    conn = _obligation_connect()
-    try:
-        rows = conn.execute(
-            "SELECT txid, fee_sats, commitments, confirmed_height, confirmed_at, "
-            "records, amount_sats, payment_hash, bolt11, invoice_created_at, "
-            "status, paid_at "
-            "FROM anchor_bills WHERE status='unpaid' OR paid_at >= ? "
-            "ORDER BY confirmed_at",
-            (now - _ANCHOR_BILL_RECENTLY_PAID_SECONDS,),
-        ).fetchall()
-    finally:
-        conn.close()
-
-    bills = []
-    unpaid_count = 0
-    unpaid_sats = 0
-    for (
-        txid, fee_sats, commitments, confirmed_height, confirmed_at, records,
-        amount_sats, payment_hash, bolt11, invoice_created_at, status, paid_at,
-    ) in rows:
-        bill = {
-            "txid": txid,
-            "fee_sats": fee_sats,
-            "commitments": commitments,
-            "confirmed_height": confirmed_height,
-            "confirmed_at": confirmed_at,
-            # The payer's audit handle: amount_sats = records × the
-            # contracted rate. NULL on markup-era bills — their amounts
-            # stand as stored, whatever formula made them.
-            "records": records,
-            "amount_sats": amount_sats,
-            "status": status,
-        }
-        if status == "paid":
-            # Recently paid: reported for reconciliation, bolt11 dropped.
-            bill["payment_hash"] = payment_hash
-            bill["paid_at"] = paid_at
-            bills.append(bill)
-            continue
-
-        needs_mint = payment_hash is None
-        if payment_hash is not None:
-            invoice_status = PAYMENT_BACKEND.lookup_invoice(payment_hash)
-            if invoice_status.settled:
-                _mark_anchor_bill_paid(txid, now)
-                bill["status"] = "paid"
-                bill["payment_hash"] = payment_hash
-                bill["paid_at"] = now
-                bills.append(bill)
-                continue
-            # expired is None when the backend has no expiry signal: treat
-            # the invoice as live rather than re-mint on every poll.
-            needs_mint = invoice_status.expired is True
-        if needs_mint:
-            # A backend failure propagates as the existing 502: the poll is
-            # retryable and nothing is lost.
-            new_bolt11, new_hash = create_invoice(f"anchor-bill {txid}", amount_sats)
-            if _store_anchor_bill_invoice(txid, new_hash, new_bolt11, now,
-                                          expected_hash=payment_hash):
-                bolt11, payment_hash, invoice_created_at = new_bolt11, new_hash, now
-            else:
-                # Lost the mint race: a concurrent poll stored its invoice
-                # after this one read the row. Serve the winner's — every
-                # poller must converge on the ONE invoice later polls will
-                # settle-check.
-                payment_hash, bolt11, invoice_created_at = (
-                    _read_anchor_bill_invoice(txid)
-                )
-
-        bill["payment_hash"] = payment_hash
-        bill["bolt11"] = bolt11
-        bill["invoice_created_at"] = invoice_created_at
-        bills.append(bill)
-        unpaid_count += 1
-        unpaid_sats += amount_sats
-
-    return JSONResponse(
-        content={
-            "bills": bills,
-            "summary": {"unpaid_count": unpaid_count, "unpaid_sats": unpaid_sats},
-        }
     )
 
 
@@ -2396,26 +1870,6 @@ def upgrade(body: VerifyRequest, request: Request):
 @app.post("/timestamp")
 def timestamp(body: TimestampRequest, request: Request):
     # PAUSED is enforced app-wide by _pause_gate.
-
-    if not L402_ENABLED:
-        # Free door: stamp immediately and hand over the proof. No invoice, no
-        # macaroon, no 402; the payment backend is never contacted and the
-        # Authorization header is never read (a token minted before the flip
-        # gets its proof regardless). No obligation row: that log exists so a
-        # paid customer is never dropped, and nothing is paid here — a failed
-        # stamp is the client's 502 to retry. The mint rate limiter does not
-        # apply: nothing mints. The per-record cost lands on the anchor bill
-        # when billing is on.
-        try:
-            ots_bytes = stamp_digest(body.digest)
-        except Exception:
-            logging.exception("OTS stamping failed")
-            raise HTTPException(status_code=502, detail="OTS error: stamping failed")
-        return Response(
-            content=ots_bytes,
-            media_type="application/octet-stream",
-            headers={"Content-Disposition": f"attachment; filename={body.digest}.ots"},
-        )
 
     auth = request.headers.get("Authorization", "")
 

@@ -13,7 +13,9 @@
 #   BACKUP_AGE_RECIPIENT  age public key; empty = archive stays plaintext
 #   BACKUP_REMOTE         rsync destination user@host:path; empty = no push
 #   BACKUP_KEEP           newest archives kept in BACKUP_ROOT (default 7)
-#   PHOENIX_HOME          phoenixd state dir (seed.dat, wallet db)
+#   PHOENIX_HOME          phoenixd state dir (seed.dat, wallet db); the
+#                         phoenixd user's home, /var/lib/phoenixd/.phoenix
+#                         (deploy/phoenixd.service.example)
 #   OTSD_CALENDAR_DIR     otsd calendar state, host path
 #   OBLIGATIONS_DB_PATH   the obligation log the gateway is configured to
 #                         use (its .env setting); default
@@ -27,10 +29,26 @@
 #                         name); default is the compose tor_keys volume. Set
 #                         empty to declare it not-applicable to this shape
 #                         (e.g. a bare-metal box with no inbound onion).
-#   ANCHOR_RECEIPTS_DIR   anchor receipts (billing evidence); default is the
-#                         compose anchor_receipts volume. On a non-compose
-#                         layout point it at the real host receipts path
-#                         (the .env ANCHOR_RECEIPTS_PATH), or empty for N/A.
+#   ANCHOR_RECEIPTS_DIR   the calendar's anchor accounting (its receipts
+#                         file and markers, where the fork's
+#                         OTSD_ANCHOR_RECEIPTS points) when that directory
+#                         is OUTSIDE the calendar directory; inside it (the
+#                         systemd path) it is already a member. Default
+#                         empty (N/A); the compose layout that wired a
+#                         dedicated anchor_receipts volume before 2026-09-18
+#                         names its host path here to keep archiving it.
+#   CALENDAR_BACKUP_BOUNDARY
+#                         how the calendar directory becomes a backup
+#                         rather than a hot copy (below): stop | stopped |
+#                         snapshot. Unset: a running calendar writer makes
+#                         the run failed.
+#   OTSD_SERVICE          the calendar's systemd unit name (default otsd)
+#                         when CALENDAR_BACKUP_BOUNDARY=stop stops it; on
+#                         the compose path the service is otsd.
+#   OTSD_CALENDAR_SNAPSHOT_DIR
+#                         with CALENDAR_BACKUP_BOUNDARY=snapshot: the
+#                         operator's filesystem snapshot of the calendar
+#                         directory, archived in place of the live one.
 #   ARTIFACTS             proof artifacts dir
 #   UNIT_DIR              installed systemd units dir
 #   GATEWAY_UNIT          the three installed-unit members individually;
@@ -61,6 +79,9 @@ STATE_DIR="${STATE_DIR:-/var/lib/timestamp-gateway}"
 STATUS_FILE="${BACKUP_STATUS_PATH:-$STATE_DIR/backup-status}"
 STATUS="ok"
 DETAIL=""
+# The calendar writer this run stopped for the copy, to be restarted
+# whatever happens after the stop ("" = none).
+RESTART_CALENDAR=""
 
 write_status() {
   # write_status <status> <archive-name> [detail] — atomic: tmp file in the
@@ -118,14 +139,14 @@ STATE_DIR="${STATE_DIR:-/var/lib/timestamp-gateway}"
 STATUS_FILE="${BACKUP_STATUS_PATH:-$STATE_DIR/backup-status}"
 BACKUP_ROOT="${BACKUP_ROOT:-/home/gateway/timestamp-gateway-live-backups}"
 OTSD_FORK_PATH="${OTSD_FORK_PATH:-/home/gateway/opentimestamps-server}"
-PHOENIX_HOME="${PHOENIX_HOME:-/home/gateway/phoenixd/home/.phoenix}"
+PHOENIX_HOME="${PHOENIX_HOME:-/var/lib/phoenixd/.phoenix}"
 OTSD_CALENDAR_DIR="${OTSD_CALENDAR_DIR:-/var/lib/otsd/calendar}"
 # Unset-only defaults (${VAR=...}, not ${VAR:-...}): a deployment can set
 # either to the empty string to declare the member not-applicable to its
 # shape (skipped silently below); only a truly UNSET var falls through to the
 # compose-volume default.
 : "${TOR_KEYS_DIR=/var/lib/docker/volumes/timestamp-gateway_tor_keys/_data}"
-: "${ANCHOR_RECEIPTS_DIR=/var/lib/docker/volumes/timestamp-gateway_anchor_receipts/_data}"
+: "${ANCHOR_RECEIPTS_DIR=}"
 # Unset-only as well: the compose island keeps no proof artifacts dir by
 # design (ARTIFACTS= declares it N/A there).
 : "${ARTIFACTS=/home/gateway/timestamp-gateway-live-artifacts}"
@@ -162,7 +183,10 @@ OUTDIR="$BACKUP_ROOT/$TS"
 ARCHIVE="$BACKUP_ROOT/$TS-live-state.tar.gz"
 
 on_err() {
-  # Any unhandled command failure is a failed backup.
+  # Any unhandled command failure is a failed backup. A calendar writer this
+  # run stopped is restarted first: the copy is never worth a stopped
+  # calendar.
+  restart_calendar_writer || true
   write_status "failed" "$(basename "$ARCHIVE")" "backup aborted (see journal)" || true
   logger -p user.err -t backup-live-state "backup failed — see journal" || true
   echo "state: failed"
@@ -300,6 +324,112 @@ PYQ
   fi
 fi
 
+echo "=== calendar backup boundary ==="
+# A copy of the calendar directory taken while otsd writes is a hot copy:
+# its members were read at different moments, whatever tar reports, and
+# the calendar's own contract calls only a stopped copy a backup (fork
+# docs/contracts.md, section 10, R1). The calendar member therefore
+# succeeds only at a boundary this run established or verified, and never
+# one it inferred (2026-09-18 gate ruling 3):
+#   CALENDAR_BACKUP_BOUNDARY=stop      this run stops the calendar writer,
+#                                      sees it stopped, copies, restarts it
+#   CALENDAR_BACKUP_BOUNDARY=stopped   the operator stopped it before the
+#                                      run; verified here, never assumed
+#   CALENDAR_BACKUP_BOUNDARY=snapshot  the operator's filesystem snapshot
+#                                      (OTSD_CALENDAR_SNAPSHOT_DIR) is
+#                                      archived in place of the live dir
+# Unset with no writer running counts as stopped. Unset with a writer
+# running: the run refuses success (status failed, the reason named), and
+# the hot copy is still archived as a degraded member.
+CALENDAR_BACKUP_BOUNDARY="${CALENDAR_BACKUP_BOUNDARY:-}"
+OTSD_SERVICE="${OTSD_SERVICE:-otsd}"
+: "${OTSD_CALENDAR_SNAPSHOT_DIR=}"
+CALENDAR_MEMBER="$OTSD_CALENDAR_DIR"
+BOUNDARY_NOTE="none"
+
+calendar_writer() {
+  # Prints which calendar writer is running: systemd, compose, or none.
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$OTSD_SERVICE" 2>/dev/null; then
+    echo systemd; return
+  fi
+  if docker compose --project-directory "$REPO_DIR" ps --status running --services 2>/dev/null | grep -qx otsd; then
+    echo compose; return
+  fi
+  echo none
+}
+
+stop_calendar_writer() {
+  case "$1" in
+    systemd) systemctl stop "$OTSD_SERVICE" ;;
+    compose) docker compose --project-directory "$REPO_DIR" stop otsd ;;
+  esac
+}
+
+restart_calendar_writer() {
+  # Restart the writer this run stopped, once; "" means nothing to do.
+  [ -n "$RESTART_CALENDAR" ] || return 0
+  local writer="$RESTART_CALENDAR"
+  RESTART_CALENDAR=""
+  echo "=== restarting the calendar writer ==="
+  case "$writer" in
+    systemd) systemctl start "$OTSD_SERVICE" ;;
+    compose) docker compose --project-directory "$REPO_DIR" start otsd ;;
+  esac && [ "$(calendar_writer)" = "$writer" ] || {
+    fail_member "calendar: otsd ($writer) did not restart after the copy; start it by hand now"
+    return 1
+  }
+  echo "calendar writer restarted ($writer)"
+}
+
+case "$CALENDAR_BACKUP_BOUNDARY" in
+  ""|stop|stopped|snapshot) ;;
+  *) echo "CALENDAR_BACKUP_BOUNDARY must be stop, stopped, snapshot or unset (got '$CALENDAR_BACKUP_BOUNDARY')" >&2; exit 1 ;;
+esac
+WRITER="$(calendar_writer)"
+case "$CALENDAR_BACKUP_BOUNDARY" in
+  "")
+    if [ "$WRITER" = none ]; then
+      BOUNDARY_NOTE="stopped (no calendar writer was running)"
+      echo "calendar writer: none running; the copy is a stopped copy"
+    else
+      BOUNDARY_NOTE="none (otsd running under $WRITER; hot copy)"
+      fail_member "calendar: hot copy — otsd is running under $WRITER and no boundary was set; a calendar backup needs CALENDAR_BACKUP_BOUNDARY=stop (this run stops and restarts otsd), =stopped (stop otsd before the run) or =snapshot (OTSD_CALENDAR_SNAPSHOT_DIR); the hot copy is archived but is not a backup of the calendar"
+    fi ;;
+  stopped)
+    if [ "$WRITER" = none ]; then
+      BOUNDARY_NOTE="stopped (verified: no calendar writer running)"
+      echo "calendar writer: none running (boundary: stopped, verified)"
+    else
+      BOUNDARY_NOTE="none (otsd running under $WRITER; hot copy)"
+      fail_member "calendar: CALENDAR_BACKUP_BOUNDARY=stopped but otsd is running under $WRITER; stop it before the run, or use =stop; the hot copy is archived but is not a backup of the calendar"
+    fi ;;
+  stop)
+    if [ "$WRITER" = none ]; then
+      BOUNDARY_NOTE="stopped (no calendar writer was running; nothing to stop)"
+      echo "calendar writer: none running; nothing to stop"
+    else
+      echo "stopping the calendar writer ($WRITER) for the copy"
+      RESTART_CALENDAR="$WRITER"
+      if stop_calendar_writer "$WRITER" && [ "$(calendar_writer)" = none ]; then
+        BOUNDARY_NOTE="stop (otsd stopped for the copy, restarted after it)"
+        echo "calendar writer stopped and seen stopped"
+      else
+        BOUNDARY_NOTE="none (otsd did not stop; hot copy)"
+        fail_member "calendar: otsd ($WRITER) did not stop for the copy; the calendar member is a hot copy and is not a backup of the calendar"
+      fi
+    fi ;;
+  snapshot)
+    if [ -n "$OTSD_CALENDAR_SNAPSHOT_DIR" ] && [ -d "$OTSD_CALENDAR_SNAPSHOT_DIR" ] && [ -e "$OTSD_CALENDAR_SNAPSHOT_DIR/journal" ]; then
+      CALENDAR_MEMBER="$OTSD_CALENDAR_SNAPSHOT_DIR"
+      BOUNDARY_NOTE="snapshot (operator-declared: $OTSD_CALENDAR_SNAPSHOT_DIR)"
+      echo "calendar member: the declared snapshot $OTSD_CALENDAR_SNAPSHOT_DIR"
+    else
+      BOUNDARY_NOTE="none (no snapshot at OTSD_CALENDAR_SNAPSHOT_DIR; hot copy of the live directory)"
+      fail_member "calendar: CALENDAR_BACKUP_BOUNDARY=snapshot but OTSD_CALENDAR_SNAPSHOT_DIR is unset, not a directory, or holds no journal; the live directory is archived as the hot copy it is"
+    fi ;;
+esac
+echo "calendar_backup_boundary: $BOUNDARY_NOTE" >> "$OUTDIR/metadata.txt"
+
 echo "=== creating sensitive archive ==="
 # The state dir holds the durable obligation log (obligations.db plus its
 # WAL -wal/-shm sidecars) and the operator PAUSED switch. The checked
@@ -307,7 +437,8 @@ echo "=== creating sensitive archive ==="
 # a consistent copy only when they were taken with no writer running. The
 # opentimestamps-server checkout (uncommitted work by design), the tor
 # hidden-service keys (the onion identity — and the calendar's uri name
-# where the onion is the uri), the anchor receipts (billing evidence), and
+# where the onion is the uri), the calendar's anchor receipts where they
+# live outside its directory, and
 # the installed socat unit (substituted node onion) are deployment state
 # that git cannot restore. Member disposition (present, absent, declared
 # empty): the header above.
@@ -317,7 +448,7 @@ MEMBERS=(
   "$PHOENIXD_UNIT"
   "$SOCAT_UNIT"
   "$PHOENIX_HOME"
-  "$OTSD_CALENDAR_DIR"
+  "$CALENDAR_MEMBER"
   "$TOR_KEYS_DIR"
   "$ANCHOR_RECEIPTS_DIR"
   "$STATE_DIR"
@@ -350,6 +481,9 @@ for MEMBER in "${MEMBERS[@]}"; do
   fi
 done
 tar -czf "$ARCHIVE" "${PRESENT[@]}" 2>"$OUTDIR/tar-warnings.txt"
+# The writer stopped for the copy goes back up as soon as the copy is on
+# disk, before encryption and the push.
+restart_calendar_writer || true
 
 if [ -s "$OUTDIR/tar-warnings.txt" ]; then
   logger -p user.notice -t backup-live-state \

@@ -1,15 +1,35 @@
 # phoenixd under systemd: the Lightning wallet holding the gateway's funds.
 # phoenixd stays OUTSIDE the compose stack by design; this unit runs it on
 # the Docker host, bound where the gateway container can reach it.
-# Copy to /etc/systemd/system/phoenixd.service, edit User= and the
-# /home/gateway path for your host, then:
+# Copy to /etc/systemd/system/phoenixd.service, then:
 # systemctl daemon-reload && systemctl enable --now phoenixd
 #
-# FIRST RUN IS INTERACTIVE: run phoenixd once by hand as the service user
-# before enabling the unit — first run creates ~/.phoenix (the wallet seed,
-# and the API passwords in phoenix.conf). seed.dat in that directory IS the
-# money: back it up off-box before taking payments (the reference backup
-# set: ops/BACKUP-RECOVERY.md).
+# ITS OWN USER (2026-09-15 review F06): the wallet's seed and its full
+# spending password live in the phoenixd user's home, mode 700, which the
+# gateway user cannot read. Until 2026-09-18 both units ran as the gateway
+# user, so code execution in the web process reached the wallet's files by
+# ownership whatever password the gateway was given. Create the user and
+# the home once, unpack the release under /opt/phoenixd (root-owned, the
+# binary is not writable by the service user), and run phoenixd once by
+# hand AS THAT USER before enabling the unit — the first run is interactive
+# and creates ~/.phoenix (the wallet seed, and the API passwords in
+# phoenix.conf):
+#   sudo useradd --system --home-dir /var/lib/phoenixd --create-home \
+#     --shell /usr/sbin/nologin phoenixd
+#   sudo chmod 700 /var/lib/phoenixd
+#   sudo mkdir -p /opt/phoenixd && sudo tar -xzf phoenixd-*-linux-x64.zip -C /opt/phoenixd --strip-components=1
+#   sudo -u phoenixd HOME=/var/lib/phoenixd /opt/phoenixd/phoenixd --http-bind-ip 172.17.0.1
+# Copy http-password-limited-access out of /var/lib/phoenixd/.phoenix/
+# phoenix.conf into the gateway's .env as PHOENIXD_HTTP_PASSWORD_LIMITED
+# (that key cannot spend); the full http-password stays in the file, which
+# only phoenixd and root can read. seed.dat in that directory IS the money:
+# back it up off-box before taking payments (ops/BACKUP-RECOVERY.md).
+#
+# A box deployed before 2026-09-18 with the wallet under the gateway user's
+# home moves it: stop phoenixd, `mv /home/gateway/phoenixd/home/.phoenix
+# /var/lib/phoenixd/.phoenix && chown -R phoenixd:phoenixd /var/lib/phoenixd
+# && chmod 700 /var/lib/phoenixd`, install this unit, start it. The
+# backup's PHOENIX_HOME defaults to the new path.
 #
 # WHY --http-bind-ip 172.17.0.1 (the docker0 bridge address): phoenixd
 # binds 127.0.0.1 by default, and on a Linux engine a container cannot
@@ -34,8 +54,16 @@ Wants=network-online.target
 After=network-online.target docker.service
 
 [Service]
-User=gateway
-ExecStart=/home/gateway/phoenixd/phoenixd --http-bind-ip 172.17.0.1
+User=phoenixd
+Group=phoenixd
+WorkingDirectory=/var/lib/phoenixd
+Environment=HOME=/var/lib/phoenixd
+ExecStart=/opt/phoenixd/phoenixd --http-bind-ip 172.17.0.1
+# The wallet writes only its own home; nothing else on the box is writable.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/phoenixd
 Restart=always
 RestartSec=10
 

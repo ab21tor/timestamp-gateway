@@ -41,13 +41,21 @@ services:
     # is_an_allowlist in test_main.py resolves this file with dummy values
     # and checks both directions: every variable main.py reads is listed,
     # and the RPC credential is in otsd's environment only. (The retired
-    # pricing names main.py warns about are deliberately absent too: under
-    # compose they cannot reach the process, so that warning never fires.)
+    # pricing and billing names main.py warns about are deliberately absent:
+    # under compose they cannot reach the process, so that warning never
+    # fires. The two retired names whose old values are REFUSED stay listed,
+    # see L402_ENABLED and OTS_BACKEND_MODE below.)
     environment:
+      # Retired on 2026-09-18 and kept here for the same reason as
+      # L402_ENABLED below: an explicit `public` is refused at startup.
       - OTS_BACKEND_MODE=${OTS_BACKEND_MODE-}
       - OTS_CALENDAR_URL=${OTS_CALENDAR_URL-}
       - OTS_SUBMIT_MAX_ATTEMPTS=${OTS_SUBMIT_MAX_ATTEMPTS-}
       - OTS_SUBMIT_BACKOFF_SECONDS=${OTS_SUBMIT_BACKOFF_SECONDS-}
+      # Retired on 2026-09-18 (workflow five) and kept in the allowlist on
+      # purpose: an explicitly configured false is refused at startup with
+      # a migration diagnostic, and a value that never reached the process
+      # could not be refused (a free door must never silently turn paid).
       - L402_ENABLED=${L402_ENABLED-}
       - PRICE_PER_PROOF_SATS=${PRICE_PER_PROOF_SATS-}
       - L402_SECRET_HEX=${L402_SECRET_HEX-}
@@ -72,14 +80,6 @@ services:
       - HEALTH_PROBE_CACHE_SECONDS=${HEALTH_PROBE_CACHE_SECONDS-}
       - GATEWAY_BEHIND_PROXY=${GATEWAY_BEHIND_PROXY-}
       - UPGRADE_CLIENT_TOKEN=${UPGRADE_CLIENT_TOKEN-}
-      - ANCHOR_BILLING_ENABLED=${ANCHOR_BILLING_ENABLED-}
-      - PER_RECORD_SATS=${PER_RECORD_SATS-}
-      # Anchor billing under compose: the container path is fixed by the
-      # anchor_receipts mount below, so set
-      # ANCHOR_RECEIPTS_PATH=/anchor-receipts/anchor-receipts.jsonl in .env
-      # when you uncomment that mount (operator guide, "Anchor billing").
-      - ANCHOR_RECEIPTS_PATH=${ANCHOR_RECEIPTS_PATH-}
-      - ANCHOR_BILLS_TOKEN=${ANCHOR_BILLS_TOKEN-}
     logging: *bounded-logging
     restart: unless-stopped
     depends_on:
@@ -103,14 +103,6 @@ services:
     # the status files the timers write are the ones /health reads.
     volumes:
       - ${GATEWAY_STATE_DIR:-gateway_data}:/var/lib/timestamp-gateway
-      # Anchor billing (operator guide, "Anchor billing"): the receipts
-      # file the calendar fork writes, read-only — a dedicated volume,
-      # deliberately NOT otsd_calendar, which holds the hmac key.
-      # Uncomment here, in otsd, and under top-level volumes, and set
-      # ANCHOR_RECEIPTS_PATH=/anchor-receipts/anchor-receipts.jsonl in
-      # .env; nothing switches on while these stay commented (and
-      # ANCHOR_BILLING_ENABLED stays false in .env).
-      # - anchor_receipts:/anchor-receipts:ro
     # Loopback-only publish: reachable from this host (curl, ops scripts,
     # the health monitor) but not from the network — Tor is the public
     # front door. For clearnet exposure change to "8000:8000" and see
@@ -177,18 +169,12 @@ services:
       - ${OTSD_CALENDAR_DIR:-otsd_calendar}:/calendar
       # Calendar code: the fork checkout (see above).
       - ${OTSD_FORK_PATH:-../opentimestamps-server}:/app
-      # Anchor billing: the receipts volume, writable — the fork writes,
-      # the gateway reads (see the gateway service above).
-      # - anchor_receipts:/anchor-receipts
     environment:
       # Full RPC URL including credentials. Set in gitignored .env ONLY.
       # Unset -> otsd exits at startup with a clear error. Runtime
       # fail-loud, deliberately not ${VAR:?}: parse-time errors here would
       # break every compose command for operators not using this profile.
       - BITCOIN_RPC_SERVICE_URL=${BITCOIN_RPC_SERVICE_URL:-}
-      # Anchor billing: where the fork writes its receipts JSONL —
-      # uncomment with the wiring above.
-      # - OTSD_ANCHOR_RECEIPTS=/anchor-receipts/anchor-receipts.jsonl
 
   # socat bridge to an onion Bitcoin node: --profile onion-rpc
   # For operators whose Bitcoin node exposes RPC as a Tor onion service
@@ -217,5 +203,3 @@ volumes:
   tor_keys:
   gateway_data:
   otsd_calendar:
-  # Anchor billing receipts (uncomment with the gateway and otsd wiring):
-  # anchor_receipts:

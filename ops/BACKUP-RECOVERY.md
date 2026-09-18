@@ -55,19 +55,21 @@ A consistent copy is one of two things: a SQLite online snapshot (`sqlite3 .back
 
 Systemd unit:
 
-`/etc/systemd/system/phoenixd.service`
+`/etc/systemd/system/phoenixd.service` (from `deploy/phoenixd.service.example`: `User=phoenixd`, a system user of its own since 2026-09-18, review F06)
 
 Phoenixd binary directory:
 
-the release directory under `/home/gateway/phoenixd/` (e.g. `phoenixd-0.8.0-linux-x64`)
+`/opt/phoenixd` (the unpacked release, root-owned)
 
 Phoenixd home/state directory:
 
-`/home/gateway/phoenixd/home/.phoenix`
+`/var/lib/phoenixd/.phoenix` (the phoenixd user's home, mode 700: the gateway user cannot read it; the backup runs as root and can)
 
 Back up the whole directory. The critical-file list lives in
 OPERATOR-NOTES.md, "Phoenixd boundary" — `seed.dat` in particular is
-wallet material; treat it as secret.
+wallet material; treat it as secret. A box deployed before 2026-09-18
+kept it under the gateway user's home; the unit template's header has the
+move.
 
 **Recovery is by seed — a restored phoenixd is NEVER started.** Lightning
 channel state is not file-restorable: the wallet database in the archive is
@@ -83,8 +85,8 @@ funds.
 
 Log files are useful but less critical:
 
-- `phoenix.log`
-- `/home/gateway/phoenixd/phoenixd-systemd.log`
+- `phoenix.log`, in the home directory
+- the unit's journal: `journalctl -u phoenixd`
 
 Service boundary (localhost-only bind, systemd management): see
 OPERATOR-NOTES.md, "Phoenixd boundary".
@@ -97,28 +99,45 @@ The local OpenTimestamps calendar data lives at:
 
 This is critical.
 
-The complete file list:
+The complete file list (the fork's `docs/contracts.md`, section 10, "The
+set, member by member"):
 
 - `uri` — the calendar's permanent identity (baked into every attestation)
 - `hmac-key` — commitment MAC secret
 - `donation_addr`
 - `journal` — the append-only commitment record; the durable source of truth
-- `journal.counts` — the record-count sidecar (billing evidence; 4 bytes
-  per journal entry)
+- `journal.counts` — the record-count sidecar (4 bytes per journal entry;
+  the calendar's own accounting)
+- `journal.known-good` — the restart checkpoint (index and database
+  generation); deleting it costs one rescan, never a proof
 - `db/` — the LevelDB of per-commitment timestamps (serves upgrades)
+- `anchor-receipts.jsonl` and its `<receipts file>.pending.<txid>` markers,
+  when `OTSD_ANCHOR_RECEIPTS` points inside the directory (the systemd path
+  does)
 - `backup_cache` — left behind by fork versions before 2026-09-08 (the removed `/experimental/backup` replication scheme); absent on newer calendars, harmless either way
 
-**Hot-copy consistency:** `journal` and `journal.counts` are append-only
-and copy safely while otsd runs — a torn tail entry is padded out on the
-next writer open (the journal is written fsync-per-entry). `db/` is a
-LevelDB with no online-backup method, so its copy in the archive, taken
-while otsd runs, is **not a consistent snapshot of any instant** and may
-not open. The recovery implication: a torn `db/` may fail to open or miss
-entries, which costs the calendar its served-upgrade path for the
-affected old commitments — while client-held anchored proofs verify
-against Bitcoin regardless, and pending commitments re-enter stamping
-from the journal scan and are anchored again, in a later block, under new
-paths. For a consistent `db/` copy, back up while otsd is stopped.
+**A copy is a backup only at a boundary.** The members are written at
+different moments, `db/` has no online-backup method, and the calendar's
+own contract (fork `docs/contracts.md`, section 10, R1 and R2) calls a
+copy taken while `otsd` writes a *hot copy*: its next start refuses the
+skews its files can show (a checkpoint newer than the database, a sidecar
+longer than the journal, a database that does not open) and cannot see
+the ones they cannot. So `ops/backup-live-state.sh` archives the calendar
+directory as a backup only at a boundary it established or verified,
+`CALENDAR_BACKUP_BOUNDARY`: `stop` (the run stops the calendar writer,
+sees it stopped, copies, restarts it; intake answers 502 for the copy's
+duration, and the gateway's own submit retries cover about ten seconds of
+it), `stopped` (the operator stopped `otsd` before the run; verified,
+never assumed) or `snapshot` (the operator's filesystem snapshot at
+`OTSD_CALENDAR_SNAPSHOT_DIR` is archived in place of the live directory).
+Unset with no writer running counts as stopped. Unset with `otsd`
+running, the run is `failed` and its detail says why; the hot copy is
+still archived as a degraded member, and restoring it is the fork's R2:
+what its own files show is refused at the next start, and the way on is
+the one the refusal names. Which boundary a box uses is the operator's
+choice; a timer with no boundary set fails every run while `otsd` runs,
+until one is chosen (2026-09-18 gate ruling 3). The archive's
+`metadata.txt` records the boundary used (`calendar_backup_boundary`).
 
 The running Docker container is:
 
@@ -150,10 +169,16 @@ backup script archives it via `TOR_KEYS_DIR`.
 
 ### Anchor receipts
 
-Billing evidence: the fork's append-only receipts JSONL (compose volume
-`anchor_receipts`, host path
-`/var/lib/docker/volumes/timestamp-gateway_anchor_receipts/_data`).
-Append-only, copies safely hot. Archived via `ANCHOR_RECEIPTS_DIR`.
+The calendar's own anchor accounting: the fork's append-only receipts
+JSONL and its `.pending.<txid>` markers, where `OTSD_ANCHOR_RECEIPTS`
+points. Inside the calendar directory (the systemd path) they are already
+a member and travel at its boundary. Outside it (a compose deployment
+that wired a dedicated volume before 2026-09-18, host path
+`/var/lib/docker/volumes/<project>_anchor_receipts/_data`), name the
+directory as `ANCHOR_RECEIPTS_DIR`; unset, the member is not applicable.
+A marker beside a database that lacks its anchor is settled by the fork at
+its next start (its C5). The gateway no longer reads the receipts: anchor
+billing was retired on 2026-09-18.
 
 ### Bitcoin RPC bridge
 
@@ -179,9 +204,9 @@ Keep artifact directories private.
 
 `ops/backup-live-state.sh` runs daily under `backup-live-state.timer` (templates in `ops/systemd/`, install command in the unit's header comment). It runs as root — parts of the backup set are readable by root only.
 
-Each run snapshots the obligation log with `sqlite3 .backup` (where the host has no sqlite3, the same online-backup API runs through the gateway container's python — read-locked, staged in the container's ephemeral `/tmp`, never writing production state) and checks the snapshot before it counts (`ops/verify-obligations-snapshot.sh`; the log line `snapshot check: usable ...` and the metadata line `obligations_snapshot_check`), archives the critical set above (including the opentimestamps-server checkout, the Tor hidden-service keys, the anchor receipts, and the installed socat unit), encrypts the archive to `BACKUP_AGE_RECIPIENT`, pushes it to `BACKUP_REMOTE`, prunes to the `BACKUP_KEEP` newest archives — matched by archive-name pattern only, nothing else in `BACKUP_ROOT` is ever deleted — and writes `backup-status` to the state directory.
+Each run snapshots the obligation log with `sqlite3 .backup` (where the host has no sqlite3, the same online-backup API runs through the gateway container's python — read-locked, staged in the container's ephemeral `/tmp`, never writing production state) and checks the snapshot before it counts (`ops/verify-obligations-snapshot.sh`; the log line `snapshot check: usable ...` and the metadata line `obligations_snapshot_check`), archives the critical set above (including the calendar directory at its boundary, the opentimestamps-server checkout, the Tor hidden-service keys, and the installed socat unit), encrypts the archive to `BACKUP_AGE_RECIPIENT`, pushes it to `BACKUP_REMOTE`, prunes to the `BACKUP_KEEP` newest archives — matched by archive-name pattern only, nothing else in `BACKUP_ROOT` is ever deleted — and writes `backup-status` to the state directory.
 
-Layouts differ (systemd VPS vs compose island); a member's disposition follows its configured path — present, absent (degrades the run to `attention`, naming it; the archive is made without it), or declared **explicitly empty** (not applicable to this deployment shape; skipped silently) — as documented in the script header. Use empty only for a member absent *by design* here, never to paper over one that should exist. On the compose island, pass the layout as invocation env (`REPO_DIR=/root/timestamp-gateway`, `STATE_DIR=/var/lib/docker/volumes/timestamp-gateway_gateway_data/_data`, `PHOENIX_HOME=/root/.phoenix`; leaving `TOR_KEYS_DIR`/`ANCHOR_RECEIPTS_DIR` **unset** falls through to the compose-volume defaults) — the gitignored `.env` wins only for the keys it actually sets. On a bare-metal/systemd box with no inbound onion, set `TOR_KEYS_DIR=` empty (N/A) and point `ANCHOR_RECEIPTS_DIR` at the real host receipts file (`ANCHOR_RECEIPTS_PATH`, e.g. `/var/lib/otsd/calendar/anchor-receipts.jsonl`) so the billing evidence is captured by name.
+Layouts differ (systemd VPS vs compose island); a member's disposition follows its configured path — present, absent (degrades the run to `attention`, naming it; the archive is made without it), or declared **explicitly empty** (not applicable to this deployment shape; skipped silently) — as documented in the script header. Use empty only for a member absent *by design* here, never to paper over one that should exist. On the compose island, pass the layout as invocation env (`REPO_DIR=/root/timestamp-gateway`, `STATE_DIR=/var/lib/docker/volumes/timestamp-gateway_gateway_data/_data`, `PHOENIX_HOME=/root/.phoenix`; leaving `TOR_KEYS_DIR`/`ANCHOR_RECEIPTS_DIR` **unset** falls through to the compose-volume defaults) — the gitignored `.env` wins only for the keys it actually sets. On a bare-metal/systemd box with no inbound onion, set `TOR_KEYS_DIR=` empty (N/A); its receipts live inside the calendar directory and need no member of their own. Set `CALENDAR_BACKUP_BOUNDARY` on every layout (above).
 
 Prerequisites on the box (the script degrades loudly to `attention` when one is missing; it never silently skips a step):
 
@@ -195,7 +220,7 @@ Configuration lives in the gitignored `.env` (entries in `.env.example`):
 - `BACKUP_REMOTE` — rsync destination (`user@host:path`) for the encrypted archive. Plaintext archives are never pushed. Empty: backups stay on this box. A local-only backup shares fate with the box: whatever takes the box takes every backup of it.
 - `BACKUP_KEEP` — newest archives kept locally (default 7).
 
-Status file: `backup-status` in the state directory (`BACKUP_STATUS_PATH`), one JSON line written atomically (same pattern as `wallet-status`). `status` is `ok` (encrypted and pushed), `local_only` (archive created, nothing pushed — `detail` says whether it is plaintext), `attention` (a backup exists but degraded — `detail` says why; this includes "no usable snapshot, gateway stopped, the raw copy is a stopped-writer copy"), or `failed` (no usable archive, or no usable obligation-log snapshot while the gateway was running — the archive is still made for the other members, but the obligation log in it is not a snapshot of any instant, and `/health` degrades until a run succeeds).
+Status file: `backup-status` in the state directory (`BACKUP_STATUS_PATH`), one JSON line written atomically (same pattern as `wallet-status`). `status` is `ok` (encrypted and pushed), `local_only` (archive created, nothing pushed — `detail` says whether it is plaintext), `attention` (a backup exists but degraded — `detail` says why; this includes "no usable snapshot, gateway stopped, the raw copy is a stopped-writer copy"), or `failed` (no usable archive; no usable obligation-log snapshot while the gateway was running; or the calendar copied with no boundary while `otsd` ran, a writer that did not stop or did not restart, or a declared snapshot that was not there — the archive is still made for the other members, but the member named in the detail is not a backup of any instant, and `/health` degrades until a run succeeds).
 
 ## Capacity and the recovery hierarchy
 
@@ -205,7 +230,7 @@ Status file: `backup-status` in the state directory (`BACKUP_STATUS_PATH`), one 
 
 1. **Irreplaceable, small, and constant-size:** the phoenixd seed, the Tor hidden-service keys (the calendar's onion identity), `.env`, the calendar's `uri`/`hmac-key`, and the obligation log snapshot. Losing these loses identity or money.
 2. **The journal (and `journal.counts`) is the record.** Append-only flat files, cheap to copy, trivially consistent. Every commitment ever accepted is in the journal; the record-count sidecar can only undercount, never invent.
-3. **The LevelDB `db/` is the served history, and only partly rebuildable.** It holds the completed timestamps — each commitment's original anchor path. The live-tar'd copy in the archive is best-effort (LevelDB is copied while running and a mid-compaction snapshot may not open); if a restored `db/` will not open, restore the journal and let the stamper re-derive pending state: commitments not yet anchored are anchored again, in a later block, under new paths. Already-anchored commitments remain provable only through the attestations already handed to clients — a rebuilt `db/` does not reconstruct their original anchor paths, so a client who never upgraded a proof that had been anchored can upgrade it only to the later re-anchor.
+3. **The LevelDB `db/` is the served history, and only partly rebuildable.** It holds the completed timestamps — each commitment's original anchor path. The copy in the archive is a backup only at the boundary its `metadata.txt` records (`calendar_backup_boundary`); a hot copy's next start refuses what its files can show and starts on what they cannot (fork R1, R2). If a restored `db/` will not open, move it aside, delete `journal.known-good`, and let the stamper rescan the journal: commitments not yet anchored are anchored again, in a later block, under new paths. Already-anchored commitments remain provable only through the attestations already handed to clients — a rebuilt `db/` does not reconstruct their original anchor paths, so a client who never upgraded a proof that had been anchored can upgrade it only to the later re-anchor.
 
 ## Minimum restore checklist
 
@@ -221,10 +246,10 @@ On a replacement box:
      ```
 
      A `usable:` answer is the restore; an `unusable:` answer means the copy is torn or predates the run's newest obligation — the restore has failed, and the next-older archive is the one to try. Only when the archive holds no snapshot (its `backup-status` was `attention` with the stopped-writer note) do the raw files stand in, checked the same way.
-4. Restore Phoenixd binary directory.
-5. Restore Phoenixd home/state directory.
-6. Restore `phoenixd.service`.
-7. Restore `/var/lib/otsd/calendar`.
+4. Create the `phoenixd` user and unpack the release under `/opt/phoenixd` (the `useradd` lines: `deploy/phoenixd.service.example`, header).
+5. Restore the Phoenixd home/state directory to `/var/lib/phoenixd/.phoenix`, owned by `phoenixd`, mode 700.
+6. Install `phoenixd.service` from the template.
+7. Restore `/var/lib/otsd/calendar` from an archive whose `metadata.txt` records a boundary (`calendar_backup_boundary: stop …`, `stopped …` or `snapshot …`); the restore itself is the fork's R2 (`opentimestamps-server/docs/contracts.md`, section 10), and its next start says what it refuses.
 8. Restore the `opentimestamps-server` checkout **from the archive** — never by re-cloning from GitHub. The deployed fork carries uncommitted work by design; a re-clone silently loses it and deploys different code than the calendar was running.
 9. Create the `otsd` system user (docker group; the lines are in `deploy/otsd.service.example`'s header), install `otsd.service` from that template and recreate its companion `/etc/systemd/system/otsd.env` (owned by `otsd`, mode 600; it holds `BITCOIN_RPC_SERVICE_URL` and is NOT part of the automated backup archive — recreate it from your credential store; on this path the URL is never in `.env`). Recreate `/etc/systemd/system/wallet-balance-check.env` (`WALLET_RPC_URL`, the alarm's whitelisted RPC user) the same way. Enable the unit; it recreates the `otsd` container with the shape recorded above.
 10. Restore `socat-bitcoin-rpc.service` from the backup archive (the installed unit carries the substituted node onion; the repo ships only the template) and enable it — without it otsd has no Bitcoin path.

@@ -2,9 +2,16 @@
 set -u
 
 REPO="${REPO:-/home/gateway/timestamp-gateway}"
+# Every setting is resolved AFTER .env is loaded through the shared loader
+# (ops/lib/env.sh; .env wins over an older value in the environment). The
+# 2026-09-15 review's F23 found GATEWAY_URL taken from the environment
+# first and ARTIFACTS never read from .env at all.
+# shellcheck source=lib/env.sh
+. "$(cd "$(dirname "$0")" && pwd)/lib/env.sh"
+load_env
 ARTIFACTS="${ARTIFACTS:-/home/gateway/timestamp-gateway-live-artifacts}"
-# set GATEWAY_URL in .env (e.g. your Tailscale IP)
-GATEWAY_URL="${GATEWAY_URL:-$(grep "^GATEWAY_URL=" "$REPO/.env" 2>/dev/null | cut -d= -f2- || echo "http://127.0.0.1:8000")}"
+# GATEWAY_URL: where callers reach the gateway (set it in .env).
+GATEWAY_URL="${GATEWAY_URL:-http://127.0.0.1:8000}"
 
 echo "=== timestamp-gateway operator status ==="
 echo "time_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -31,27 +38,14 @@ systemctl --no-pager show timestamp-gateway.service \
 echo
 
 echo "=== gateway config ==="
-if [ -f "$REPO/.env" ]; then
-  PRICE="$(grep '^PRICE_PER_PROOF_SATS=' "$REPO/.env" | cut -d= -f2-)"
-  PAUSE_FILE="$(grep '^PAUSE_FILE=' "$REPO/.env" | cut -d= -f2-)"
-  PAYMENT_BACKEND="$(grep '^PAYMENT_BACKEND_TYPE=' "$REPO/.env" | cut -d= -f2-)"
-  L402_ENABLED="$(grep '^L402_ENABLED=' "$REPO/.env" | cut -d= -f2-)"
-else
-  PRICE=""
-  PAUSE_FILE=""
-  PAYMENT_BACKEND=""
-  L402_ENABLED=""
-fi
+# From the loaded .env (the gateway's own defaults are not repeated here:
+# an unset value reads as unknown, never guessed).
+PRICE="${PRICE_PER_PROOF_SATS:-}"
+PAUSE_FILE="${PAUSE_FILE:-}"
+PAYMENT_BACKEND="${PAYMENT_BACKEND_TYPE:-}"
 
 echo "payment_backend: ${PAYMENT_BACKEND:-unknown}"
-# A free door (L402_ENABLED=false) legitimately has no per-proof price —
-# the per-record cost lands on the anchor bill. Missing price is
-# needs_attention only with the door on (or unset: on is the default).
-if [ "$L402_ENABLED" = "false" ]; then
-  echo "price_per_proof_sats: n/a (free door)"
-else
-  echo "price_per_proof_sats: ${PRICE:-needs_attention}"
-fi
+echo "price_per_proof_sats: ${PRICE:-needs_attention}"
 echo "pause_file: ${PAUSE_FILE:-unknown}"
 
 if [ -n "$PAUSE_FILE" ] && [ -e "$PAUSE_FILE" ]; then
