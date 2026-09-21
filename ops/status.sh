@@ -3,9 +3,7 @@ set -u
 
 REPO="${REPO:-/home/gateway/timestamp-gateway}"
 # Every setting is resolved AFTER .env is loaded through the shared loader
-# (ops/lib/env.sh; .env wins over an older value in the environment). The
-# 2026-09-15 review's F23 found GATEWAY_URL taken from the environment
-# first and ARTIFACTS never read from .env at all.
+# (ops/lib/env.sh; .env wins over an older value in the environment).
 # shellcheck source=lib/env.sh
 . "$(cd "$(dirname "$0")" && pwd)/lib/env.sh"
 load_env

@@ -83,9 +83,9 @@ def _env(name: str, default: str | None = None) -> str | None:
 def _parse_config() -> GatewayConfig:
     """Parse and validate all required env vars. Raises RuntimeError on misconfiguration."""
     # Two settings whose old values changed what the gateway was are refused
-    # at startup with the way on, never silently reinterpreted (workflow
-    # five, gate rulings 2 and 5, 2026-09-18). Any other value of either
-    # name is a retired name, warned about below and ignored.
+    # at startup with the way on, never silently reinterpreted. Any other
+    # value of either name is a retired name, warned about below and
+    # ignored.
     door = _env("L402_ENABLED")
     if door is not None and door.strip().lower() == "false":
         raise RuntimeError(
@@ -140,9 +140,9 @@ def _parse_config() -> GatewayConfig:
             ", ".join(retired_present),
         )
 
-    # Retired on 2026-09-18 (workflow five): anchor billing, the free door
-    # and the public relay. Their names are warned about once and ignored;
-    # the two values that changed what the gateway was are refused above.
+    # Retired: anchor billing, the free door and the public relay. Their
+    # names are warned about once and ignored; the two values that changed
+    # what the gateway was are refused above.
     retired_features_present = [
         name
         for name in (
@@ -239,12 +239,10 @@ def _parse_config() -> GatewayConfig:
     if ots_backoff < 0:
         raise RuntimeError("OTS_SUBMIT_BACKOFF_SECONDS must be >= 0")
 
-    # phoenixd is the only payment backend. The LND backend was removed on
-    # 2026-09-15 (ruling: not carried unless someone actually needs it): its
-    # adapter reported no expiry, so an anchor bill whose first invoice
-    # expired was served forever without renewal, and no deployment used it.
-    # PAYMENT_BACKEND_TYPE is still read so an existing .env keeps working;
-    # any value but phoenixd is a startup failure that says why.
+    # phoenixd is the only payment backend; the LND backend was removed, no
+    # deployment having used it. PAYMENT_BACKEND_TYPE is still read so an
+    # existing .env keeps working; any value but phoenixd is a startup
+    # failure that says why.
     payment_backend_type = _env("PAYMENT_BACKEND_TYPE", "phoenixd").lower()
     if payment_backend_type == "lnd":
         raise RuntimeError(
@@ -282,8 +280,8 @@ def _parse_config() -> GatewayConfig:
     # calls at all. Its one scoped credential is PHOENIXD_HTTP_PASSWORD_LIMITED
     # (old name PHOENIXD_HTTP_PASSWORD read as a fallback), which must be
     # phoenixd's http-password-limited-access key — the gateway calls only
-    # createinvoice, payments/incoming, and getinfo (PhoenixdPaymentBackend),
-    # all covered by the limited key, which cannot reach /payinvoice.
+    # createinvoice and payments/incoming (PhoenixdPaymentBackend), both
+    # covered by the limited key, which cannot reach /payinvoice.
     wallet_status_path = _env(
         "WALLET_STATUS_PATH", "/var/lib/timestamp-gateway/wallet-status"
     )
@@ -370,7 +368,7 @@ def _parse_config() -> GatewayConfig:
 
     # /health's calendar probe is cached for this many seconds behind a
     # single-flight lock: however many callers hit /health at once, the
-    # calendar renders its homepage (four bitcoind RPCs) at most once per
+    # calendar builds its status (three bitcoind RPCs) at most once per
     # window. 0 disables the cache (every call probes).
     try:
         health_probe_cache_seconds = int(_env("HEALTH_PROBE_CACHE_SECONDS", "15"))
@@ -729,15 +727,15 @@ app = FastAPI(lifespan=lifespan)
 # The largest legitimate body is a /verify or /upgrade proof: 256 KiB of
 # proof, base64-encoded, inside a small JSON object. Everything else is a
 # 64-hex digest. Without a cap, uvicorn buffers whatever a client sends
-# before pydantic sees it (a 120 MB body inflated the process by ~600 MB
-# before the 413 in the 2026-09-08 review), so the cap is answered by a pure
-# ASGI middleware before a single body byte is read.
+# before pydantic sees it (a body of a hundred megabytes inflates the
+# process several times over before any 413), so the cap is answered by a
+# pure ASGI middleware before a single body byte is read.
 #
-# Two rules, because a header check alone was bypassed (2026-09-15 review):
-# the pinned h11 accepts `Content-Length: 1` beside `Transfer-Encoding:
-# chunked`, frames the body by the chunks, and keeps both headers in the
-# request — so a middleware that trusted Content-Length let a 525 KB JSON
-# body through to a 200. Now (1) any Transfer-Encoding header is refused
+# Two rules, because a header check alone can be bypassed: the pinned h11
+# accepts `Content-Length: 1` beside `Transfer-Encoding: chunked`, frames
+# the body by the chunks, and keeps both headers in the request — so a
+# middleware that trusted Content-Length would let an oversized JSON body
+# through to a 200. So (1) any Transfer-Encoding header is refused
 # with 411 before routing, a missing or non-numeric Content-Length with
 # 411, disagreeing repeated Content-Length headers with 400, and a declared
 # length above the cap with 413; and (2) the ASGI receive is wrapped with a
@@ -1049,9 +1047,9 @@ def _extract_attestations(timestamp) -> list:
 # attested merkle root against a Bitcoin block header. The gateway holds no
 # Bitcoin view by design (no RPC credential: operator guide, "Privilege
 # boundary"), so it cannot tell a genuine attestation from a fabricated one
-# naming a real block height — the 2026-09-15 review built exactly that (a
-# proof attesting to block 0 whose root the genesis header does not carry)
-# and both endpoints called it verified. So: the state is
+# naming a real block height (a proof attesting to block 0 whose root the
+# genesis header does not carry passes every structural check). So: the
+# state is
 # `bitcoin_attestation_present`, and `verified` is null for it — not
 # checked here — and false for every other state. The verifier is whatever
 # holds a Bitcoin view: `ots verify` against the client's own node, or the
@@ -1079,9 +1077,9 @@ def _proof_answer(digest: str, status: str, proof_digest: str | None = None,
         "valid_ots": valid_ots,
         "digest_match": proof_digest == digest,
         "bitcoin_attestation_present": present,
-        # The same structural flag under its pre-2026-09-15 name, kept for
-        # clients built against it (the api-endpoint adapter reads it). It
-        # never meant more than "a Bitcoin attestation node is present".
+        # The same structural flag under its earlier name, kept for clients
+        # built against it (the api-endpoint adapter reads it). It never
+        # meant more than "a Bitcoin attestation node is present".
         "bitcoin_anchored": present,
         # null: a Bitcoin attestation is present and was NOT checked against
         # Bitcoin here. false: nothing to verify, or the structure fails.
@@ -1131,10 +1129,10 @@ def _verify_ots_bytes(digest: str, ots_bytes: bytes) -> dict:
     return _proof_answer(digest, status, proof_digest, attestations)
 
 
-# Bounds on one /upgrade's calendar work (2026-09-15 review: a 3.5 KB proof
-# with 100 pending sub-stamps made 100 sequential calendar calls at
-# timeout=10 each — up to ~1000 s of one worker per accepted request, every
-# failure reported as an ordinary "pending"). Per request: at most
+# Bounds on one /upgrade's calendar work: without them a small proof with
+# a hundred pending sub-stamps makes a hundred sequential calendar calls,
+# minutes of one worker per accepted request, every failure reported as an
+# ordinary "pending". Per request: at most
 # UPGRADE_MAX_CALENDAR_QUERIES lookups, at most UPGRADE_MAX_SECONDS in all,
 # each lookup no longer than UPGRADE_QUERY_TIMEOUT; commitments are queried
 # once each, and the walk stops as soon as a Bitcoin attestation is in hand.
@@ -1188,8 +1186,7 @@ def _upgrade_pending_against_operator(timestamp) -> dict:
 
         # The library's timeout is a socket inactivity timeout: a calendar
         # that trickles bytes in gaps shorter than it keeps one read alive
-        # past the request's budget (2026-09-15 review F18: 13 bytes in
-        # 1.42 s gaps ran 17 s against a 15 s budget). So the lookup runs in
+        # past the request's budget. So the lookup runs in
         # a worker joined for what remains of the budget; a worker still
         # reading when the budget runs out is abandoned (it ends at its own
         # socket timeout, at most UPGRADE_QUERY_TIMEOUT of inactivity later)
@@ -1327,8 +1324,7 @@ def verify_l402_token(macaroon_b64: str, digest: str) -> tuple[str, int]:
         # nothing else. No traceback (a stranger must not be able to write
         # ERROR-level stack traces into the journal at will) and no exception
         # text: a parse error's message carries the bytes it choked on, which
-        # are whatever the sender put in the token (2026-09-15 review: a
-        # malformed token's payload was echoed verbatim into the log).
+        # are whatever the sender put in the token.
         logging.warning("L402 macaroon could not be parsed (%s)", type(exc).__name__)
         raise HTTPException(status_code=401, detail="Invalid L402 token")
 
@@ -1516,8 +1512,7 @@ def _make_payment_backend(backend_type: str) -> PaymentBackend:
     raise RuntimeError(f"Unknown PAYMENT_BACKEND_TYPE: {backend_type!r}")
 
 
-# phoenixd is the only payment backend (the LND backend was removed on
-# 2026-09-15; see _parse_config).
+# phoenixd is the only payment backend (see _parse_config).
 PAYMENT_BACKEND: PaymentBackend = _make_payment_backend(PAYMENT_BACKEND_TYPE)
 
 
@@ -1533,7 +1528,7 @@ def stamp_digest(hex_digest: str) -> bytes:
     return the serialized .ots bytes, retrying up to OTS_SUBMIT_MAX_ATTEMPTS
     times with a backoff so a paid request does not fail just because otsd is
     still starting. No fallback to any other calendar: persistent failure is
-    a RuntimeError (the public-calendar relay was retired on 2026-09-18)."""
+    a RuntimeError."""
     digest_bytes = bytes.fromhex(hex_digest)
     file_timestamp = DetachedTimestampFile(OpSHA256(), Timestamp(digest_bytes))
 
@@ -1608,12 +1603,11 @@ def _probe_otsd() -> tuple[str, list[str]]:
     calendar's deep-reorg findings (fork stamper.check_anchors), empty
     when none or unstated.
 
-    The contract (fork rpc.py get_status, since c1db4dd, 2026-09-14): GET /
-    answers one JSON object. best_block is the tip as the calendar sees
-    it, null when its Bitcoin RPC path is down — the one external proof
-    that otsd can see Bitcoin, so null (or any body that is not the JSON
-    status) reads as error, exactly as the retired page's missing
-    "Best-block" marker did. needs_attention lists receipted anchors that
+    The contract (fork rpc.py get_status): GET / answers one JSON object.
+    best_block is the tip as the calendar sees it, null when its Bitcoin
+    RPC path is down — the one external proof that otsd can see Bitcoin,
+    so null (or any body that is not the JSON status) reads as error.
+    needs_attention lists receipted anchors that
     left the chain: the saved proofs name a block that no longer holds
     them, nothing is re-anchored automatically, the operator decides — so
     it degrades. Residual, unchanged: this proves RPC reachability, not
@@ -1630,10 +1624,9 @@ def _probe_otsd() -> tuple[str, list[str]]:
         # (5, 45): connect is local (compose network / localhost) — 5s is
         # generous. The read leg waits for the status to be built in full:
         # three Bitcoin RPCs, each allowed up to a 30s stall by the fork's
-        # make_proxy(timeout=30) — a single-stall status can take ~34s. A
-        # plain 5 here timed out ~11% of such reads when the page did four
-        # RPCs over Tor (2026-07-17). Paired with the fork's status timeout:
-        # change the two together.
+        # make_proxy(timeout=30) — a single-stall status can take ~34s, which
+        # a plain 5 here would cut off. Paired with the fork's status
+        # timeout: change the two together.
         resp = requests.get(OTS_CALENDAR_URL, timeout=(5, 45))
         resp.raise_for_status()
         content = resp.content or b""
@@ -1685,8 +1678,8 @@ def _probe_otsd() -> tuple[str, list[str]]:
 # The probe's cache: one status read per HEALTH_PROBE_CACHE_SECONDS,
 # however many callers ask. The lock makes concurrent callers wait for the
 # one render in flight instead of starting their own (single flight), so a
-# flood of /health can no longer hold every worker on the calendar or make
-# bitcoind answer three RPCs per hit (2026-09-08 review, D1).
+# flood of /health cannot hold every worker on the calendar or make
+# bitcoind answer three RPCs per hit.
 _health_probe_lock = threading.Lock()
 _health_probe_cache: dict = {"at": None, "result": None}
 
@@ -1725,8 +1718,8 @@ def _otsd_probe_cached() -> tuple[str, list[str]]:
 
 @app.get("/health")
 def health(request: Request):
-    # The same per-peer budget as /verify: /health used to be the one
-    # unlimited, unauthenticated route, and each hit cost a calendar render.
+    # The same per-peer budget as /verify: an unlimited, unauthenticated
+    # route whose every hit costs a calendar render would be the one to flood.
     retry_after = _verify_rate_limit_retry_after(_client_ip(request))
     if retry_after is not None:
         raise HTTPException(

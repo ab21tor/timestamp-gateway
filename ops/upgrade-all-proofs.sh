@@ -10,9 +10,9 @@
 # empty result: a traversal failure (find exits nonzero — an unreadable
 # subtree, a missing tool) is status "attention", state needs_attention and
 # exit 1, distinguished from a clean scan of a directory that holds no
-# proofs (total 0, status ok, "no proofs"). Before 2026-09-15 find's exit
-# status vanished in a process substitution and its stderr was discarded,
-# so an injected find failure produced status ok, total 0, scan_complete.
+# proofs (total 0, status ok, "no proofs"). find's exit status must not
+# vanish in a process substitution with its stderr discarded, or a failed
+# scan would produce status ok, total 0, scan_complete.
 #
 # Every setting is resolved AFTER .env is loaded (ops/lib/env.sh).
 set -u

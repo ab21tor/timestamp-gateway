@@ -19,9 +19,9 @@
 # one configuration file. Either URL goes to curl via stdin config — never
 # argv, never echoed, never logged.
 #
-# Every setting is resolved AFTER .env is loaded (ops/lib/env.sh): the
-# 2026-09-15 review found WALLET_STATUS_PATH captured before sourcing, so a
-# path set in .env was ignored and /health read a file nothing wrote.
+# Every setting is resolved AFTER .env is loaded (ops/lib/env.sh): a
+# WALLET_STATUS_PATH captured before sourcing would ignore the path set in
+# .env, and /health would read a file nothing writes.
 set -u
 umask 077
 

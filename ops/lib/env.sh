@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 # Shared configuration loader for the ops/ scripts. Source it, call
 # load_env, and only THEN resolve settings with ${VAR:-default}: every
-# setting is read after the gitignored .env has been loaded, never before.
-# (2026-09-15 review: wallet-balance-check.sh captured WALLET_STATUS_PATH
-# before sourcing .env, so a path changed there was ignored and /health kept
-# reading a file nothing wrote to; upgrade-all-proofs.sh never read .env at
-# all; backup-live-state.sh ignored BACKUP_STATUS_PATH.)
+# setting is read after the gitignored .env has been loaded, never before:
+# a path captured before .env is sourced is a path .env cannot change, and
+# /health would keep reading a file nothing writes to.
 #
 # Precedence, lowest to highest: the script's own defaults (applied by the
 # caller after load_env returns), the invoking environment, then

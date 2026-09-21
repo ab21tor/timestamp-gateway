@@ -3,19 +3,18 @@ set -u
 
 REPO="${REPO:-/home/gateway/timestamp-gateway}"
 # Every setting is resolved AFTER .env is loaded through the shared loader
-# (ops/lib/env.sh; .env wins over an older value in the environment). The
-# 2026-09-15 review's F23 found this script probing 127.0.0.1:9740 while
-# .env named the docker0 bind, and reporting the configured listener absent.
+# (ops/lib/env.sh; .env wins over an older value in the environment): the
+# listener probed must be the one .env names, never a default.
 # shellcheck source=lib/env.sh
 . "$(cd "$(dirname "$0")" && pwd)/lib/env.sh"
 load_env
 SERVICE="${PHOENIXD_SERVICE:-phoenixd.service}"
-# The wallet home is the phoenixd user's, not the gateway's (review F06).
+# The wallet home is the phoenixd user's, not the gateway's.
 PHOENIX_HOME="${PHOENIX_HOME:-/var/lib/phoenixd/.phoenix}"
 PHOENIX_URL="${PHOENIXD_URL:-http://127.0.0.1:9740}"
 # The process is matched by exact name (pgrep -x): a substring match on the
-# full argv counted this script itself, and anything else mentioning
-# "phoenixd", as a running daemon (full review D9, 2026-09-08).
+# full argv would count this script itself, and anything else mentioning
+# "phoenixd", as a running daemon.
 PHOENIXD_PROC="${PHOENIXD_PROC:-phoenixd}"
 # The listener check looks for the host:port PHOENIXD_URL names, not a
 # hard-wired loopback address: the shipped unit binds the docker0 bridge.

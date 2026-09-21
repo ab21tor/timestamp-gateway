@@ -28,10 +28,9 @@ x-logging: &bounded-logging
 services:
   gateway:
     build: .
-    # An explicit allowlist, never `env_file: .env` (2026-09-15 review: the
-    # whole file gave the internet-facing gateway container the otsd
-    # wallet's Bitcoin RPC URL and password — `docker compose config`
-    # showed BITCOIN_RPC_SERVICE_URL inside gateway.environment). Each
+    # An explicit allowlist, never `env_file: .env`: the whole file would
+    # give the internet-facing gateway container the otsd wallet's Bitcoin
+    # RPC URL and password. Each
     # line is interpolated from .env; a name absent there arrives as the
     # empty string, which the gateway reads as unset (main.py, _env). What
     # is NOT here never reaches the container: BITCOIN_RPC_SERVICE_URL and
@@ -46,14 +45,14 @@ services:
     # fires. The two retired names whose old values are REFUSED stay listed,
     # see L402_ENABLED and OTS_BACKEND_MODE below.)
     environment:
-      # Retired on 2026-09-18 and kept here for the same reason as
-      # L402_ENABLED below: an explicit `public` is refused at startup.
+      # Retired and kept here for the same reason as L402_ENABLED below:
+      # an explicit `public` is refused at startup.
       - OTS_BACKEND_MODE=${OTS_BACKEND_MODE-}
       - OTS_CALENDAR_URL=${OTS_CALENDAR_URL-}
       - OTS_SUBMIT_MAX_ATTEMPTS=${OTS_SUBMIT_MAX_ATTEMPTS-}
       - OTS_SUBMIT_BACKOFF_SECONDS=${OTS_SUBMIT_BACKOFF_SECONDS-}
-      # Retired on 2026-09-18 (workflow five) and kept in the allowlist on
-      # purpose: an explicitly configured false is refused at startup with
+      # Retired and kept in the allowlist on purpose: an explicitly
+      # configured false is refused at startup with
       # a migration diagnostic, and a value that never reached the process
       # could not be refused (a free door must never silently turn paid).
       - L402_ENABLED=${L402_ENABLED-}

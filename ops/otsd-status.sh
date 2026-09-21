@@ -6,7 +6,6 @@ REPO="${REPO:-/home/gateway/timestamp-gateway}"
 # calendar directory is the one .env names (OTSD_CALENDAR_DIR), and the
 # container is OTSD_CONTAINER or, unset, the name compose gave the otsd
 # service (the systemd path's `docker run --name otsd` is the fallback).
-# The 2026-09-15 review's F23: a literal `otsd` and a hard-wired host path.
 # shellcheck source=lib/env.sh
 . "$(cd "$(dirname "$0")" && pwd)/lib/env.sh"
 load_env

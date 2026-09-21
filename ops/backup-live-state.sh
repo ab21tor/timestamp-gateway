@@ -21,9 +21,7 @@
 #                         use (its .env setting); default
 #                         $STATE_DIR/obligations.db on the host. Every
 #                         snapshot, check, archive member and metadata line
-#                         names this file (2026-09-15/16 review F07: the
-#                         default beside it was archived as if it were the
-#                         live one).
+#                         names this file, never the default beside it.
 #   TOR_KEYS_DIR          tor hidden-service state (onion identity — and,
 #                         where the onion is the calendar uri, the calendar's
 #                         name); default is the compose tor_keys volume. Set
@@ -34,9 +32,9 @@
 #                         OTSD_ANCHOR_RECEIPTS points) when that directory
 #                         is OUTSIDE the calendar directory; inside it (the
 #                         systemd path) it is already a member. Default
-#                         empty (N/A); the compose layout that wired a
-#                         dedicated anchor_receipts volume before 2026-09-18
-#                         names its host path here to keep archiving it.
+#                         empty (N/A); an older compose layout that wired a
+#                         dedicated anchor_receipts volume names its host
+#                         path here to keep archiving it.
 #   CALENDAR_BACKUP_BOUNDARY
 #                         how the calendar directory becomes a backup
 #                         rather than a hot copy (below): stop | stopped |
@@ -233,9 +231,9 @@ echo "=== snapshotting obligation log ==="
 # ops/verify-obligations-snapshot.sh). Only a snapshot that passes is
 # usable. Without one, the raw obligations.db/-wal/-shm files that the
 # archive also carries are a consistent copy ONLY if no writer was running:
-# the 2026-09-15 review copied the database, let a WAL checkpoint run, then
-# copied the WAL, and the restored copy had lost the committed obligations
-# table. So: no usable snapshot and the gateway running = the backup is
+# a database copied before a WAL checkpoint and a WAL copied after it
+# restore to a copy that has lost committed rows. So: no usable snapshot
+# and the gateway running = the backup is
 # "failed" (the rest of the set is still archived); no usable snapshot and
 # the gateway stopped = "attention", the raw copy stands as a stopped-writer
 # copy. Nothing here is ever called crash-consistent.
@@ -330,7 +328,7 @@ echo "=== calendar backup boundary ==="
 # the calendar's own contract calls only a stopped copy a backup (fork
 # docs/contracts.md, section 10, R1). The calendar member therefore
 # succeeds only at a boundary this run established or verified, and never
-# one it inferred (2026-09-18 gate ruling 3):
+# one it inferred:
 #   CALENDAR_BACKUP_BOUNDARY=stop      this run stops the calendar writer,
 #                                      sees it stopped, copies, restarts it
 #   CALENDAR_BACKUP_BOUNDARY=stopped   the operator stopped it before the
